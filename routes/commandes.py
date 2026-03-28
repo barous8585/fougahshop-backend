@@ -33,12 +33,13 @@ def generate_ref(db):
     count = db.query(Commande).count() + 1
     return f"CMD-{datetime.now().year}-{count:04d}"
 
-def calc_article(prix_eu, poids, pays, qty, cfg, db):
+def calc_article(prix_eu, poids, pays, qty, cfg, db, commission_par_article=0):
+    """commission_par_article = commission totale / nb articles du panier"""
     taux = cfg.taux_change
     port_fcfa_kg = get_port(db, pays)
     base_fcfa = round(prix_eu * taux)
     port_fcfa = round(port_fcfa_kg * poids)
-    total_fcfa_unit = base_fcfa + cfg.commission + port_fcfa
+    total_fcfa_unit = base_fcfa + commission_par_article + port_fcfa
     m = MONNAIES.get(pays, {"symbole": "FCFA", "taux_base": 656})
     taux_local = cfg.taux_gnf if m["symbole"] == "GNF" else 656
     taux_conv = taux_local / 656
@@ -46,7 +47,7 @@ def calc_article(prix_eu, poids, pays, qty, cfg, db):
     return {
         "base_fcfa": base_fcfa,
         "port_fcfa": port_fcfa,
-        "commission": cfg.commission,
+        "commission": commission_par_article,
         "total_local": total_local,
         "monnaie": m["symbole"],
     }
@@ -78,11 +79,14 @@ def creer_commande(body: Dict[str, Any], db: Session = Depends(get_db)):
     total_local = 0.0
     poids_total = 0.0
 
+    nb_articles_total = len(articles_in)
+    commission_par_article = round(cfg.commission / nb_articles_total) if nb_articles_total > 0 else cfg.commission
+
     for a in articles_in:
         prix_eu = float(a.get("prix_eu", 0))
         poids = float(a.get("poids", 0.5))
         qty = int(a.get("qty", 1))
-        detail = calc_article(prix_eu, poids, client_pays, qty, cfg, db)
+        detail = calc_article(prix_eu, poids, client_pays, qty, cfg, db, commission_par_article)
         articles_detail.append({
             "lien": a.get("lien", ""), "nom": a.get("nom", ""),
             "img": a.get("img"), "categorie": a.get("categorie"),
