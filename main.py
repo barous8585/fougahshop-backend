@@ -29,14 +29,14 @@ def startup():
 startup()
 
 # ── App ───────────────────────────────────────────────────────
-app = FastAPI(title="ProxyShop API", version="2.0.0")
+app = FastAPI(title="FougahShop API", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
 )
 
 # ── Routes API ────────────────────────────────────────────────
@@ -62,7 +62,7 @@ def health():
 @app.get("/api")
 def api_info():
     return {
-        "app": "ProxyShop API",
+        "app": "FougahShop API",
         "version": "2.0.0",
         "endpoints": [
             "GET  /api/config/public",
