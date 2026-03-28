@@ -29,26 +29,24 @@ def login(body: Dict[str, Any], response: Response, db: Session = Depends(get_db
         raise HTTPException(status_code=401, detail="Mot de passe incorrect")
     token = secrets.token_hex(32)
     sessions[token] = role
-    response.set_cookie("admin_token", token, httponly=True, max_age=86400*7, samesite="lax")
-    return {"ok": True, "role": role}
+    return {"ok": True, "role": role, "token": token}
 
 @router.post("/logout")
-def logout(request: Request, response: Response):
-    token = request.cookies.get("admin_token")
+def logout(request: Request):
+    token = request.headers.get("X-Admin-Token") or request.cookies.get("admin_token")
     sessions.pop(token, None)
-    response.delete_cookie("admin_token")
     return {"ok": True}
 
 @router.get("/check")
 def check(request: Request):
-    token = request.cookies.get("admin_token")
+    token = request.headers.get("X-Admin-Token") or request.cookies.get("admin_token")
     role = sessions.get(token)
     if role:
         return {"authenticated": True, "role": role}
     return {"authenticated": False}
 
 def require_auth(request: Request):
-    token = request.cookies.get("admin_token")
+    token = request.headers.get("X-Admin-Token") or request.cookies.get("admin_token")
     role = sessions.get(token)
     if not role:
         raise HTTPException(status_code=401, detail="Non authentifié")
