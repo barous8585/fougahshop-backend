@@ -1,14 +1,12 @@
 from fastapi import APIRouter, Depends, HTTPException, Response, Request
 from sqlalchemy.orm import Session
-from pydantic import BaseModel
+from typing import Dict, Any
 import secrets
 from database import get_db
 from models import Config, Employe
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
-
-# Sessions en mémoire (suffisant pour usage solo/petite équipe)
-sessions: dict = {}  # token → role
+sessions: dict = {}
 
 def get_config(db):
     cfg = db.query(Config).first()
@@ -16,31 +14,22 @@ def get_config(db):
         cfg = Config(); db.add(cfg); db.commit(); db.refresh(cfg)
     return cfg
 
-class LoginRequest(BaseModel):
-    password: str
-
 @router.post("/login")
-def login(body: LoginRequest, response: Response, db: Session = Depends(get_db)):
+def login(body: Dict[str, Any], response: Response, db: Session = Depends(get_db)):
+    password = str(body.get("password", ""))
     cfg = get_config(db)
     role = None
-
-    if body.password == cfg.admin_pwd:
+    if password == cfg.admin_pwd:
         role = "patron"
     else:
-        emp = db.query(Employe).filter(
-            Employe.pwd == body.password,
-            Employe.actif == True
-        ).first()
+        emp = db.query(Employe).filter(Employe.pwd == password, Employe.actif == True).first()
         if emp:
             role = "employe"
-
     if not role:
         raise HTTPException(status_code=401, detail="Mot de passe incorrect")
-
     token = secrets.token_hex(32)
     sessions[token] = role
-    response.set_cookie("admin_token", token, httponly=True,
-                        max_age=86400 * 7, samesite="lax")
+    response.set_cookie("admin_token", token, httponly=True, max_age=86400*7, samesite="lax")
     return {"ok": True, "role": role}
 
 @router.post("/logout")
