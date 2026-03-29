@@ -21,8 +21,14 @@ Base.metadata.create_all(bind=engine)
 def startup():
     db = SessionLocal()
     try:
-        get_config(db)   # crée config si absente
-        init_port(db)    # crée les tarifs par défaut
+        cfg = get_config(db)
+        init_port(db)
+        if not cfg.admin_pwd or cfg.admin_pwd == '':
+            cfg.admin_pwd = 'admin123'
+            db.commit()
+            print("✅ Mot de passe admin : admin123")
+        else:
+            print(f"✅ Mot de passe actuel : {cfg.admin_pwd}")
     finally:
         db.close()
 
