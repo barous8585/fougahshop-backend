@@ -8,6 +8,20 @@ from models import Commande, Config, PortKg
 
 router = APIRouter(prefix="/api/commandes", tags=["commandes"])
 
+PALIERS_COMMISSION = [
+    {"max": 50,    "comm": 3500},
+    {"max": 100,   "comm": 5000},
+    {"max": 200,   "comm": 7000},
+    {"max": 500,   "comm": 12000},
+    {"max": 99999, "comm": 20000},
+]
+
+def get_commission(total_euros: float) -> float:
+    for palier in PALIERS_COMMISSION:
+        if total_euros <= palier["max"]:
+            return palier["comm"]
+    return 20000
+
 MONNAIES = {
     "Burkina Faso": {"symbole": "FCFA", "taux_base": 656},
     "Guinée":       {"symbole": "GNF",  "taux_base": None},
@@ -79,8 +93,11 @@ def creer_commande(body: Dict[str, Any], db: Session = Depends(get_db)):
     total_local = 0.0
     poids_total = 0.0
 
+    # Commission progressive selon total panier
+    total_euros_panier = sum(float(a.get("prix_eu", 0)) * int(a.get("qty", 1)) for a in articles_in)
+    commission_totale = get_commission(total_euros_panier)
     nb_articles_total = len(articles_in)
-    commission_par_article = round(cfg.commission / nb_articles_total) if nb_articles_total > 0 else cfg.commission
+    commission_par_article = round(commission_totale / nb_articles_total) if nb_articles_total > 0 else commission_totale
 
     for a in articles_in:
         prix_eu = float(a.get("prix_eu", 0))
