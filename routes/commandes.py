@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
-from typing import List, Optional, Any, Dict
+from typing import Any, Dict
 from datetime import datetime
 import json
 from database import get_db
@@ -48,23 +48,20 @@ def generate_ref(db):
     return f"CMD-{datetime.now().year}-{count:04d}"
 
 def calc_article(prix_eu, poids, pays, qty, cfg, db, commission_par_article=0):
-    """commission_par_article = commission totale / nb articles du panier"""
     port_fcfa_kg = get_port(db, pays)
     port_fcfa = round(port_fcfa_kg * poids)
     m = MONNAIES.get(pays, {"symbole": "FCFA", "taux_base": 656})
+    base_fcfa = round(prix_eu * cfg.taux_change)
 
     if m["symbole"] == "GNF":
-        # Calcul direct en GNF sans passer par FCFA
+        # Calcul direct en GNF — pas de conversion depuis FCFA
         taux_gnf = cfg.taux_gnf or 9500
         base_gnf = round(prix_eu * taux_gnf)
         port_gnf = round(port_fcfa * (taux_gnf / 656))
         comm_gnf = round(commission_par_article * (taux_gnf / 656))
         total_local = round((base_gnf + port_gnf) * qty + comm_gnf)
-        base_fcfa = round(prix_eu * cfg.taux_change)
     else:
         # FCFA standard
-        taux = cfg.taux_change
-        base_fcfa = round(prix_eu * taux)
         total_fcfa_unit = base_fcfa + commission_par_article + port_fcfa
         total_local = round(total_fcfa_unit * qty)
 
@@ -103,7 +100,6 @@ def creer_commande(body: Dict[str, Any], db: Session = Depends(get_db)):
     total_local = 0.0
     poids_total = 0.0
 
-    # Commission progressive selon total panier
     total_euros_panier = sum(float(a.get("prix_eu", 0)) * int(a.get("qty", 1)) for a in articles_in)
     commission_totale = get_commission(total_euros_panier)
     nb_articles_total = len(articles_in)
