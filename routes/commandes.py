@@ -49,15 +49,25 @@ def generate_ref(db):
 
 def calc_article(prix_eu, poids, pays, qty, cfg, db, commission_par_article=0):
     """commission_par_article = commission totale / nb articles du panier"""
-    taux = cfg.taux_change
     port_fcfa_kg = get_port(db, pays)
-    base_fcfa = round(prix_eu * taux)
     port_fcfa = round(port_fcfa_kg * poids)
-    total_fcfa_unit = base_fcfa + commission_par_article + port_fcfa
     m = MONNAIES.get(pays, {"symbole": "FCFA", "taux_base": 656})
-    taux_local = cfg.taux_gnf if m["symbole"] == "GNF" else 656
-    taux_conv = taux_local / 656
-    total_local = round(total_fcfa_unit * taux_conv * qty)
+
+    if m["symbole"] == "GNF":
+        # Calcul direct en GNF sans passer par FCFA
+        taux_gnf = cfg.taux_gnf or 9500
+        base_gnf = round(prix_eu * taux_gnf)
+        port_gnf = round(port_fcfa * (taux_gnf / 656))
+        comm_gnf = round(commission_par_article * (taux_gnf / 656))
+        total_local = round((base_gnf + port_gnf) * qty + comm_gnf)
+        base_fcfa = round(prix_eu * cfg.taux_change)
+    else:
+        # FCFA standard
+        taux = cfg.taux_change
+        base_fcfa = round(prix_eu * taux)
+        total_fcfa_unit = base_fcfa + commission_par_article + port_fcfa
+        total_local = round(total_fcfa_unit * qty)
+
     return {
         "base_fcfa": base_fcfa,
         "port_fcfa": port_fcfa,
