@@ -105,12 +105,19 @@ def update_statut(ref: str, body: Dict[str, Any], request: Request,
         articles = json.loads(cmd.articles) if cmd.articles else []
         nouveau_total = 0
         poids_par_art = poids_reel / max(cmd.nb_articles, 1)
+        taux_gnf = cfg.taux_gnf or 9500
         for a in articles:
-            base = round(a["prix_eu"] * cfg.taux_change)
+            prix_eu = a["prix_eu"]
             port_art = round(port_kg * poids_par_art)
-            total_fcfa = (base + cfg.commission + port_art) * a["qty"]
-            taux_local = cfg.taux_gnf if cmd.monnaie == "GNF" else 656
-            nouveau_total += round(total_fcfa * (taux_local / 656))
+            if cmd.monnaie == "GNF":
+                base_gnf = round(prix_eu * taux_gnf)
+                port_gnf = round(port_art * (taux_gnf / 656))
+                comm_gnf = round(cfg.commission * (taux_gnf / 656))
+                nouveau_total += round((base_gnf + port_gnf) * a["qty"] + comm_gnf)
+            else:
+                base = round(prix_eu * cfg.taux_change)
+                total_fcfa = (base + cfg.commission + port_art) * a["qty"]
+                nouveau_total += total_fcfa
         diff = nouveau_total - cmd.total_local
         cmd.total_local = nouveau_total
         if diff != 0:
