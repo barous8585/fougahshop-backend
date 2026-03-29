@@ -47,27 +47,21 @@ def generate_ref(db):
     count = db.query(Commande).count() + 1
     return f"CMD-{datetime.now().year}-{count:04d}"
 
-def calc_article(prix_eu, poids, pays, qty, cfg, db, commission_par_article=0):
-    port_fcfa_kg = get_port(db, pays)
-    port_fcfa = round(port_fcfa_kg * poids)
+def calc_article(prix_eu, pays, qty, cfg, db, commission_par_article=0):
+    """Port NON inclus — ajouté après pesée réelle par l'admin"""
     m = MONNAIES.get(pays, {"symbole": "FCFA", "taux_base": 656})
     base_fcfa = round(prix_eu * cfg.taux_change)
 
     if m["symbole"] == "GNF":
-        # Calcul direct en GNF — pas de conversion depuis FCFA
         taux_gnf = cfg.taux_gnf or 9500
         base_gnf = round(prix_eu * taux_gnf)
-        port_gnf = round(port_fcfa * (taux_gnf / 656))
         comm_gnf = round(commission_par_article * (taux_gnf / 656))
-        total_local = round((base_gnf + port_gnf) * qty + comm_gnf)
+        total_local = round(base_gnf * qty + comm_gnf)
     else:
-        # FCFA standard
-        total_fcfa_unit = base_fcfa + commission_par_article + port_fcfa
-        total_local = round(total_fcfa_unit * qty)
+        total_local = round((base_fcfa + commission_par_article) * qty)
 
     return {
         "base_fcfa": base_fcfa,
-        "port_fcfa": port_fcfa,
         "commission": commission_par_article,
         "total_local": total_local,
         "monnaie": m["symbole"],
@@ -78,7 +72,6 @@ def calculer(body: Dict[str, Any], db: Session = Depends(get_db)):
     cfg = get_config(db)
     detail = calc_article(
         float(body.get("prix_eu", 0)),
-        float(body.get("poids", 0.5)),
         str(body.get("pays", "")),
         int(body.get("qty", 1)),
         cfg, db
@@ -109,7 +102,7 @@ def creer_commande(body: Dict[str, Any], db: Session = Depends(get_db)):
         prix_eu = float(a.get("prix_eu", 0))
         poids = float(a.get("poids", 0.5))
         qty = int(a.get("qty", 1))
-        detail = calc_article(prix_eu, poids, client_pays, qty, cfg, db, commission_par_article)
+        detail = calc_article(prix_eu, client_pays, qty, cfg, db, commission_par_article)
         articles_detail.append({
             "lien": a.get("lien", ""), "nom": a.get("nom", ""),
             "img": a.get("img"), "categorie": a.get("categorie"),
