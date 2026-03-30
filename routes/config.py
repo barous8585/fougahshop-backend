@@ -6,16 +6,22 @@ from models import Config, PortKg, Employe
 
 router = APIRouter(prefix="/api/config", tags=["config"])
 
-PAYS_LIST = ["Burkina Faso","Guinée","Cameroun","Bénin","Togo","Niger","Congo","Gabon"]
+PAYS_LIST = [
+    "Burkina Faso","Guinée","Cameroun","Bénin","Togo",
+    "Niger","Congo","Gabon","Sénégal","Mali","Côte d'Ivoire"
+]
 DEFAULT_PORT = {
-    "Burkina Faso": {"prix": 7000, "delai": "10-14 jours"},
-    "Guinée":       {"prix": 7000, "delai": "10-15 jours"},
-    "Cameroun":     {"prix": 7000, "delai": "10-15 jours"},
-    "Bénin":        {"prix": 7000, "delai": "8-12 jours"},
-    "Togo":         {"prix": 7000, "delai": "8-12 jours"},
-    "Niger":        {"prix": 7000, "delai": "12-18 jours"},
-    "Congo":        {"prix": 8000, "delai": "14-21 jours"},
-    "Gabon":        {"prix": 8000, "delai": "14-21 jours"},
+    "Burkina Faso":    {"prix": 8500,  "delai": "10-14 jours"},
+    "Guinée":          {"prix": 9000,  "delai": "10-15 jours"},
+    "Cameroun":        {"prix": 9500,  "delai": "10-15 jours"},
+    "Bénin":           {"prix": 7500,  "delai": "8-12 jours"},
+    "Togo":            {"prix": 7500,  "delai": "8-12 jours"},
+    "Niger":           {"prix": 9000,  "delai": "12-18 jours"},
+    "Congo":           {"prix": 10500, "delai": "14-21 jours"},
+    "Gabon":           {"prix": 10500, "delai": "14-21 jours"},
+    "Sénégal":         {"prix": 8000,  "delai": "8-12 jours"},
+    "Mali":            {"prix": 8500,  "delai": "10-14 jours"},
+    "Côte d'Ivoire":   {"prix": 7000,  "delai": "7-10 jours"},
 }
 
 def get_config(db):
