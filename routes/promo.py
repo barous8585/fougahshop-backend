@@ -3,26 +3,33 @@ from sqlalchemy.orm import Session
 from sqlalchemy import text
 from typing import Dict, Any
 from database import get_db
-from models import PromoCode, Commande
 from routes.auth import require_auth
 
 router = APIRouter(prefix="/api/promo", tags=["promo"])
 
+def get_promo_model():
+    from models import PromoCode
+    return PromoCode
+
+def get_commande_model():
+    from models import Commande
+    return Commande
+
 def ensure_promo_columns(db):
-    """Ajouter les colonnes promo si elles n'existent pas (migration douce)"""
     try:
-        db.execute(text("ALTER TABLE commandes ADD COLUMN promo_code VARCHAR"))
+        db.execute(text("ALTER TABLE commandes ADD COLUMN IF NOT EXISTS promo_code VARCHAR"))
         db.commit()
     except Exception:
-        pass
+        db.rollback()
     try:
-        db.execute(text("ALTER TABLE commandes ADD COLUMN promo_reduction FLOAT DEFAULT 0"))
+        db.execute(text("ALTER TABLE commandes ADD COLUMN IF NOT EXISTS promo_reduction FLOAT DEFAULT 0"))
         db.commit()
     except Exception:
-        pass
+        db.rollback()
 
 @router.post("/verifier")
 def verifier_code(body: Dict[str, Any], db: Session = Depends(get_db)):
+    PromoCode = get_promo_model()
     code = str(body.get("code", "")).strip().upper()
     if not code:
         raise HTTPException(400, "Code manquant")
@@ -44,6 +51,8 @@ def verifier_code(body: Dict[str, Any], db: Session = Depends(get_db)):
 
 @router.get("/admin")
 def list_promos(request: Request, db: Session = Depends(get_db), role: str = Depends(require_auth)):
+    PromoCode = get_promo_model()
+    Commande = get_commande_model()
     ensure_promo_columns(db)
     promos = db.query(PromoCode).order_by(PromoCode.created_at.desc()).all()
     result = []
@@ -68,6 +77,7 @@ def list_promos(request: Request, db: Session = Depends(get_db), role: str = Dep
 
 @router.post("/admin", status_code=201)
 def create_promo(body: Dict[str, Any], request: Request, db: Session = Depends(get_db), role: str = Depends(require_auth)):
+    PromoCode = get_promo_model()
     code = str(body.get("code", "")).strip().upper()
     if not code:
         raise HTTPException(400, "Code manquant")
@@ -84,6 +94,7 @@ def create_promo(body: Dict[str, Any], request: Request, db: Session = Depends(g
 
 @router.patch("/admin/{promo_id}")
 def update_promo(promo_id: int, body: Dict[str, Any], request: Request, db: Session = Depends(get_db), role: str = Depends(require_auth)):
+    PromoCode = get_promo_model()
     promo = db.query(PromoCode).filter(PromoCode.id == promo_id).first()
     if not promo:
         raise HTTPException(404, "Code introuvable")
@@ -96,6 +107,7 @@ def update_promo(promo_id: int, body: Dict[str, Any], request: Request, db: Sess
 
 @router.delete("/admin/{promo_id}")
 def delete_promo(promo_id: int, request: Request, db: Session = Depends(get_db), role: str = Depends(require_auth)):
+    PromoCode = get_promo_model()
     promo = db.query(PromoCode).filter(PromoCode.id == promo_id).first()
     if promo: promo.actif = False; db.commit()
     return {"ok": True}
