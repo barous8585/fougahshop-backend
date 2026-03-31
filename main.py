@@ -14,6 +14,7 @@ from routes.paiement  import router as paiement_router
 from routes.promo     import router as promo_router
 from routes.config    import init_port, get_config
 from database import SessionLocal
+from routes.notifs import router as notifs_router
 
 # ── Créer les tables ──────────────────────────────────────────
 Base.metadata.create_all(bind=engine)
@@ -92,7 +93,7 @@ def api_info():
             "DELETE /api/promo/admin/{id}",
         ]
     }
-from routes.notifs import router as notifs_router
+
 # ...
 app.include_router(notifs_router)
 ```
