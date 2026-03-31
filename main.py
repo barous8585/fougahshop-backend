@@ -92,3 +92,11 @@ def api_info():
             "DELETE /api/promo/admin/{id}",
         ]
     }
+from routes.notifs import router as notifs_router
+# ...
+app.include_router(notifs_router)
+```
+
+**Dans `requirements.txt`**, ajoute :
+```
+firebase-admin
