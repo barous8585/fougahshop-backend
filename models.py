@@ -10,7 +10,7 @@ class Config(Base):
     taux_gnf     = Column(Float, default=9500.0)
     wa_number    = Column(String, default="33651727112")
     admin_pwd    = Column(String, default="admin123")
-    secret_reset = Column(String, default="fougah2026")  # ✅ Stocké en base, jamais dans le HTML
+    secret_reset = Column(String, default="fougah2026")
 
 class PortKg(Base):
     __tablename__ = "port_kg"
@@ -18,6 +18,7 @@ class PortKg(Base):
     pays  = Column(String, unique=True)
     prix  = Column(Float, default=7000.0)
     delai = Column(String, default="7-10 jours")
+    actif = Column(Boolean, default=True)  # ✅ Nouveau champ
 
 class Employe(Base):
     __tablename__ = "employes"
