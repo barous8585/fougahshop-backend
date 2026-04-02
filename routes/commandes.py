@@ -16,7 +16,7 @@ except Exception:
 
 MONNAIES = {
     "Burkina Faso": {"symbole": "FCFA", "taux_base": 656},
-    "Guinée":       {"symbole": "GNF",  "taux_base": None},  # flottant
+    "Guinée":       {"symbole": "GNF",  "taux_base": None},
     "Cameroun":     {"symbole": "FCFA", "taux_base": 656},
     "Bénin":        {"symbole": "FCFA", "taux_base": 656},
     "Togo":         {"symbole": "FCFA", "taux_base": 656},
@@ -45,7 +45,6 @@ def calc_article(prix_eu, poids, pays, qty, cfg, db):
     base_fcfa = round(prix_eu * taux)
     port_fcfa = round(port_fcfa_kg * poids)
     total_fcfa_unit = base_fcfa + cfg.commission + port_fcfa
-    # Convertir en monnaie locale
     m = MONNAIES.get(pays, {"symbole": "FCFA", "taux_base": 656})
     taux_local = cfg.taux_gnf if m["symbole"] == "GNF" else 656
     taux_conv = taux_local / 656
@@ -109,11 +108,18 @@ def creer_commande(body: CommandeCreate, db: Session = Depends(get_db)):
     for a in body.articles:
         detail = calc_article(a.prix_eu, a.poids, body.client_pays, a.qty, cfg, db)
         articles_detail.append({
-            "lien": a.lien, "nom": a.nom, "img": a.img,
-            "categorie": a.categorie, "taille": a.taille,
-            "couleur": a.couleur, "specs": a.specs,
-            "prix_eu": a.prix_eu, "poids": a.poids, "qty": a.qty,
-            "total_local": detail["total_local"], "monnaie": detail["monnaie"],
+            "lien": a.lien,
+            "nom": a.nom,
+            "img": None,  # ✅ Images non stockées en base — évite les crashes mémoire
+            "categorie": a.categorie,
+            "taille": a.taille,
+            "couleur": a.couleur,
+            "specs": a.specs,
+            "prix_eu": a.prix_eu,
+            "poids": a.poids,
+            "qty": a.qty,
+            "total_local": detail["total_local"],
+            "monnaie": detail["monnaie"],
         })
         total_eu += a.prix_eu * a.qty
         total_local += detail["total_local"]
@@ -138,7 +144,6 @@ def creer_commande(body: CommandeCreate, db: Session = Depends(get_db)):
     )
     db.add(commande); db.commit(); db.refresh(commande)
 
-    # Notifier le patron
     notifier_patron(db, "🛍️ Nouvelle commande reçue !",
         f"{commande.client_nom} · {commande.ref} · {round(commande.total_local or 0):,} {commande.monnaie or 'FCFA'}",
         commande.ref)
@@ -171,7 +176,7 @@ def suivi(ref: str, db: Session = Depends(get_db)):
 def historique(tel: str, db: Session = Depends(get_db)):
     tel_clean = tel.replace(" ", "").replace("+", "")
     cmds = db.query(Commande).filter(
-        Commande.client_tel.contains(tel_clean[-8:])  # chercher sur les 8 derniers chiffres
+        Commande.client_tel.contains(tel_clean[-8:])
     ).order_by(Commande.created_at.desc()).all()
     if not cmds:
         raise HTTPException(404, "Aucune commande trouvée")
