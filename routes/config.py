@@ -69,6 +69,7 @@ def update_config(body: Dict[str, Any], db: Session = Depends(get_db)):
     if "commission"  in body: cfg.commission  = float(body["commission"])
     if "taux_gnf"    in body: cfg.taux_gnf    = float(body["taux_gnf"])
     if "wa_number"   in body: cfg.wa_number   = str(body["wa_number"])
+    if "admin_pwd"   in body: cfg.admin_pwd   = str(body["admin_pwd"])
     db.commit()
     return {"ok": True}
 
