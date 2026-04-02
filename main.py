@@ -3,7 +3,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 import os
-
 from database import engine, Base
 import models  # noqa
 from routes.commandes import router as commandes_router
@@ -25,12 +24,23 @@ def startup():
     try:
         cfg = get_config(db)
         init_port(db)
+
+        # Mot de passe admin
         if not cfg.admin_pwd or cfg.admin_pwd == '':
             cfg.admin_pwd = 'admin123'
             db.commit()
-            print("✅ Mot de passe admin : admin123")
+            print("✅ Mot de passe admin initialisé : admin123")
         else:
             print(f"✅ Mot de passe actuel : {cfg.admin_pwd}")
+
+        # ✅ Secret reset — stocké en base, jamais dans le HTML
+        if not cfg.secret_reset or cfg.secret_reset == '':
+            cfg.secret_reset = 'fougah2026'
+            db.commit()
+            print("✅ Secret reset initialisé : fougah2026")
+        else:
+            print(f"✅ Secret reset actuel : {cfg.secret_reset}")
+
     finally:
         db.close()
 
@@ -83,6 +93,8 @@ def api_info():
             "POST /api/paiement/init",
             "POST /api/paiement/webhook",
             "POST /api/auth/login",
+            "POST /api/auth/reset",
+            "GET  /api/auth/check",
             "GET  /api/admin/stats",
             "GET  /api/admin/commandes",
             "PATCH /api/admin/commandes/{ref}/statut",
