@@ -25,6 +25,22 @@ MONNAIES = {
     "Gabon":        {"symbole": "FCFA", "taux_base": 656},
 }
 
+# Paliers de commission (identiques au frontend)
+PALIERS_COMMISSION = [
+    {"max": 50,    "comm": 3500},
+    {"max": 100,   "comm": 5000},
+    {"max": 200,   "comm": 7000},
+    {"max": 500,   "comm": 12000},
+    {"max": 99999, "comm": 20000},
+]
+
+def get_commission(total_euros: float) -> float:
+    """Commission unique calculée sur le total du panier en euros"""
+    for palier in PALIERS_COMMISSION:
+        if total_euros <= palier["max"]:
+            return palier["comm"]
+    return 20000
+
 def get_config(db):
     cfg = db.query(Config).first()
     if not cfg:
@@ -39,12 +55,13 @@ def generate_ref(db):
     count = db.query(Commande).count() + 1
     return f"CMD-{datetime.now().year}-{count:04d}"
 
-def calc_article(prix_eu, poids, pays, qty, cfg, db):
+def calc_article_sans_commission(prix_eu, poids, pays, qty, cfg, db):
+    """Calcule le total d'un article SANS commission (commission appliquée une seule fois sur la commande)"""
     taux = cfg.taux_change
     port_fcfa_kg = get_port(db, pays)
     base_fcfa = round(prix_eu * taux)
     port_fcfa = round(port_fcfa_kg * poids)
-    total_fcfa_unit = base_fcfa + cfg.commission + port_fcfa
+    total_fcfa_unit = base_fcfa + port_fcfa  # ✅ PAS de commission ici
     m = MONNAIES.get(pays, {"symbole": "FCFA", "taux_base": 656})
     taux_local = cfg.taux_gnf if m["symbole"] == "GNF" else 656
     taux_conv = taux_local / 656
@@ -52,9 +69,9 @@ def calc_article(prix_eu, poids, pays, qty, cfg, db):
     return {
         "base_fcfa": base_fcfa,
         "port_fcfa": port_fcfa,
-        "commission": cfg.commission,
         "total_local": total_local,
         "monnaie": m["symbole"],
+        "taux_conv": taux_conv,
     }
 
 # ── Schemas ───────────────────────────────────────────────────
@@ -89,8 +106,20 @@ class CalculRequest(BaseModel):
 @router.post("/calculer")
 def calculer(body: CalculRequest, db: Session = Depends(get_db)):
     cfg = get_config(db)
-    detail = calc_article(body.prix_eu, body.poids, body.pays, body.qty, cfg, db)
-    return detail
+    detail = calc_article_sans_commission(body.prix_eu, body.poids, body.pays, body.qty, cfg, db)
+    # Pour un seul article, la commission = commission totale
+    commission = get_commission(body.prix_eu * body.qty)
+    m = MONNAIES.get(body.pays, {"symbole": "FCFA", "taux_base": 656})
+    taux_local = cfg.taux_gnf if m["symbole"] == "GNF" else 656
+    taux_conv = taux_local / 656
+    comm_local = round(commission * taux_conv)
+    return {
+        "base_fcfa": detail["base_fcfa"],
+        "port_fcfa": detail["port_fcfa"],
+        "commission": commission,
+        "total_local": detail["total_local"] + comm_local,
+        "monnaie": detail["monnaie"],
+    }
 
 @router.post("/", status_code=201)
 def creer_commande(body: CommandeCreate, db: Session = Depends(get_db)):
@@ -102,15 +131,16 @@ def creer_commande(body: CommandeCreate, db: Session = Depends(get_db)):
 
     articles_detail = []
     total_eu = 0.0
-    total_local = 0.0
+    total_local_sans_comm = 0.0
     poids_total = 0.0
+    taux_conv = 1.0
 
     for a in body.articles:
-        detail = calc_article(a.prix_eu, a.poids, body.client_pays, a.qty, cfg, db)
+        detail = calc_article_sans_commission(a.prix_eu, a.poids, body.client_pays, a.qty, cfg, db)
         articles_detail.append({
             "lien": a.lien,
             "nom": a.nom,
-            "img": None,  # ✅ Images non stockées en base — évite les crashes mémoire
+            "img": None,
             "categorie": a.categorie,
             "taille": a.taille,
             "couleur": a.couleur,
@@ -122,8 +152,14 @@ def creer_commande(body: CommandeCreate, db: Session = Depends(get_db)):
             "monnaie": detail["monnaie"],
         })
         total_eu += a.prix_eu * a.qty
-        total_local += detail["total_local"]
+        total_local_sans_comm += detail["total_local"]
         poids_total += a.poids * a.qty
+        taux_conv = detail["taux_conv"]
+
+    # ✅ Commission appliquée UNE SEULE FOIS sur le total du panier
+    commission_fcfa = get_commission(total_eu)
+    commission_locale = round(commission_fcfa * taux_conv)
+    total_local = total_local_sans_comm + commission_locale
 
     commande = Commande(
         ref=generate_ref(db),
