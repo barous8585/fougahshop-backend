@@ -1,8 +1,9 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.orm import Session
 from typing import Dict, Any
 from database import get_db
 from models import Config, PortKg, Employe
+from routes.auth import require_patron
 
 router = APIRouter(prefix="/api/config", tags=["config"])
 
@@ -10,18 +11,19 @@ PAYS_LIST = [
     "Burkina Faso","Guinée","Cameroun","Bénin","Togo",
     "Niger","Congo","Gabon","Sénégal","Mali","Côte d'Ivoire"
 ]
+
 DEFAULT_PORT = {
-    "Burkina Faso":    {"prix": 8500,  "delai": "10-14 jours"},
-    "Guinée":          {"prix": 9000,  "delai": "10-15 jours"},
-    "Cameroun":        {"prix": 9500,  "delai": "10-15 jours"},
-    "Bénin":           {"prix": 7500,  "delai": "8-12 jours"},
-    "Togo":            {"prix": 7500,  "delai": "8-12 jours"},
-    "Niger":           {"prix": 9000,  "delai": "12-18 jours"},
-    "Congo":           {"prix": 10500, "delai": "14-21 jours"},
-    "Gabon":           {"prix": 10500, "delai": "14-21 jours"},
-    "Sénégal":         {"prix": 8000,  "delai": "8-12 jours"},
-    "Mali":            {"prix": 8500,  "delai": "10-14 jours"},
-    "Côte d'Ivoire":   {"prix": 7000,  "delai": "7-10 jours"},
+    "Burkina Faso":  {"prix": 8500,  "delai": "10-14 jours", "actif": False},
+    "Guinée":        {"prix": 9000,  "delai": "10-15 jours", "actif": True},
+    "Cameroun":      {"prix": 9500,  "delai": "10-15 jours", "actif": False},
+    "Bénin":         {"prix": 7500,  "delai": "8-12 jours",  "actif": True},
+    "Togo":          {"prix": 7500,  "delai": "8-12 jours",  "actif": False},
+    "Niger":         {"prix": 9000,  "delai": "12-18 jours", "actif": False},
+    "Congo":         {"prix": 10500, "delai": "14-21 jours", "actif": False},
+    "Gabon":         {"prix": 10500, "delai": "14-21 jours", "actif": False},
+    "Sénégal":       {"prix": 8000,  "delai": "8-12 jours",  "actif": True},
+    "Mali":          {"prix": 8500,  "delai": "10-14 jours", "actif": False},
+    "Côte d'Ivoire": {"prix": 7000,  "delai": "7-10 jours",  "actif": False},
 }
 
 def get_config(db):
@@ -32,14 +34,25 @@ def get_config(db):
 
 def init_port(db):
     for pays, info in DEFAULT_PORT.items():
-        if not db.query(PortKg).filter(PortKg.pays == pays).first():
-            db.add(PortKg(pays=pays, prix=info["prix"], delai=info["delai"]))
+        existing = db.query(PortKg).filter(PortKg.pays == pays).first()
+        if not existing:
+            db.add(PortKg(pays=pays, prix=info["prix"], delai=info["delai"], actif=info["actif"]))
+        elif existing.actif is None:
+            existing.actif = info["actif"]
     db.commit()
 
+# ── Config publique ───────────────────────────────────────────
 @router.get("/public")
 def config_public(db: Session = Depends(get_db)):
     cfg = get_config(db)
-    ports = {p.pays: {"prix": p.prix, "delai": p.delai} for p in db.query(PortKg).all()}
+    ports = {
+        p.pays: {
+            "prix": p.prix,
+            "delai": p.delai,
+            "actif": p.actif if p.actif is not None else True
+        }
+        for p in db.query(PortKg).all()
+    }
     return {
         "taux_change": cfg.taux_change,
         "commission": cfg.commission,
@@ -48,6 +61,7 @@ def config_public(db: Session = Depends(get_db)):
         "port_kg": ports,
     }
 
+# ── Mise à jour config ────────────────────────────────────────
 @router.put("/")
 def update_config(body: Dict[str, Any], db: Session = Depends(get_db)):
     cfg = get_config(db)
@@ -58,6 +72,7 @@ def update_config(body: Dict[str, Any], db: Session = Depends(get_db)):
     db.commit()
     return {"ok": True}
 
+# ── Mise à jour port ──────────────────────────────────────────
 @router.put("/port")
 def update_port(body: Dict[str, Any], db: Session = Depends(get_db)):
     pays = str(body.get("pays", ""))
@@ -69,6 +84,32 @@ def update_port(body: Dict[str, Any], db: Session = Depends(get_db)):
     db.commit()
     return {"ok": True}
 
+# ── Toggle actif/inactif d'un pays ────────────────────────────
+@router.patch("/pays/{pays}/toggle")
+def toggle_pays(pays: str, request: Request, db: Session = Depends(get_db),
+                role: str = Depends(require_patron)):
+    p = db.query(PortKg).filter(PortKg.pays == pays).first()
+    if not p:
+        raise HTTPException(404, "Pays introuvable")
+    p.actif = not (p.actif if p.actif is not None else True)
+    db.commit()
+    return {"ok": True, "pays": pays, "actif": p.actif}
+
+# ── Liste pays avec statut (patron) ──────────────────────────
+@router.get("/pays")
+def list_pays(request: Request, db: Session = Depends(get_db),
+              role: str = Depends(require_patron)):
+    return [
+        {
+            "pays": p.pays,
+            "prix": p.prix,
+            "delai": p.delai,
+            "actif": p.actif if p.actif is not None else True
+        }
+        for p in db.query(PortKg).order_by(PortKg.pays).all()
+    ]
+
+# ── Employés ──────────────────────────────────────────────────
 @router.get("/employes")
 def list_employes(db: Session = Depends(get_db)):
     return [{"id": e.id, "nom": e.nom, "actif": e.actif}
