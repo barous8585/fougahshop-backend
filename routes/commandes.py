@@ -55,20 +55,20 @@ def generate_ref(db):
     count = db.query(Commande).count() + 1
     return f"CMD-{datetime.now().year}-{count:04d}"
 
-def calc_article_sans_commission(prix_eu, poids, pays, qty, cfg, db):
-    """Calcule le total d'un article SANS commission (commission appliquée une seule fois sur la commande)"""
+def calc_article_sans_port_ni_commission(prix_eu, qty, pays, cfg):
+    """
+    Calcule la valeur convertie d'un article SANS port et SANS commission.
+    - Port : ajouté après pesée réelle (admin)
+    - Commission : ajoutée une seule fois sur le total panier
+    """
     taux = cfg.taux_change
-    port_fcfa_kg = get_port(db, pays)
     base_fcfa = round(prix_eu * taux)
-    port_fcfa = round(port_fcfa_kg * poids)
-    total_fcfa_unit = base_fcfa + port_fcfa  # ✅ PAS de commission ici
     m = MONNAIES.get(pays, {"symbole": "FCFA", "taux_base": 656})
     taux_local = cfg.taux_gnf if m["symbole"] == "GNF" else 656
     taux_conv = taux_local / 656
-    total_local = round(total_fcfa_unit * taux_conv * qty)
+    total_local = round(base_fcfa * taux_conv * qty)
     return {
         "base_fcfa": base_fcfa,
-        "port_fcfa": port_fcfa,
         "total_local": total_local,
         "monnaie": m["symbole"],
         "taux_conv": taux_conv,
@@ -94,6 +94,7 @@ class CommandeCreate(BaseModel):
     client_adresse:      Optional[str] = None
     client_instructions: Optional[str] = None
     operateur:           str
+    promo_code:          Optional[str] = None
     articles:            List[ArticleIn]
 
 class CalculRequest(BaseModel):
@@ -106,18 +107,20 @@ class CalculRequest(BaseModel):
 @router.post("/calculer")
 def calculer(body: CalculRequest, db: Session = Depends(get_db)):
     cfg = get_config(db)
-    detail = calc_article_sans_commission(body.prix_eu, body.poids, body.pays, body.qty, cfg, db)
-    # Pour un seul article, la commission = commission totale
+    detail = calc_article_sans_port_ni_commission(body.prix_eu, body.qty, body.pays, cfg)
     commission = get_commission(body.prix_eu * body.qty)
     m = MONNAIES.get(body.pays, {"symbole": "FCFA", "taux_base": 656})
     taux_local = cfg.taux_gnf if m["symbole"] == "GNF" else 656
     taux_conv = taux_local / 656
     comm_local = round(commission * taux_conv)
+    port_fcfa = get_port(db, body.pays)
+    port_local = round(port_fcfa * body.poids * taux_conv)
     return {
         "base_fcfa": detail["base_fcfa"],
-        "port_fcfa": detail["port_fcfa"],
         "commission": commission,
+        "port_estime": port_local,
         "total_local": detail["total_local"] + comm_local,
+        "total_avec_port": detail["total_local"] + comm_local + port_local,
         "monnaie": detail["monnaie"],
     }
 
@@ -136,7 +139,8 @@ def creer_commande(body: CommandeCreate, db: Session = Depends(get_db)):
     taux_conv = 1.0
 
     for a in body.articles:
-        detail = calc_article_sans_commission(a.prix_eu, a.poids, body.client_pays, a.qty, cfg, db)
+        # ✅ PAS de port ici — port ajouté après pesée réelle uniquement
+        detail = calc_article_sans_port_ni_commission(a.prix_eu, a.qty, body.client_pays, cfg)
         articles_detail.append({
             "lien": a.lien,
             "nom": a.nom,
@@ -156,10 +160,30 @@ def creer_commande(body: CommandeCreate, db: Session = Depends(get_db)):
         poids_total += a.poids * a.qty
         taux_conv = detail["taux_conv"]
 
-    # ✅ Commission appliquée UNE SEULE FOIS sur le total du panier
+    # ✅ Commission appliquée UNE SEULE FOIS sur le total du panier en €
     commission_fcfa = get_commission(total_eu)
     commission_locale = round(commission_fcfa * taux_conv)
+
+    # ✅ Total = articles convertis + commission — SANS port
     total_local = total_local_sans_comm + commission_locale
+
+    # Appliquer code promo si valide
+    if body.promo_code:
+        try:
+            from sqlalchemy import text
+            promo = db.execute(
+                text("SELECT * FROM promo_codes WHERE code=:code AND actif=TRUE LIMIT 1"),
+                {"code": body.promo_code.upper()}
+            ).fetchone()
+            if promo and promo.utilisations < promo.quota:
+                reduction = round(promo.reduction_fcfa * taux_conv)
+                total_local = max(0, total_local - reduction)
+                db.execute(
+                    text("UPDATE promo_codes SET utilisations = utilisations + 1 WHERE code=:code"),
+                    {"code": body.promo_code.upper()}
+                )
+        except Exception:
+            pass
 
     commande = Commande(
         ref=generate_ref(db),
@@ -178,7 +202,9 @@ def creer_commande(body: CommandeCreate, db: Session = Depends(get_db)):
         statut="en_attente_paiement",
         delai_livraison=port_info.delai if port_info else "—",
     )
-    db.add(commande); db.commit(); db.refresh(commande)
+    db.add(commande)
+    db.commit()
+    db.refresh(commande)
 
     notifier_patron(db, "🛍️ Nouvelle commande reçue !",
         f"{commande.client_nom} · {commande.ref} · {round(commande.total_local or 0):,} {commande.monnaie or 'FCFA'}",
@@ -223,6 +249,7 @@ def historique(tel: str, db: Session = Depends(get_db)):
             "total_local": c.total_local, "monnaie": c.monnaie,
             "delai_livraison": c.delai_livraison,
             "note_admin": c.note_admin,
+            "client_nom": c.client_nom,
             "created_at": c.created_at,
         }
         for c in cmds
