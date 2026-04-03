@@ -136,29 +136,25 @@ def update_statut(
     if body.note_admin:
         cmd.note_admin = (cmd.note_admin or "") + " | " + body.note_admin
 
-    # Ajustement poids réel (patron uniquement)
+    # Calcul port réel (patron uniquement)
     if body.poids_reel and role == "patron":
         cmd.poids_reel = body.poids_reel
-        # Recalculer le total si poids différent
         cfg = db.query(Config).first()
         from models import PortKg
         port = db.query(PortKg).filter(PortKg.pays == cmd.client_pays).first()
         port_kg = port.prix if port else 7000
-        articles = json.loads(cmd.articles) if cmd.articles else []
-        nouveau_total = 0
-        poids_par_art = body.poids_reel / max(cmd.nb_articles, 1)
-        for a in articles:
-            base = round(a["prix_eu"] * cfg.taux_change)
-            port_art = round(port_kg * poids_par_art)
-            total_fcfa = (base + cfg.commission + port_art) * a["qty"]
-            taux_local = cfg.taux_gnf if cmd.monnaie == "GNF" else 656
-            nouveau_total += round(total_fcfa * (taux_local / 656))
-        diff = nouveau_total - cmd.total_local
-        cmd.total_local = nouveau_total
-        if diff != 0:
-            sign = "+" if diff > 0 else ""
-            note = f"Poids réel: {body.poids_reel}kg | Ajustement: {sign}{round(diff):,} {cmd.monnaie}"
-            cmd.note_admin = (cmd.note_admin or "") + " | " + note
+
+        # ✅ Port total = poids × prix/kg (sans toucher aux articles ni à la commission)
+        port_fcfa = round(port_kg * body.poids_reel)
+        taux_local = (cfg.taux_gnf if cfg else 9500) if cmd.monnaie == "GNF" else 656
+        port_local = round(port_fcfa * (taux_local / 656))
+
+        # Ajouter le port au total existant
+        cmd.total_local = (cmd.total_local or 0) + port_local
+
+        # Note claire pour l'admin
+        note = f"Poids réel: {body.poids_reel}kg | Port: {port_local:,} {cmd.monnaie or 'FCFA'}"
+        cmd.note_admin = (cmd.note_admin or "") + " | " + note
 
     db.commit()
 
@@ -172,9 +168,7 @@ def update_statut(
     }
     if body.statut in labels:
         msg = labels[body.statut]
-        # Notifier le client
         notifier_client(db, cmd.ref, f"🛍️ Commande {cmd.ref}", msg)
-        # Notifier le patron si nouvelle commande payée
         if body.statut == "paye":
             notifier_patron(db, "💰 Nouveau paiement reçu",
                 f"{cmd.client_nom} · {cmd.ref} · {round(cmd.total_local or 0):,} {cmd.monnaie or 'FCFA'}", cmd.ref)
