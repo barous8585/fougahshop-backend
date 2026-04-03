@@ -106,6 +106,9 @@ def update_promo(promo_id: int, body: Dict[str, Any], request: Request, db: Sess
     if "quota" in body: updates.append("quota=:quota"); params["quota"] = int(body["quota"])
     if "reduction_fcfa" in body: updates.append("reduction_fcfa=:reduction_fcfa"); params["reduction_fcfa"] = float(body["reduction_fcfa"])
     if "gain_influenceur" in body: updates.append("gain_influenceur=:gain_influenceur"); params["gain_influenceur"] = float(body["gain_influenceur"])
+    if body.get("reset_utilisations"):
+        updates.append("utilisations=0")
+        updates.append("actif=TRUE")
     if updates:
         db.execute(text(f"UPDATE promo_codes SET {', '.join(updates)} WHERE id=:id"), params)
         db.commit()
@@ -113,6 +116,6 @@ def update_promo(promo_id: int, body: Dict[str, Any], request: Request, db: Sess
 
 @router.delete("/admin/{promo_id}")
 def delete_promo(promo_id: int, request: Request, db: Session = Depends(get_db), role: str = Depends(require_auth)):
-    db.execute(text("UPDATE promo_codes SET actif=FALSE WHERE id=:id"), {"id": promo_id})
+    db.execute(text("DELETE FROM promo_codes WHERE id=:id"), {"id": promo_id})
     db.commit()
     return {"ok": True}
