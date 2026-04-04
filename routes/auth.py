@@ -24,17 +24,26 @@ def login(body: Dict[str, Any], db: Session = Depends(get_db)):
     password = str(body.get("password", ""))
     cfg = get_config(db)
     role = None
+
+    # Vérifier d'abord le mot de passe patron
     if password == cfg.admin_pwd:
         role = "patron"
     else:
+        # Chercher un employé actif avec ce mot de passe
         emp = db.query(Employe).filter(
             Employe.pwd == password,
             Employe.actif == True
         ).first()
         if emp:
-            role = "employe"
+            # ✅ Lire le rôle depuis la base — "employe" ou "logisticien"
+            role = getattr(emp, "role", None) or "employe"
+            # Sécurité : seuls les rôles connus sont acceptés
+            if role not in ("employe", "logisticien"):
+                role = "employe"
+
     if not role:
         raise HTTPException(status_code=401, detail="Mot de passe incorrect")
+
     token = secrets.token_hex(32)
     sessions[token] = role
     return {"ok": True, "role": role, "token": token}
@@ -58,14 +67,10 @@ def reset_password(body: Dict[str, Any], db: Session = Depends(get_db)):
     secret       = str(body.get("secret", ""))
     new_password = str(body.get("new_password", ""))
     cfg = get_config(db)
-
-    # ✅ Le secret est lu depuis la base de données — plus jamais codé en dur
     if not secret or secret != cfg.secret_reset:
         raise HTTPException(status_code=403, detail="Code secret incorrect")
-
     if len(new_password) < 4:
         raise HTTPException(status_code=400, detail="Mot de passe trop court")
-
     cfg.admin_pwd = new_password
     db.commit()
     return {"ok": True, "message": "Mot de passe mis à jour"}
