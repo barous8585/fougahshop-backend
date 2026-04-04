@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.orm import Session
+from sqlalchemy import text
 from typing import Dict, Any
 from database import get_db
 from models import Config, PortKg, Employe
@@ -26,6 +27,8 @@ DEFAULT_PORT = {
     "Côte d'Ivoire": {"prix": 7000,  "delai": "7-10 jours",  "actif": False},
 }
 
+ROLES_AUTORISES = ("employe", "logisticien")
+
 def get_config(db):
     cfg = db.query(Config).first()
     if not cfg:
@@ -40,6 +43,16 @@ def init_port(db):
         elif existing.actif is None:
             existing.actif = info["actif"]
     db.commit()
+
+def ensure_role_column(db):
+    """Migration automatique — ajoute la colonne role si elle n'existe pas encore."""
+    try:
+        db.execute(text(
+            "ALTER TABLE employes ADD COLUMN IF NOT EXISTS role VARCHAR DEFAULT 'employe'"
+        ))
+        db.commit()
+    except Exception:
+        db.rollback()
 
 # ── Config publique ───────────────────────────────────────────
 @router.get("/public")
@@ -113,17 +126,57 @@ def list_pays(request: Request, db: Session = Depends(get_db),
 # ── Employés ──────────────────────────────────────────────────
 @router.get("/employes")
 def list_employes(db: Session = Depends(get_db)):
-    return [{"id": e.id, "nom": e.nom, "actif": e.actif}
-            for e in db.query(Employe).filter(Employe.actif == True).all()]
+    ensure_role_column(db)
+    employes = db.query(Employe).filter(Employe.actif == True).all()
+    result = []
+    for e in employes:
+        result.append({
+            "id": e.id,
+            "nom": e.nom,
+            "actif": e.actif,
+            # ✅ Lire le rôle depuis la BDD (colonne role)
+            "role": getattr(e, "role", None) or "employe"
+        })
+    return result
 
 @router.post("/employes", status_code=201)
 def create_employe(body: Dict[str, Any], db: Session = Depends(get_db)):
-    e = Employe(nom=str(body.get("nom","")), pwd=str(body.get("pwd","")))
-    db.add(e); db.commit(); db.refresh(e)
-    return {"id": e.id, "nom": e.nom}
+    ensure_role_column(db)
+
+    nom = str(body.get("nom", "")).strip()
+    pwd = str(body.get("pwd", ""))
+    role = str(body.get("role", "employe"))
+
+    if not nom or not pwd:
+        raise HTTPException(400, "Nom et mot de passe requis")
+    if len(pwd) < 4:
+        raise HTTPException(400, "Mot de passe trop court (min 4 caractères)")
+
+    # ✅ Valider le rôle — uniquement "employe" ou "logisticien"
+    if role not in ROLES_AUTORISES:
+        role = "employe"
+
+    e = Employe(nom=nom, pwd=pwd)
+    db.add(e)
+    db.commit()
+    db.refresh(e)
+
+    # ✅ Sauvegarder le rôle via SQL direct (compatible si colonne pas encore dans le modèle)
+    try:
+        db.execute(
+            text("UPDATE employes SET role = :role WHERE id = :id"),
+            {"role": role, "id": e.id}
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+
+    return {"id": e.id, "nom": e.nom, "role": role}
 
 @router.delete("/employes/{emp_id}")
 def delete_employe(emp_id: int, db: Session = Depends(get_db)):
     e = db.query(Employe).filter(Employe.id == emp_id).first()
-    if e: e.actif = False; db.commit()
+    if e:
+        e.actif = False
+        db.commit()
     return {"ok": True}
