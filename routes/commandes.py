@@ -225,6 +225,7 @@ def suivi(ref: str, db: Session = Depends(get_db)):
         raise HTTPException(404, "Commande introuvable")
     return {
         "ref": cmd.ref, "statut": cmd.statut,
+        "client_tel": cmd.client_tel,
         "nb_articles": cmd.nb_articles,
         "total_local": cmd.total_local, "monnaie": cmd.monnaie,
         "poids_estime": cmd.poids_estime, "poids_reel": cmd.poids_reel,
