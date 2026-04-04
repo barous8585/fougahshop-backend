@@ -12,6 +12,7 @@ from routes.config    import router as config_router
 from routes.paiement  import router as paiement_router
 from routes.promo     import router as promo_router
 from routes.notifs    import router as notifs_router
+from routes.avis      import router as avis_router
 from routes.config    import init_port, get_config
 from database import SessionLocal
 
@@ -76,6 +77,7 @@ app.include_router(config_router)
 app.include_router(paiement_router)
 app.include_router(promo_router)
 app.include_router(notifs_router)
+app.include_router(avis_router)
 
 # ── Frontend statique ─────────────────────────────────────────
 static_dir = os.path.join(os.path.dirname(__file__), "static")
@@ -120,5 +122,11 @@ def api_info():
             "DELETE /api/promo/admin/{id}",
             "POST /api/notifs/register",
             "POST /api/notifs/send",
+            "GET  /api/avis/",
+            "POST /api/avis/",
+            "GET  /api/avis/admin",
+            "PATCH /api/avis/admin/{id}/reponse",
+            "PATCH /api/avis/admin/{id}/visibilite",
+            "DELETE /api/avis/admin/{id}",
         ]
     }
