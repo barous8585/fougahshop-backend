@@ -9,7 +9,6 @@ from database import get_db
 from models import Commande, Config
 from routes.auth import require_auth, require_patron
 
-# Import notifs (optionnel — ne crashe pas si Firebase pas configuré)
 try:
     from routes.notifs import notifier_client, notifier_patron
     NOTIFS_OK = True
@@ -28,6 +27,13 @@ STATUT_LABELS = {
     "expedie":  "Expédié",
     "arrive":   "Arrivé",
     "paiement_refuse": "Paiement refusé",
+}
+
+# Statuts accessibles par rôle
+STATUTS_PAR_ROLE = {
+    "patron":      STATUTS,
+    "logisticien": ["paye","achete","expedie","arrive"],
+    "employe":     ["paye","achete"],
 }
 
 def serialize_cmd(c):
@@ -60,10 +66,8 @@ def stats(request: Request, db: Session = Depends(get_db),
 
     base = {"total": total, "by_statut": by_statut}
 
-    # Finances uniquement pour le patron
     if role == "patron":
         base["encaisse"] = round(encaisse)
-        # Marge estimée (commission × nb articles payés)
         cfg = db.query(Config).first()
         nb_articles_payes = db.query(func.sum(Commande.nb_articles)).filter(
             Commande.statut.in_(["paye","achete","expedie","arrive"])
@@ -84,9 +88,13 @@ def liste_commandes(
 ):
     q = db.query(Commande)
 
-    # Employé : uniquement paye et achete
-    if role == "employe":
-        q = q.filter(Commande.statut.in_(["paye", "achete"]))
+    statuts_autorises = STATUTS_PAR_ROLE.get(role, ["paye", "achete"])
+
+    if role in ("employe", "logisticien"):
+        if statut and statut in statuts_autorises:
+            q = q.filter(Commande.statut == statut)
+        else:
+            q = q.filter(Commande.statut.in_(statuts_autorises))
     elif statut:
         q = q.filter(Commande.statut == statut)
 
@@ -103,11 +111,10 @@ def liste_commandes(
 
     cmds = q.order_by(Commande.created_at.desc()).all()
 
-    # Employé ne voit pas les montants
     result = []
     for c in cmds:
         d = serialize_cmd(c)
-        if role == "employe":
+        if role in ("employe", "logisticien"):
             d.pop("total_local", None)
             d.pop("total_euro", None)
             d.pop("monnaie", None)
@@ -126,8 +133,10 @@ def update_statut(
     db: Session = Depends(get_db),
     role: str = Depends(require_auth),
 ):
-    if body.statut not in STATUTS:
-        raise HTTPException(400, "Statut invalide")
+    statuts_autorises = STATUTS_PAR_ROLE.get(role, ["paye", "achete"])
+    if body.statut not in statuts_autorises:
+        raise HTTPException(403, f"Statut '{body.statut}' non autorisé pour le rôle '{role}'")
+
     cmd = db.query(Commande).filter(Commande.ref == ref).first()
     if not cmd:
         raise HTTPException(404, "Commande introuvable")
@@ -136,29 +145,24 @@ def update_statut(
     if body.note_admin:
         cmd.note_admin = (cmd.note_admin or "") + " | " + body.note_admin
 
-    # Calcul port réel (patron uniquement)
-    if body.poids_reel and role == "patron":
+    # Calcul port réel — patron ET logisticien
+    if body.poids_reel and role in ("patron", "logisticien"):
         cmd.poids_reel = body.poids_reel
         cfg = db.query(Config).first()
         from models import PortKg
         port = db.query(PortKg).filter(PortKg.pays == cmd.client_pays).first()
         port_kg = port.prix if port else 7000
 
-        # ✅ Port total = poids × prix/kg (sans toucher aux articles ni à la commission)
         port_fcfa = round(port_kg * body.poids_reel)
         taux_local = (cfg.taux_gnf if cfg else 9500) if cmd.monnaie == "GNF" else 656
         port_local = round(port_fcfa * (taux_local / 656))
 
-        # Ajouter le port au total existant
         cmd.total_local = (cmd.total_local or 0) + port_local
-
-        # Note claire pour l'admin
         note = f"Poids réel: {body.poids_reel}kg | Port: {port_local:,} {cmd.monnaie or 'FCFA'}"
         cmd.note_admin = (cmd.note_admin or "") + " | " + note
 
     db.commit()
 
-    # ── Notifications push ────────────────────────────────────
     labels = {
         "paye":     "💰 Paiement confirmé ! On achète votre article.",
         "achete":   "🛍️ Article acheté ! Préparation en cours.",
@@ -172,6 +176,10 @@ def update_statut(
         if body.statut == "paye":
             notifier_patron(db, "💰 Nouveau paiement reçu",
                 f"{cmd.client_nom} · {cmd.ref} · {round(cmd.total_local or 0):,} {cmd.monnaie or 'FCFA'}", cmd.ref)
+        # Patron notifié quand logisticien met à jour
+        if role == "logisticien" and body.statut in ("achete", "expedie", "arrive"):
+            notifier_patron(db, f"📦 Logistique — {STATUT_LABELS.get(body.statut, body.statut)}",
+                f"{cmd.ref} · {cmd.client_nom} · {cmd.client_pays}", cmd.ref)
 
     return {"ref": cmd.ref, "statut": cmd.statut}
 
