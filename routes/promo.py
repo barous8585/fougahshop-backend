@@ -8,7 +8,6 @@ from routes.auth import require_auth
 router = APIRouter(prefix="/api/promo", tags=["promo"])
 
 def ensure_tables(db):
-    """Créer la table promo_codes si elle n'existe pas"""
     try:
         db.execute(text("""
             CREATE TABLE IF NOT EXISTS promo_codes (
@@ -18,12 +17,14 @@ def ensure_tables(db):
                 reduction_fcfa FLOAT DEFAULT 500,
                 gain_influenceur FLOAT DEFAULT 1000,
                 quota INTEGER DEFAULT 50,
-                utilisations INTEGER DEFAULT 0,
+                utilisations INTEGER NOT NULL DEFAULT 0,
                 actif BOOLEAN DEFAULT TRUE,
                 created_at TIMESTAMP DEFAULT NOW()
             )
         """))
         db.execute(text("ALTER TABLE commandes ADD COLUMN IF NOT EXISTS promo_code VARCHAR"))
+        # ✅ Fix : s'assurer que les lignes existantes n'ont pas NULL
+        db.execute(text("UPDATE promo_codes SET utilisations = 0 WHERE utilisations IS NULL"))
         db.commit()
     except Exception:
         db.rollback()
@@ -34,19 +35,27 @@ def verifier_code(body: Dict[str, Any], db: Session = Depends(get_db)):
     code = str(body.get("code", "")).strip().upper()
     if not code:
         raise HTTPException(400, "Code manquant")
+
     result = db.execute(text(
         "SELECT * FROM promo_codes WHERE code=:code AND actif=TRUE LIMIT 1"
     ), {"code": code}).fetchone()
+
     if not result:
         raise HTTPException(404, "Code invalide ou expiré")
-    if result.utilisations >= result.quota:
-        raise HTTPException(400, "Code épuisé")
+
+    utilisations = result.utilisations or 0
+    quota = result.quota or 50
+
+    if utilisations >= quota:
+        raise HTTPException(400, "Code épuisé — quota atteint")
+
     return {
         "valide": True,
         "code": result.code,
         "influenceur": result.influenceur,
         "reduction_fcfa": result.reduction_fcfa,
-        "utilisations_restantes": result.quota - result.utilisations,
+        "utilisations_restantes": quota - utilisations,
+        "message": f"Code valide — {quota - utilisations} utilisation(s) restante(s)",
     }
 
 @router.get("/admin")
@@ -62,12 +71,13 @@ def list_promos(request: Request, db: Session = Depends(get_db), role: str = Dep
         except Exception:
             cmds = []
         ca_euro = sum(c.total_euro or 0 for c in cmds)
-        gain_total = (p.gain_influenceur or 1000) * (p.utilisations or 0)
+        utilisations = p.utilisations or 0
+        gain_total = (p.gain_influenceur or 1000) * utilisations
         result.append({
             "id": p.id, "code": p.code, "influenceur": p.influenceur,
             "reduction_fcfa": p.reduction_fcfa, "gain_influenceur": p.gain_influenceur,
-            "quota": p.quota, "utilisations": p.utilisations or 0,
-            "utilisations_restantes": max(0, (p.quota or 50) - (p.utilisations or 0)),
+            "quota": p.quota, "utilisations": utilisations,
+            "utilisations_restantes": max(0, (p.quota or 50) - utilisations),
             "actif": p.actif, "ca_euro": round(ca_euro, 2),
             "gain_total_fcfa": round(gain_total),
             "commandes": [{"ref": c.ref, "statut": c.statut} for c in cmds],
@@ -84,9 +94,11 @@ def create_promo(body: Dict[str, Any], request: Request, db: Session = Depends(g
     existing = db.execute(text("SELECT id FROM promo_codes WHERE code=:code"), {"code": code}).fetchone()
     if existing:
         raise HTTPException(400, "Code déjà existant")
+
+    # ✅ Fix : utilisations explicitement à 0
     result = db.execute(text("""
-        INSERT INTO promo_codes (code, influenceur, reduction_fcfa, gain_influenceur, quota)
-        VALUES (:code, :influenceur, :reduction_fcfa, :gain_influenceur, :quota)
+        INSERT INTO promo_codes (code, influenceur, reduction_fcfa, gain_influenceur, quota, utilisations)
+        VALUES (:code, :influenceur, :reduction_fcfa, :gain_influenceur, :quota, 0)
         RETURNING id, code
     """), {
         "code": code,
