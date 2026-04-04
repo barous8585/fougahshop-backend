@@ -25,7 +25,6 @@ def startup():
         cfg = get_config(db)
         init_port(db)
 
-        # Mot de passe admin
         if not cfg.admin_pwd or cfg.admin_pwd == '':
             cfg.admin_pwd = 'admin123'
             db.commit()
@@ -33,7 +32,6 @@ def startup():
         else:
             print(f"✅ Mot de passe actuel : {cfg.admin_pwd}")
 
-        # ✅ Secret reset — stocké en base, jamais dans le HTML
         if not cfg.secret_reset or cfg.secret_reset == '':
             cfg.secret_reset = 'fougah2026'
             db.commit()
@@ -49,10 +47,23 @@ startup()
 # ── App ───────────────────────────────────────────────────────
 app = FastAPI(title="FougahShop API", version="2.0.0")
 
+# ── CORS — domaine Netlify fougahshop.com ─────────────────────
+ALLOWED_ORIGINS = [
+    # ── Production — domaine custom Netlify ───────────────────
+    "https://fougahshop.com",
+    "https://www.fougahshop.com",
+    # ── Développement local ───────────────────────────────────
+    "http://localhost:3000",
+    "http://localhost:5500",
+    "http://127.0.0.1:5500",
+    "http://localhost:8000",
+    "http://127.0.0.1:8000",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
+    allow_origins=ALLOWED_ORIGINS,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
     allow_credentials=False,
 )
@@ -75,10 +86,12 @@ if os.path.exists(static_dir):
     def root():
         return os.path.join(static_dir, "index.html")
 
+# ── Health check ──────────────────────────────────────────────
 @app.get("/health")
 def health():
     return {"status": "ok", "version": "2.0.0"}
 
+# ── Documentation des routes ──────────────────────────────────
 @app.get("/api")
 def api_info():
     return {
@@ -90,6 +103,7 @@ def api_info():
             "POST /api/commandes/",
             "GET  /api/commandes/suivi/{ref}",
             "GET  /api/commandes/historique/{tel}",
+            "POST /api/commandes/annuler",
             "POST /api/paiement/init",
             "POST /api/paiement/webhook",
             "POST /api/auth/login",
