@@ -254,3 +254,52 @@ def historique(tel: str, db: Session = Depends(get_db)):
         }
         for c in cmds
     ]
+
+# ── Annulation de commande par le client ──────────────────────
+class AnnulationBody(BaseModel):
+    ref: str
+    client_tel: str
+    motif: Optional[str] = None
+
+@router.post("/annuler")
+def annuler_commande(body: AnnulationBody, db: Session = Depends(get_db)):
+    ref = body.ref.strip().upper()
+    cmd = db.query(Commande).filter(Commande.ref == ref).first()
+
+    if not cmd:
+        raise HTTPException(404, "Commande introuvable")
+
+    # Vérifier que le téléphone correspond (sécurité minimale)
+    tel_clean = body.client_tel.replace(" ", "").replace("+", "")
+    cmd_tel_clean = (cmd.client_tel or "").replace(" ", "").replace("+", "")
+    if tel_clean[-8:] not in cmd_tel_clean:
+        raise HTTPException(403, "Numéro de téléphone incorrect")
+
+    # Vérifier que l'annulation est possible
+    STATUTS_ANNULABLES = ["en_attente_paiement", "paye"]
+    if cmd.statut not in STATUTS_ANNULABLES:
+        raise HTTPException(400, f"Annulation impossible — statut actuel : {cmd.statut}")
+
+    # Sauvegarder l'ancien statut pour la notification
+    ancien_statut = cmd.statut
+
+    # Passer au statut "annulée"
+    cmd.statut = "annulee"
+    note = f"[ANNULATION CLIENT] Tel: {body.client_tel}"
+    if body.motif:
+        note += f" | Motif: {body.motif}"
+    cmd.note_admin = (cmd.note_admin or "") + " | " + note
+    db.commit()
+
+    # Notifier le patron
+    try:
+        notifier_patron(
+            db,
+            "❌ Demande d'annulation",
+            f"{cmd.ref} · {cmd.client_nom} · {cmd.client_pays} · Ancien statut: {ancien_statut}",
+            cmd.ref
+        )
+    except Exception:
+        pass
+
+    return {"ok": True, "ref": cmd.ref, "statut": "annulee"}
