@@ -19,20 +19,22 @@ except Exception:
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
 
-STATUTS = ["en_attente_paiement","paye","achete","expedie","arrive","paiement_refuse"]
+STATUTS = ["en_attente_paiement","paye","achete","expedie","arrive","recupere","paiement_refuse","annulee"]
 STATUT_LABELS = {
     "en_attente_paiement": "En attente de paiement",
     "paye":     "Payé",
     "achete":   "Acheté",
     "expedie":  "Expédié",
     "arrive":   "Arrivé",
+    "recupere": "Récupéré",
     "paiement_refuse": "Paiement refusé",
+    "annulee":  "Annulée",
 }
 
 # Statuts accessibles par rôle
 STATUTS_PAR_ROLE = {
     "patron":      STATUTS,
-    "logisticien": ["paye","achete","expedie","arrive"],
+    "logisticien": ["paye","achete","expedie","arrive","recupere"],
     "employe":     ["paye","achete"],
 }
 
@@ -61,7 +63,7 @@ def stats(request: Request, db: Session = Depends(get_db),
     by_statut = {s: db.query(Commande).filter(Commande.statut == s).count()
                  for s in STATUTS}
     encaisse = db.query(func.sum(Commande.total_local)).filter(
-        Commande.statut.in_(["paye","achete","expedie","arrive"])
+        Commande.statut.in_(["paye","achete","expedie","arrive","recupere"])
     ).scalar() or 0
 
     base = {"total": total, "by_statut": by_statut}
@@ -70,7 +72,7 @@ def stats(request: Request, db: Session = Depends(get_db),
         base["encaisse"] = round(encaisse)
         cfg = db.query(Config).first()
         nb_articles_payes = db.query(func.sum(Commande.nb_articles)).filter(
-            Commande.statut.in_(["paye","achete","expedie","arrive"])
+            Commande.statut.in_(["paye","achete","expedie","arrive","recupere"])
         ).scalar() or 0
         base["marge_estimee"] = round((cfg.commission if cfg else 3500) * nb_articles_payes)
 
