@@ -11,7 +11,7 @@ router = APIRouter(prefix="/api/whatsapp", tags=["whatsapp"])
 
 # ── Config Twilio ─────────────────────────────────────────────
 TWILIO_ACCOUNT_SID = "AC6b3627d25e01c316ad79177595d847bf"
-TWILIO_AUTH_TOKEN  = ""  # ← À remplir avec ton Auth Token
+TWILIO_AUTH_TOKEN  = "bab9a0f2f82d9975d99afa112f6b0cd1"  # ← À remplir avec ton Auth Token
 TWILIO_WA_NUMBER   = "whatsapp:+14155238886"
 
 # ── Config ZenRows ────────────────────────────────────────────
