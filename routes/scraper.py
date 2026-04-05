@@ -208,3 +208,345 @@ async def scraper_produit(body: ScrapeRequest):
         raise
     except Exception as e:
         raise HTTPException(500, f"Erreur scraping: {str(e)[:100]}")
+
+# ══════════════════════════════════════════════════════════════
+# EXTRACTION PANIER COMPLET
+# ══════════════════════════════════════════════════════════════
+
+PANIER_RULES = {
+    "zara.com": {
+        "js": True,
+        "wait": "3000",
+        "articles_selector": "[class*='shop-cart-item']",
+    },
+    "hm.com": {
+        "js": True,
+        "wait": "3000",
+        "articles_selector": "[class*='product-item']",
+    },
+    "asos.com": {
+        "js": True,
+        "wait": "3000",
+        "articles_selector": "[class*='item-details']",
+    },
+    "zalando.fr": {
+        "js": True,
+        "wait": "3000",
+        "articles_selector": "[class*='article']",
+    },
+}
+
+class PanierRequest(BaseModel):
+    url: str
+
+@router.post("/panier")
+async def scraper_panier(body: PanierRequest):
+    url = body.url.strip()
+    if not url.startswith("http"):
+        raise HTTPException(400, "URL invalide")
+
+    # Identifier le site
+    site = next((s for s in PANIER_RULES if s in url), None)
+    rules = PANIER_RULES.get(site, {"js": True, "wait": "3000"})
+
+    # Paramètres ZenRows — JS rendering obligatoire pour les paniers
+    params = {
+        "apikey":    ZENROWS_API_KEY,
+        "url":       url,
+        "js_render": "true",
+        "wait":      rules.get("wait", "3000"),
+        "premium_proxy": "false",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=45) as client:
+            resp = await client.get(ZENROWS_URL, params=params)
+
+        if resp.status_code != 200:
+            raise HTTPException(resp.status_code, f"Erreur ZenRows: {resp.text[:200]}")
+
+        html_content = resp.text
+        articles = []
+
+        # ── ZARA ─────────────────────────────────────────────
+        if "zara.com" in url:
+            articles = extraire_panier_zara(html_content)
+
+        # ── H&M ──────────────────────────────────────────────
+        elif "hm.com" in url:
+            articles = extraire_panier_hm(html_content)
+
+        # ── ASOS ─────────────────────────────────────────────
+        elif "asos.com" in url:
+            articles = extraire_panier_asos(html_content)
+
+        # ── ZALANDO ──────────────────────────────────────────
+        elif "zalando" in url:
+            articles = extraire_panier_zalando(html_content)
+
+        # ── Générique — Open Graph + Schema.org ──────────────
+        else:
+            articles = extraire_panier_generique(html_content, url)
+
+        if not articles:
+            # Fallback : essayer l'extraction générique
+            articles = extraire_panier_generique(html_content, url)
+
+        if not articles:
+            raise HTTPException(404, "Aucun article trouvé dans ce panier")
+
+        return {
+            "ok":       True,
+            "site":     site or "autre",
+            "nb":       len(articles),
+            "articles": articles,
+        }
+
+    except httpx.TimeoutException:
+        raise HTTPException(408, "Délai dépassé — le site met trop de temps à répondre")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"Erreur: {str(e)[:100]}")
+
+
+def extraire_panier_zara(html: str) -> list:
+    """Extraction panier Zara"""
+    articles = []
+    try:
+        # JSON dans les scripts next.js / data
+        json_matches = re.findall(r'__NEXT_DATA__[^>]*>([^<]+)</script>', html)
+        for jm in json_matches:
+            try:
+                data = json.loads(jm)
+                # Chercher les items du panier dans le JSON
+                items = find_cart_items(data)
+                if items:
+                    for item in items:
+                        art = normaliser_article(item, "zara.com")
+                        if art: articles.append(art)
+                    return articles
+            except Exception:
+                pass
+
+        # Fallback regex HTML
+        # Chercher les blocs produit dans le HTML
+        blocs = re.findall(
+            r'class="[^"]*shop-cart-item[^"]*"[^>]*>(.*?)</li>',
+            html, re.S | re.I
+        )
+        for bloc in blocs[:10]:
+            art = extraire_article_html(bloc)
+            if art: articles.append(art)
+
+    except Exception as e:
+        print(f"Erreur Zara: {e}")
+
+    return articles
+
+
+def extraire_panier_hm(html: str) -> list:
+    """Extraction panier H&M"""
+    articles = []
+    try:
+        # H&M utilise souvent Redux store dans window.__data
+        data_match = re.search(r'window\.__data\s*=\s*({.*?});', html, re.S)
+        if data_match:
+            data = json.loads(data_match.group(1))
+            items = find_cart_items(data)
+            for item in items:
+                art = normaliser_article(item, "hm.com")
+                if art: articles.append(art)
+            if articles: return articles
+
+        # Fallback HTML
+        blocs = re.findall(
+            r'class="[^"]*product-item[^"]*"[^>]*>(.*?)</article>',
+            html, re.S | re.I
+        )
+        for bloc in blocs[:10]:
+            art = extraire_article_html(bloc)
+            if art: articles.append(art)
+
+    except Exception as e:
+        print(f"Erreur H&M: {e}")
+
+    return articles
+
+
+def extraire_panier_asos(html: str) -> list:
+    """Extraction panier ASOS"""
+    articles = []
+    try:
+        # ASOS stocke le panier en JSON dans window.asos
+        data_match = re.search(r'window\.asos\s*=\s*({.*?});\s*\n', html, re.S)
+        if data_match:
+            data = json.loads(data_match.group(1))
+            items = find_cart_items(data)
+            for item in items:
+                art = normaliser_article(item, "asos.com")
+                if art: articles.append(art)
+            if articles: return articles
+
+        # Fallback HTML
+        blocs = re.findall(
+            r'data-testid="[^"]*bag-item[^"]*"[^>]*>(.*?)</article>',
+            html, re.S | re.I
+        )
+        for bloc in blocs[:10]:
+            art = extraire_article_html(bloc)
+            if art: articles.append(art)
+
+    except Exception as e:
+        print(f"Erreur ASOS: {e}")
+
+    return articles
+
+
+def extraire_panier_zalando(html: str) -> list:
+    """Extraction panier Zalando"""
+    articles = []
+    try:
+        data_match = re.search(r'<script[^>]*type="application/json"[^>]*>({.*?})</script>', html, re.S)
+        if data_match:
+            data = json.loads(data_match.group(1))
+            items = find_cart_items(data)
+            for item in items:
+                art = normaliser_article(item, "zalando.fr")
+                if art: articles.append(art)
+            if articles: return articles
+
+        blocs = re.findall(
+            r'class="[^"]*article[^"]*"[^>]*>(.*?)</article>',
+            html, re.S | re.I
+        )
+        for bloc in blocs[:10]:
+            art = extraire_article_html(bloc)
+            if art: articles.append(art)
+
+    except Exception as e:
+        print(f"Erreur Zalando: {e}")
+
+    return articles
+
+
+def extraire_panier_generique(html: str, url: str) -> list:
+    """Extraction générique via Schema.org et Open Graph"""
+    articles = []
+    try:
+        # Schema.org ItemList ou Product
+        ld_matches = re.findall(
+            r'<script[^>]*type="application/ld\+json"[^>]*>(.*?)</script>',
+            html, re.S | re.I
+        )
+        for ld in ld_matches:
+            try:
+                data = json.loads(ld)
+                if isinstance(data, list):
+                    for item in data:
+                        art = normaliser_article(item, url)
+                        if art: articles.append(art)
+                elif data.get("@type") in ("ItemList", "ShoppingCart"):
+                    for item in data.get("itemListElement", []):
+                        art = normaliser_article(item, url)
+                        if art: articles.append(art)
+                elif data.get("@type") == "Product":
+                    art = normaliser_article(data, url)
+                    if art: articles.append(art)
+            except Exception:
+                pass
+
+    except Exception as e:
+        print(f"Erreur générique: {e}")
+
+    return articles
+
+
+def find_cart_items(data: dict, depth: int = 0) -> list:
+    """Cherche récursivement les items du panier dans un dict JSON"""
+    if depth > 8: return []
+    results = []
+    if isinstance(data, dict):
+        # Clés communes pour les items de panier
+        for key in ['items', 'cartItems', 'lineItems', 'products', 'entries',
+                    'bagItems', 'cart_items', 'articles', 'orderItems']:
+            if key in data and isinstance(data[key], list):
+                results.extend(data[key])
+        # Récursion
+        for v in data.values():
+            if isinstance(v, (dict, list)):
+                results.extend(find_cart_items(v, depth+1))
+    elif isinstance(data, list):
+        for item in data:
+            results.extend(find_cart_items(item, depth+1))
+    return results[:20]  # Max 20 articles
+
+
+def normaliser_article(item: dict, site: str) -> dict:
+    """Normalise un article extrait en format FougahShop"""
+    if not isinstance(item, dict): return None
+    try:
+        nom = (item.get("name") or item.get("productName") or
+               item.get("title") or item.get("displayName") or "")
+        if not nom: return None
+
+        prix_raw = (item.get("price") or item.get("currentPrice") or
+                    item.get("salePrice") or item.get("amount") or 0)
+
+        if isinstance(prix_raw, dict):
+            prix_raw = prix_raw.get("value") or prix_raw.get("amount") or 0
+
+        prix = f"{prix_raw} €" if prix_raw else ""
+
+        img = (item.get("image") or item.get("imageUrl") or
+               item.get("img") or item.get("thumbnail") or "")
+        if isinstance(img, list): img = img[0] if img else ""
+        if isinstance(img, dict): img = img.get("url") or img.get("src") or ""
+
+        lien = (item.get("url") or item.get("productUrl") or
+                item.get("href") or item.get("link") or "")
+        if lien and not lien.startswith("http"):
+            domain = next((s for s in PANIER_RULES if s in site), "")
+            if domain: lien = f"https://www.{domain}{lien}"
+
+        taille = (item.get("size") or item.get("selectedSize") or
+                  item.get("variant") or "")
+        couleur = (item.get("color") or item.get("colour") or
+                   item.get("selectedColor") or "")
+        qty = int(item.get("quantity") or item.get("qty") or 1)
+
+        return {
+            "nom":    str(nom)[:120],
+            "prix":   str(prix)[:30],
+            "img":    str(img)[:500],
+            "lien":   str(lien)[:500],
+            "taille": str(taille)[:30],
+            "couleur":str(couleur)[:30],
+            "qty":    qty,
+        }
+    except Exception:
+        return None
+
+
+def extraire_article_html(bloc: str) -> dict:
+    """Extrait un article depuis un bloc HTML brut"""
+    try:
+        nom_m = re.search(r'<(?:h[1-6]|span|p)[^>]*class="[^"]*(?:name|title|product)[^"]*"[^>]*>([^<]+)', bloc, re.I)
+        prix_m = re.search(r'[\d\s]+[.,]\d{2}\s*€|€\s*[\d\s]+[.,]\d{2}', bloc)
+        img_m  = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', bloc, re.I)
+        lien_m = re.search(r'<a[^>]+href=["\']([^"\']+)["\']', bloc, re.I)
+
+        nom = nom_m.group(1).strip() if nom_m else ""
+        if not nom: return None
+
+        return {
+            "nom":    nom[:120],
+            "prix":   prix_m.group(0).strip() if prix_m else "",
+            "img":    img_m.group(1) if img_m else "",
+            "lien":   lien_m.group(1) if lien_m else "",
+            "taille": "",
+            "couleur": "",
+            "qty":    1,
+        }
+    except Exception:
+        return None
