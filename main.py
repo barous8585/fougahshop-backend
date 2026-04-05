@@ -13,6 +13,7 @@ from routes.paiement  import router as paiement_router
 from routes.promo     import router as promo_router
 from routes.notifs    import router as notifs_router
 from routes.avis      import router as avis_router
+from routes.scraper   import router as scraper_router
 from routes.config    import init_port, get_config
 from database import SessionLocal
 
@@ -78,6 +79,7 @@ app.include_router(paiement_router)
 app.include_router(promo_router)
 app.include_router(notifs_router)
 app.include_router(avis_router)
+app.include_router(scraper_router)
 
 # ── Frontend statique ─────────────────────────────────────────
 static_dir = os.path.join(os.path.dirname(__file__), "static")
