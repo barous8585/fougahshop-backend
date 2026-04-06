@@ -94,19 +94,33 @@ async def obtenir_config_fougah() -> dict:
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(f"{FOUGAH_API}/api/config/public")
-            return resp.json()
+            resp.encoding = 'utf-8'
+            data = resp.json()
+            return data
     except Exception:
-        return {"taux_change": 660, "commission": 3500}
+        return {"taux_change": 660, "commission": 3500, "taux_gnf": 9500}
+
+def get_commission(total_eu: float) -> int:
+    """Commission progressive par paliers — identique à l'app FougahShop"""
+    if total_eu <= 50:   return 3500
+    if total_eu <= 100:  return 5000
+    if total_eu <= 200:  return 7000
+    if total_eu <= 500:  return 12000
+    return 20000
 
 def calculer_total(prix_eu: float, pays: str, cfg: dict) -> str:
-    """Calcule le total en monnaie locale"""
-    taux = cfg.get("taux_gnf", 9500) if "Guinée" in pays else cfg.get("taux_change", 660)
-    commission = cfg.get("commission", 3500)
-    if "Guinée" in pays:
-        total = round((prix_eu * taux) + (commission * taux / 656))
+    """Calcule le total en monnaie locale avec commission progressive"""
+    commission = get_commission(prix_eu)
+
+    if "Guinée" in pays or "Guinee" in pays or pays == "1":
+        taux = cfg.get("taux_gnf", 9500)
+        # Commission convertie en GNF (1€ = 656 FCFA de référence)
+        commission_gnf = round(commission * taux / 656)
+        total = round((prix_eu * taux) + commission_gnf)
         return f"{total:,} GNF".replace(",", " ")
     else:
-        total = round((prix_eu * 660) + commission)
+        taux = cfg.get("taux_change", 660)
+        total = round((prix_eu * taux) + commission)
         return f"{total:,} FCFA".replace(",", " ")
 
 def get_session(tel: str) -> dict:
@@ -178,8 +192,9 @@ async def whatsapp_webhook(
 
             return twiml_response(
                 f"✅ Lien {site_txt} reçu !\n\n"
-                f"Quel est le *prix total* de votre panier affiché sur {site_txt} ? _(en €)_\n\n"
-                f"Ex: *150* ou *89.99*"
+                f"Quel est le *prix total* de votre panier affiché sur {site_txt} ?\n\n"
+                f"⚠️ Donnez le prix en *euros (€)* — pas en FCFA ou GNF\n\n"
+                f"Exemple : si le site affiche *89,99 €*, tapez *89.99*"
             )
         else:
             # Pas de lien — message de bienvenue
@@ -193,16 +208,23 @@ async def whatsapp_webhook(
 
     # ── Prix manuel ───────────────────────────────────────────
     elif session["etape"] == "prix_manuel":
-        prix_match = re.search(r'[\d.,]+', msg.replace(',','.'))
+        prix_match = re.search(r'[\d]+[.,]?\d*', msg.replace(',','.'))
         if prix_match:
             try:
-                prix = float(prix_match.group(0))
+                prix = float(prix_match.group(0).replace(',','.'))
+
+                if prix < 1:
+                    return twiml_response(
+                        f"❌ Prix invalide. Tapez le montant en *euros (€)* affiché sur le site.\n"
+                        f"Exemple : *89.99* ou *150*"
+                    )
+
                 session["total_eu"] = prix
                 session["panier"] = [{"nom": "Panier", "prix": f"{prix} €", "qty": 1}]
                 session["etape"] = "choix_pays"
 
                 return twiml_response(
-                    f"💶 Prix reçu : *{prix:.2f} €*\n\n"
+                    f"✅ *{prix:.2f} €* — c'est bien le montant en euros affiché sur le site ?\n\n"
                     f"🌍 *Dans quel pays êtes-vous ?*\n"
                     f"1 - 🇬🇳 Guinée Conakry\n"
                     f"2 - 🇧🇯 Bénin\n"
@@ -210,7 +232,11 @@ async def whatsapp_webhook(
                 )
             except Exception:
                 pass
-        return twiml_response("❌ Je n'ai pas compris. Envoyez juste le prix en chiffres, ex: *150*")
+        return twiml_response(
+            "❌ Je n'ai pas compris.\n\n"
+            "Tapez le *prix en euros (€)* affiché sur le site.\n"
+            "Exemple : *89.99* ou *150*"
+        )
 
     # ── Choix pays ────────────────────────────────────────────
     elif session["etape"] == "choix_pays":
