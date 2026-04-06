@@ -161,48 +161,26 @@ async def whatsapp_webhook(
 
         if url_match:
             url = url_match.group(0)
-            session["etape"] = "extraction"
             session["url"] = url
+            session["etape"] = "prix_manuel"
 
-            # Extraire les articles
-            articles = await extraire_articles_zenrows(url)
+            # Détecter le site pour personnaliser le message
+            site = ""
+            if "zara" in url: site = "Zara"
+            elif "nike" in url: site = "Nike"
+            elif "amazon" in url: site = "Amazon"
+            elif "hm.com" in url: site = "H&M"
+            elif "asos" in url: site = "ASOS"
+            elif "zalando" in url: site = "Zalando"
+            elif "shein" in url: site = "Shein"
 
-            if articles:
-                session["panier"] = articles
-                session["etape"] = "choix_pays"
+            site_txt = f"*{site}*" if site else "le site"
 
-                recap = "✅ *J'ai trouvé ces articles dans votre panier :*\n\n"
-                total_eu = 0
-                for i, a in enumerate(articles):
-                    recap += f"{i+1}. {a['nom']}"
-                    if a.get("prix"):
-                        recap += f" — {a['prix']}"
-                        # Extraire le prix numérique
-                        prix_num = re.search(r'[\d.,]+', a['prix'].replace(',','.'))
-                        if prix_num:
-                            try: total_eu += float(prix_num.group(0)) * a.get('qty',1)
-                            except: pass
-                    recap += "\n"
-
-                session["total_eu"] = total_eu
-
-                recap += f"\n💶 *Total Europe : {total_eu:.2f} €*\n\n"
-                recap += "🌍 *Dans quel pays êtes-vous ?*\n"
-                recap += "1 - 🇬🇳 Guinée Conakry\n"
-                recap += "2 - 🇧🇯 Bénin\n"
-                recap += "3 - 🇸🇳 Sénégal"
-
-                return twiml_response(recap)
-            else:
-                # Articles non extraits — demander le prix manuellement
-                session["etape"] = "prix_manuel"
-                session["url"] = url
-                return twiml_response(
-                    "🔍 J'ai reçu votre lien de panier.\n\n"
-                    "⚠️ Je n'ai pas pu extraire les articles automatiquement.\n\n"
-                    "Quel est le *prix total* affiché sur le site ? (en €)\n"
-                    "Ex: *150* ou *89.99*"
-                )
+            return twiml_response(
+                f"✅ Lien {site_txt} reçu !\n\n"
+                f"Quel est le *prix total* de votre panier affiché sur {site_txt} ? _(en €)_\n\n"
+                f"Ex: *150* ou *89.99*"
+            )
         else:
             # Pas de lien — message de bienvenue
             return twiml_response(
