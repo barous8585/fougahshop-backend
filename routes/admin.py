@@ -56,6 +56,14 @@ def serialize_cmd(c):
         "created_at": c.created_at,
     }
 
+def get_commission_palier(total_eu: float) -> int:
+    """Commission progressive par paliers — identique à l'app FougahShop"""
+    if total_eu <= 50:   return 3500
+    if total_eu <= 100:  return 5000
+    if total_eu <= 200:  return 7000
+    if total_eu <= 500:  return 12000
+    return 20000
+
 @router.get("/stats")
 def stats(request: Request, db: Session = Depends(get_db),
           role: str = Depends(require_auth)):
@@ -70,11 +78,16 @@ def stats(request: Request, db: Session = Depends(get_db),
 
     if role == "patron":
         base["encaisse"] = round(encaisse)
-        cfg = db.query(Config).first()
-        nb_articles_payes = db.query(func.sum(Commande.nb_articles)).filter(
+        # Calcul marge réelle avec paliers par commande
+        cmds_payees = db.query(Commande).filter(
             Commande.statut.in_(["paye","achete","expedie","arrive","recupere"])
-        ).scalar() or 0
-        base["marge_estimee"] = round((cfg.commission if cfg else 3500) * nb_articles_payes)
+        ).all()
+        marge_totale = sum(
+            get_commission_palier(c.total_euro or 0)
+            for c in cmds_payees
+        )
+        base["marge_estimee"] = round(marge_totale)
+        base["nb_commandes_actives"] = len(cmds_payees)
 
     return base
 
