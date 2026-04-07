@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, Response, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.orm import Session
 from typing import Dict, Any
 import secrets
@@ -22,11 +22,16 @@ def get_config(db):
 @router.post("/login")
 def login(body: Dict[str, Any], db: Session = Depends(get_db)):
     password = str(body.get("password", ""))
+
+    # ✅ Refus immédiat si mot de passe vide
+    if not password:
+        raise HTTPException(status_code=401, detail="Mot de passe requis")
+
     cfg = get_config(db)
     role = None
 
-    # Vérifier d'abord le mot de passe patron
-    if password == cfg.admin_pwd:
+    # Vérifier le mot de passe patron
+    if cfg.admin_pwd and password == cfg.admin_pwd:
         role = "patron"
     else:
         # Chercher un employé actif avec ce mot de passe
@@ -35,9 +40,7 @@ def login(body: Dict[str, Any], db: Session = Depends(get_db)):
             Employe.actif == True
         ).first()
         if emp:
-            # ✅ Lire le rôle depuis la base — "employe" ou "logisticien"
             role = getattr(emp, "role", None) or "employe"
-            # Sécurité : seuls les rôles connus sont acceptés
             if role not in ("employe", "logisticien"):
                 role = "employe"
 
@@ -64,14 +67,27 @@ def check(request: Request):
 
 @router.post("/reset")
 def reset_password(body: Dict[str, Any], db: Session = Depends(get_db)):
-    secret       = str(body.get("secret", ""))
-    new_password = str(body.get("new_password", ""))
+    secret       = str(body.get("secret", "")).strip()
+    new_password = str(body.get("new_password", "")).strip()
+
+    # ✅ Vérifications de format avant d'interroger la BDD
+    if not secret:
+        raise HTTPException(status_code=400, detail="Code secret requis")
+    if not new_password or len(new_password) < 4:
+        raise HTTPException(status_code=400, detail="Mot de passe trop court (minimum 4 caractères)")
+
     cfg = get_config(db)
-    if not secret or secret != cfg.secret_reset:
+
+    # ✅ Le secret est validé UNIQUEMENT ici côté serveur
+    if not cfg.secret_reset or secret != cfg.secret_reset:
         raise HTTPException(status_code=403, detail="Code secret incorrect")
-    if len(new_password) < 4:
-        raise HTTPException(status_code=400, detail="Mot de passe trop court")
+
     cfg.admin_pwd = new_password
+    # ✅ Invalider toutes les sessions patron actives après reset
+    tokens_a_supprimer = [t for t, r in sessions.items() if r == "patron"]
+    for t in tokens_a_supprimer:
+        sessions.pop(t, None)
+
     db.commit()
     return {"ok": True, "message": "Mot de passe mis à jour"}
 
