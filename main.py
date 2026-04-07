@@ -9,7 +9,6 @@ from routes.commandes import router as commandes_router
 from routes.admin     import router as admin_router
 from routes.auth      import router as auth_router
 from routes.config    import router as config_router
-from routes.paiement  import router as paiement_router
 from routes.promo     import router as promo_router
 from routes.notifs    import router as notifs_router
 from routes.avis      import router as avis_router
@@ -31,16 +30,16 @@ def startup():
         if not cfg.admin_pwd or cfg.admin_pwd == '':
             cfg.admin_pwd = 'admin123'
             db.commit()
-            print("✅ Mot de passe admin initialisé : admin123")
+            print("✅ Mot de passe admin initialisé (valeur par défaut)")
         else:
-            print(f"✅ Mot de passe actuel : {cfg.admin_pwd}")
+            print("✅ Mot de passe admin configuré")   # ← ne pas afficher la valeur
 
         if not cfg.secret_reset or cfg.secret_reset == '':
             cfg.secret_reset = 'fougah2026'
             db.commit()
-            print("✅ Secret reset initialisé : fougah2026")
+            print("✅ Secret reset initialisé (valeur par défaut)")
         else:
-            print(f"✅ Secret reset actuel : {cfg.secret_reset}")
+            print("✅ Secret reset configuré")          # ← ne pas afficher la valeur
 
     finally:
         db.close()
@@ -67,7 +66,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["*"],
+    allow_headers=["Content-Type", "X-Admin-Token"],  # ← restreint aux headers réellement utilisés
     allow_credentials=False,
 )
 
@@ -76,7 +75,7 @@ app.include_router(commandes_router)
 app.include_router(admin_router)
 app.include_router(auth_router)
 app.include_router(config_router)
-app.include_router(paiement_router)
+# paiement_router retiré — non utilisé côté frontend
 app.include_router(promo_router)
 app.include_router(notifs_router)
 app.include_router(avis_router)
@@ -110,8 +109,6 @@ def api_info():
             "GET  /api/commandes/suivi/{ref}",
             "GET  /api/commandes/historique/{tel}",
             "POST /api/commandes/annuler",
-            "POST /api/paiement/init",
-            "POST /api/paiement/webhook",
             "POST /api/auth/login",
             "POST /api/auth/reset",
             "GET  /api/auth/check",
@@ -132,5 +129,14 @@ def api_info():
             "PATCH /api/avis/admin/{id}/reponse",
             "PATCH /api/avis/admin/{id}/visibilite",
             "DELETE /api/avis/admin/{id}",
+            "GET  /api/config/pays",
+            "PATCH /api/config/pays/{pays}/toggle",
+            "POST /api/config/employes",
+            "DELETE /api/config/employes/{id}",
+            "GET  /api/config/employes",
+            "PUT  /api/config/port",
+            "PUT  /api/config/",
+            "POST /api/scraper/produit",
+            "POST /api/scraper/panier",
         ]
     }
