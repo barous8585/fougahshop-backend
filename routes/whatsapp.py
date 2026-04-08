@@ -6,16 +6,17 @@ from fastapi import Depends
 import httpx
 import re
 import json
+import os
 
 router = APIRouter(prefix="/api/whatsapp", tags=["whatsapp"])
 
 # ── Config Twilio ─────────────────────────────────────────────
-TWILIO_ACCOUNT_SID = "AC6b3627d25e01c316ad79177595d847bf"
-TWILIO_AUTH_TOKEN  = "bab9a0f2f82d9975d99afa112f6b0cd1"  # ← À remplir avec ton Auth Token
+TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN  = os.environ.get("TWILIO_AUTH_TOKEN")
 TWILIO_WA_NUMBER   = "whatsapp:+14155238886"
 
 # ── Config ZenRows ────────────────────────────────────────────
-ZENROWS_API_KEY = "7a92ab21726eae0cb290c90ec704b8a79ee6dad5"
+ZENROWS_API_KEY = os.environ.get("ZENROWS_API_KEY")
 ZENROWS_URL     = "https://api.zenrows.com/v1/"
 
 # ── Config Backend FougahShop ─────────────────────────────────
@@ -114,7 +115,6 @@ def calculer_total(prix_eu: float, pays: str, cfg: dict) -> str:
 
     if "Guinée" in pays or "Guinee" in pays or pays == "1":
         taux = cfg.get("taux_gnf", 9500)
-        # Commission convertie en GNF (1€ = 656 FCFA de référence)
         commission_gnf = round(commission * taux / 656)
         total = round((prix_eu * taux) + commission_gnf)
         return f"{total:,} GNF".replace(",", " ")
@@ -170,7 +170,6 @@ async def whatsapp_webhook(
     # ── Accueil ───────────────────────────────────────────────
     if session["etape"] == "accueil":
 
-        # Détecter un lien dans le message
         url_match = re.search(r'https?://[^\s]+', msg)
 
         if url_match:
@@ -178,7 +177,6 @@ async def whatsapp_webhook(
             session["url"] = url
             session["etape"] = "prix_manuel"
 
-            # Détecter le site pour personnaliser le message
             site = ""
             if "zara" in url: site = "Zara"
             elif "nike" in url: site = "Nike"
@@ -197,7 +195,6 @@ async def whatsapp_webhook(
                 f"Exemple : si le site affiche *89,99 €*, tapez *89.99*"
             )
         else:
-            # Pas de lien — message de bienvenue
             return twiml_response(
                 f"👋 Bonjour ! Je suis l'assistant FougahShop 🛍️\n\n"
                 f"J'achète vos articles en Europe et vous les livre en Afrique.\n\n"
@@ -251,14 +248,12 @@ async def whatsapp_webhook(
             session["pays"] = pays
             session["etape"] = "confirmation"
 
-            # Calculer le total
             cfg = await obtenir_config_fougah()
             total_eu = session.get("total_eu", 0)
             total_local = calculer_total(total_eu, pays, cfg)
             session["total_local"] = total_local
             session["cfg"] = cfg
 
-            # Récap complet
             recap = f"💰 *Récapitulatif de votre commande :*\n\n"
             for a in session["panier"]:
                 recap += f"• {a['nom']}"
@@ -285,7 +280,6 @@ async def whatsapp_webhook(
         session["etape"] = "operateur"
         pays = session.get("pays","")
 
-        # Opérateurs selon pays
         if "Guinée" in pays:
             ops = "1 - 🟠 Orange Money\n2 - 🟡 MTN MoMo"
         elif "Bénin" in pays:
@@ -314,7 +308,6 @@ async def whatsapp_webhook(
         session["operateur"] = operateur
         session["etape"] = "valider"
 
-        # Numéros de paiement
         numeros = {
             "Orange Money": "+224 620 762 815",
             "MTN MoMo":     "+229 01 52 26 01 00",
@@ -335,7 +328,6 @@ async def whatsapp_webhook(
         if msg_lower in ["payé","paye","paid","oui","yes","confirmé"]:
             session["etape"] = "termine"
 
-            # Créer la commande dans FougahShop
             try:
                 articles = session.get("panier",[])
                 payload = {
