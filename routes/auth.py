@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from sqlalchemy.orm import Session
 from typing import Dict, Any
 import secrets
@@ -8,7 +8,13 @@ from models import Config, Employe
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
 # Sessions en mémoire (tokens valides)
+# Note: survivent aux requêtes mais pas aux restarts Render.
+# Pour persister, stocker dans la DB ou Redis.
 sessions: dict = {}
+
+# Durée de vie du cookie (7 jours)
+COOKIE_MAX_AGE = 7 * 24 * 3600
+COOKIE_NAME = "fg_admin_session"
 
 def get_config(db):
     cfg = db.query(Config).first()
@@ -19,22 +25,33 @@ def get_config(db):
         db.refresh(cfg)
     return cfg
 
+def _set_session_cookie(response: Response, token: str):
+    response.set_cookie(
+        key=COOKIE_NAME,
+        value=token,
+        httponly=True,       # inaccessible au JS — protection XSS
+        secure=True,         # HTTPS uniquement
+        samesite="strict",   # protection CSRF
+        max_age=COOKIE_MAX_AGE,
+        path="/",
+    )
+
+def _clear_session_cookie(response: Response):
+    response.delete_cookie(key=COOKIE_NAME, path="/")
+
 @router.post("/login")
-def login(body: Dict[str, Any], db: Session = Depends(get_db)):
+def login(body: Dict[str, Any], response: Response, db: Session = Depends(get_db)):
     password = str(body.get("password", ""))
 
-    # ✅ Refus immédiat si mot de passe vide
     if not password:
         raise HTTPException(status_code=401, detail="Mot de passe requis")
 
     cfg = get_config(db)
     role = None
 
-    # Vérifier le mot de passe patron
     if cfg.admin_pwd and password == cfg.admin_pwd:
         role = "patron"
     else:
-        # Chercher un employé actif avec ce mot de passe
         emp = db.query(Employe).filter(
             Employe.pwd == password,
             Employe.actif == True
@@ -49,17 +66,32 @@ def login(body: Dict[str, Any], db: Session = Depends(get_db)):
 
     token = secrets.token_hex(32)
     sessions[token] = role
-    return {"ok": True, "role": role, "token": token}
+
+    # Poser le cookie HttpOnly — le frontend ne reçoit PLUS le token en clair
+    _set_session_cookie(response, token)
+
+    # On retourne role pour que le frontend sache qui est connecté,
+    # mais on ne retourne plus le token
+    return {"ok": True, "role": role}
 
 @router.post("/logout")
-def logout(request: Request):
-    token = request.headers.get("X-Admin-Token") or ""
+def logout(request: Request, response: Response):
+    token = (
+        request.cookies.get(COOKIE_NAME)
+        or request.headers.get("X-Admin-Token")  # rétrocompatibilité transitoire
+        or ""
+    )
     sessions.pop(token, None)
+    _clear_session_cookie(response)
     return {"ok": True}
 
 @router.get("/check")
 def check(request: Request):
-    token = request.headers.get("X-Admin-Token") or ""
+    token = (
+        request.cookies.get(COOKIE_NAME)
+        or request.headers.get("X-Admin-Token")  # rétrocompatibilité transitoire
+        or ""
+    )
     role = sessions.get(token)
     if role:
         return {"authenticated": True, "role": role}
@@ -70,7 +102,6 @@ def reset_password(body: Dict[str, Any], db: Session = Depends(get_db)):
     secret       = str(body.get("secret", "")).strip()
     new_password = str(body.get("new_password", "")).strip()
 
-    # ✅ Vérifications de format avant d'interroger la BDD
     if not secret:
         raise HTTPException(status_code=400, detail="Code secret requis")
     if not new_password or len(new_password) < 4:
@@ -78,12 +109,10 @@ def reset_password(body: Dict[str, Any], db: Session = Depends(get_db)):
 
     cfg = get_config(db)
 
-    # ✅ Le secret est validé UNIQUEMENT ici côté serveur
     if not cfg.secret_reset or secret != cfg.secret_reset:
         raise HTTPException(status_code=403, detail="Code secret incorrect")
 
     cfg.admin_pwd = new_password
-    # ✅ Invalider toutes les sessions patron actives après reset
     tokens_a_supprimer = [t for t, r in sessions.items() if r == "patron"]
     for t in tokens_a_supprimer:
         sessions.pop(t, None)
@@ -92,8 +121,16 @@ def reset_password(body: Dict[str, Any], db: Session = Depends(get_db)):
     return {"ok": True, "message": "Mot de passe mis à jour"}
 
 # ── Dépendances utilisées par les autres routes ───────────────
+
+def _get_token(request: Request) -> str:
+    return (
+        request.cookies.get(COOKIE_NAME)
+        or request.headers.get("X-Admin-Token")  # rétrocompatibilité transitoire
+        or ""
+    )
+
 def require_auth(request: Request):
-    token = request.headers.get("X-Admin-Token") or ""
+    token = _get_token(request)
     role = sessions.get(token)
     if not role:
         raise HTTPException(status_code=401, detail="Non authentifié")
