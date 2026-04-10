@@ -9,10 +9,8 @@ router = APIRouter(prefix="/api/auth", tags=["auth"])
 
 # Sessions en mémoire (tokens valides)
 # Note: survivent aux requêtes mais pas aux restarts Render.
-# Pour persister, stocker dans la DB ou Redis.
 sessions: dict = {}
 
-# Durée de vie du cookie (7 jours)
 COOKIE_MAX_AGE = 7 * 24 * 3600
 COOKIE_NAME = "fg_admin_session"
 
@@ -29,9 +27,9 @@ def _set_session_cookie(response: Response, token: str):
     response.set_cookie(
         key=COOKIE_NAME,
         value=token,
-        httponly=True,       # inaccessible au JS — protection XSS
-        secure=True,         # HTTPS uniquement
-        samesite="strict",   # protection CSRF
+        httponly=True,
+        secure=True,
+        samesite="strict",
         max_age=COOKIE_MAX_AGE,
         path="/",
     )
@@ -67,18 +65,17 @@ def login(body: Dict[str, Any], response: Response, db: Session = Depends(get_db
     token = secrets.token_hex(32)
     sessions[token] = role
 
-    # Poser le cookie HttpOnly — le frontend ne reçoit PLUS le token en clair
+    # Cookie HttpOnly pour les navigateurs
     _set_session_cookie(response, token)
 
-    # On retourne role pour que le frontend sache qui est connecté,
-    # mais on ne retourne plus le token
-    return {"ok": True, "role": role}
+    # ✅ Token retourné aussi dans le JSON pour le frontend localStorage
+    return {"ok": True, "role": role, "token": token}
 
 @router.post("/logout")
 def logout(request: Request, response: Response):
     token = (
         request.cookies.get(COOKIE_NAME)
-        or request.headers.get("X-Admin-Token")  # rétrocompatibilité transitoire
+        or request.headers.get("X-Admin-Token")
         or ""
     )
     sessions.pop(token, None)
@@ -89,7 +86,7 @@ def logout(request: Request, response: Response):
 def check(request: Request):
     token = (
         request.cookies.get(COOKIE_NAME)
-        or request.headers.get("X-Admin-Token")  # rétrocompatibilité transitoire
+        or request.headers.get("X-Admin-Token")
         or ""
     )
     role = sessions.get(token)
@@ -120,12 +117,12 @@ def reset_password(body: Dict[str, Any], db: Session = Depends(get_db)):
     db.commit()
     return {"ok": True, "message": "Mot de passe mis à jour"}
 
-# ── Dépendances utilisées par les autres routes ───────────────
+# ── Dépendances ───────────────────────────────────────────────
 
 def _get_token(request: Request) -> str:
     return (
         request.cookies.get(COOKIE_NAME)
-        or request.headers.get("X-Admin-Token")  # rétrocompatibilité transitoire
+        or request.headers.get("X-Admin-Token")
         or ""
     )
 
