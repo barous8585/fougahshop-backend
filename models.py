@@ -2,6 +2,7 @@ from sqlalchemy import Column, Integer, String, Float, DateTime, Text, Boolean
 from sqlalchemy.sql import func
 from database import Base
 
+
 class Config(Base):
     __tablename__ = "config"
     id              = Column(Integer, primary_key=True, default=1)
@@ -11,10 +12,15 @@ class Config(Base):
     wa_number       = Column(String,  default="33651727112")
     admin_pwd       = Column(String,  default="admin123")
     secret_reset    = Column(String,  default="fougah2026")
-    # ✅ Tarifs à l'unité — sérialisés en JSON (TEXT)
+    # Tarifs à l'unité — sérialisés en JSON (TEXT)
     tarifs_unite    = Column(Text,    nullable=True)
-    # ✅ Tarif au poids kg affiché sur la landing
+    # Tarif au poids kg affiché sur la landing
     tarif_poids_kg  = Column(Float,   default=12.0)
+    # ✅ Opérateurs Mobile Money par pays — JSON ex: {"Bénin": ["MTN MoMo", "Moov Money"]}
+    operateurs_pays = Column(Text,    nullable=True)
+    # ✅ Numéros de paiement par opérateur — JSON ex: {"Orange Money": "+224 620 762 815"}
+    numeros_paiement = Column(Text,   nullable=True)
+
 
 class PortKg(Base):
     __tablename__ = "port_kg"
@@ -24,14 +30,15 @@ class PortKg(Base):
     delai = Column(String,  default="7-10 jours")
     actif = Column(Boolean, default=True)
 
+
 class Employe(Base):
     __tablename__ = "employes"
     id    = Column(Integer, primary_key=True, autoincrement=True)
     nom   = Column(String)
     pwd   = Column(String)
     actif = Column(Boolean, default=True)
-    # ✅ Rôle : "employe" | "logisticien"
     role  = Column(String,  default="employe")
+
 
 class Commande(Base):
     __tablename__ = "commandes"
@@ -56,8 +63,13 @@ class Commande(Base):
     note_admin          = Column(Text,    nullable=True)
     delai_livraison     = Column(String,  nullable=True)
     promo_code          = Column(String,  nullable=True)
+    # ✅ Numéro de suivi colis (ex: LY123456789FR)
+    suivi_num           = Column(String,  nullable=True)
+    # ✅ Motif de refus paiement (envoyé au client)
+    motif_refus         = Column(Text,    nullable=True)
     created_at          = Column(DateTime, server_default=func.now())
     updated_at          = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
 
 class PromoCode(Base):
     __tablename__ = "promo_codes"
@@ -70,6 +82,7 @@ class PromoCode(Base):
     utilisations     = Column(Integer, default=0)
     actif            = Column(Boolean, default=True)
     created_at       = Column(DateTime, server_default=func.now())
+
 
 class Avis(Base):
     __tablename__ = "avis"
