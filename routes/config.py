@@ -55,20 +55,33 @@ def ensure_role_column(db):
         db.rollback()
 
 def ensure_tarifs_columns(db):
-    try:
-        db.execute(text(
-            "ALTER TABLE configs ADD COLUMN IF NOT EXISTS tarifs_unite TEXT DEFAULT NULL"
-        ))
-        db.commit()
-    except Exception:
-        db.rollback()
-    try:
-        db.execute(text(
-            "ALTER TABLE configs ADD COLUMN IF NOT EXISTS tarif_poids_kg FLOAT DEFAULT 12.0"
-        ))
-        db.commit()
-    except Exception:
-        db.rollback()
+    """Migration automatique — toutes les colonnes optionnelles."""
+    migrations = [
+        "ALTER TABLE configs ADD COLUMN IF NOT EXISTS tarifs_unite TEXT DEFAULT NULL",
+        "ALTER TABLE configs ADD COLUMN IF NOT EXISTS tarif_poids_kg FLOAT DEFAULT 12.0",
+        # ✅ Opérateurs Mobile Money par pays (JSON)
+        "ALTER TABLE configs ADD COLUMN IF NOT EXISTS operateurs_pays TEXT DEFAULT NULL",
+        # ✅ Numéros de paiement par opérateur (JSON)
+        "ALTER TABLE configs ADD COLUMN IF NOT EXISTS numeros_paiement TEXT DEFAULT NULL",
+    ]
+    for sql in migrations:
+        try:
+            db.execute(text(sql))
+            db.commit()
+        except Exception:
+            db.rollback()
+
+    # Migration table commandes
+    commandes_migrations = [
+        "ALTER TABLE commandes ADD COLUMN IF NOT EXISTS suivi_num VARCHAR DEFAULT NULL",
+        "ALTER TABLE commandes ADD COLUMN IF NOT EXISTS motif_refus TEXT DEFAULT NULL",
+    ]
+    for sql in commandes_migrations:
+        try:
+            db.execute(text(sql))
+            db.commit()
+        except Exception:
+            db.rollback()
 
 # ── Config publique (pas d'auth — lecture seule) ──────────────
 @router.get("/public")
@@ -84,24 +97,30 @@ def config_public(db: Session = Depends(get_db)):
         for p in db.query(PortKg).all()
     }
 
-    tarifs_unite = None
-    raw = getattr(cfg, "tarifs_unite", None)
-    if raw:
-        try:
-            tarifs_unite = json.loads(raw)
-        except Exception:
-            tarifs_unite = None
+    def parse_json_col(col_name):
+        raw = getattr(cfg, col_name, None)
+        if raw:
+            try: return json.loads(raw)
+            except Exception: pass
+        return None
 
-    tarif_poids_kg = getattr(cfg, "tarif_poids_kg", None) or 12.0
+    tarifs_unite    = parse_json_col("tarifs_unite")
+    tarif_poids_kg  = getattr(cfg, "tarif_poids_kg", None) or 12.0
+    # ✅ Opérateurs par pays — ex: {"Bénin": ["MTN MoMo", "Moov Money"]}
+    operateurs_pays = parse_json_col("operateurs_pays") or {}
+    # ✅ Numéros de paiement — ex: {"Orange Money": "+224 620 762 815"}
+    numeros_paiement = parse_json_col("numeros_paiement") or {}
 
     return {
-        "taux_change":    cfg.taux_change,
-        "commission":     cfg.commission,
-        "taux_gnf":       cfg.taux_gnf,
-        "wa_number":      cfg.wa_number,
-        "port_kg":        ports,
-        "tarifs_unite":   tarifs_unite,
-        "tarif_poids_kg": tarif_poids_kg,
+        "taux_change":     cfg.taux_change,
+        "commission":      cfg.commission,
+        "taux_gnf":        cfg.taux_gnf,
+        "wa_number":       cfg.wa_number,
+        "port_kg":         ports,
+        "tarifs_unite":    tarifs_unite,
+        "tarif_poids_kg":  tarif_poids_kg,
+        "operateurs_pays": operateurs_pays,    # ✅ nouveau
+        "numeros_paiement": numeros_paiement,  # ✅ nouveau
     }
 
 # ── Mise à jour config globale ✅ PROTÉGÉ ─────────────────────
@@ -112,12 +131,14 @@ def update_config(body: Dict[str, Any], request: Request,
     ensure_tarifs_columns(db)
     cfg = get_config(db)
 
+    # Champs simples
     if "taux_change"  in body: cfg.taux_change = float(body["taux_change"])
     if "commission"   in body: cfg.commission  = float(body["commission"])
     if "taux_gnf"     in body: cfg.taux_gnf    = float(body["taux_gnf"])
     if "wa_number"    in body: cfg.wa_number   = str(body["wa_number"])
     if "admin_pwd"    in body: cfg.admin_pwd   = str(body["admin_pwd"])
 
+    # Tarifs à l'unité
     if "tarifs_unite" in body:
         tu = body["tarifs_unite"]
         if isinstance(tu, list):
@@ -134,6 +155,49 @@ def update_config(body: Dict[str, Any], request: Request,
             db.execute(
                 text("UPDATE configs SET tarif_poids_kg = :v WHERE id = :id"),
                 {"v": float(body["tarif_poids_kg"]), "id": cfg.id}
+            )
+        except Exception:
+            pass
+
+    # ✅ Opérateurs Mobile Money par pays
+    # Le frontend envoie des clés de la forme "ops_Bénin", "ops_Sénégal", etc.
+    ops_updates = {k[4:]: v for k, v in body.items() if k.startswith("ops_")}
+    if ops_updates:
+        # Fusionner avec les données existantes
+        existing_raw = getattr(cfg, "operateurs_pays", None)
+        existing = {}
+        if existing_raw:
+            try: existing = json.loads(existing_raw)
+            except Exception: pass
+        existing.update(ops_updates)
+        try:
+            db.execute(
+                text("UPDATE configs SET operateurs_pays = :v WHERE id = :id"),
+                {"v": json.dumps(existing, ensure_ascii=False), "id": cfg.id}
+            )
+        except Exception:
+            pass
+
+    # ✅ Numéros de paiement par opérateur
+    # Le frontend envoie des clés de la forme "num_Orange-Money", "num_MTN-MoMo", etc.
+    num_updates = {}
+    for k, v in body.items():
+        if k.startswith("num_") and v:
+            # Reconvertir "num_Orange-Money" → "Orange Money"
+            op_key = k[4:].replace("-", " ")
+            num_updates[op_key] = str(v).strip()
+
+    if num_updates:
+        existing_raw = getattr(cfg, "numeros_paiement", None)
+        existing = {}
+        if existing_raw:
+            try: existing = json.loads(existing_raw)
+            except Exception: pass
+        existing.update(num_updates)
+        try:
+            db.execute(
+                text("UPDATE configs SET numeros_paiement = :v WHERE id = :id"),
+                {"v": json.dumps(existing, ensure_ascii=False), "id": cfg.id}
             )
         except Exception:
             pass
