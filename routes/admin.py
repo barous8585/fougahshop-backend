@@ -22,16 +22,15 @@ router = APIRouter(prefix="/api/admin", tags=["admin"])
 STATUTS = ["en_attente_paiement","paye","achete","expedie","arrive","recupere","paiement_refuse","annulee"]
 STATUT_LABELS = {
     "en_attente_paiement": "En attente de paiement",
-    "paye":     "Payé",
-    "achete":   "Acheté",
-    "expedie":  "Expédié",
-    "arrive":   "Arrivé",
-    "recupere": "Récupéré",
-    "paiement_refuse": "Paiement refusé",
-    "annulee":  "Annulée",
+    "paye":               "Payé",
+    "achete":             "Acheté",
+    "expedie":            "Expédié",
+    "arrive":             "Arrivé",
+    "recupere":           "Récupéré",
+    "paiement_refuse":    "Paiement refusé",
+    "annulee":            "Annulée",
 }
 
-# Statuts accessibles par rôle
 STATUTS_PAR_ROLE = {
     "patron":      STATUTS,
     "logisticien": ["paye","achete","expedie","arrive","recupere"],
@@ -40,24 +39,33 @@ STATUTS_PAR_ROLE = {
 
 def serialize_cmd(c):
     return {
-        "id": c.id, "ref": c.ref, "statut": c.statut,
-        "statut_label": STATUT_LABELS.get(c.statut, c.statut),
-        "client_nom": c.client_nom, "client_tel": c.client_tel,
-        "client_pays": c.client_pays, "client_adresse": c.client_adresse,
-        "client_instructions": c.client_instructions,
-        "operateur": c.operateur, "monnaie": c.monnaie,
-        "total_euro": c.total_euro, "total_local": c.total_local,
-        "poids_estime": c.poids_estime, "poids_reel": c.poids_reel,
-        "nb_articles": c.nb_articles,
-        "articles": json.loads(c.articles) if c.articles else [],
-        "note_admin": c.note_admin,
-        "delai_livraison": c.delai_livraison,
-        "paiement_ref": c.paiement_ref,
-        "created_at": c.created_at,
+        "id":                   c.id,
+        "ref":                  c.ref,
+        "statut":               c.statut,
+        "statut_label":         STATUT_LABELS.get(c.statut, c.statut),
+        "client_nom":           c.client_nom,
+        "client_tel":           c.client_tel,
+        "client_pays":          c.client_pays,
+        "client_adresse":       c.client_adresse,
+        "client_instructions":  c.client_instructions,
+        "operateur":            c.operateur,
+        "monnaie":              c.monnaie,
+        "total_euro":           c.total_euro,
+        "total_local":          c.total_local,
+        "poids_estime":         c.poids_estime,
+        "poids_reel":           c.poids_reel,
+        "nb_articles":          c.nb_articles,
+        "articles":             json.loads(c.articles) if c.articles else [],
+        "note_admin":           c.note_admin,
+        "delai_livraison":      c.delai_livraison,
+        "paiement_ref":         c.paiement_ref,
+        # ✅ Champs ajoutés pour suivi colis et motif refus
+        "suivi_num":            getattr(c, "suivi_num", None),
+        "motif_refus":          getattr(c, "motif_refus", None),
+        "created_at":           c.created_at,
     }
 
 def get_commission_palier(total_eu: float) -> int:
-    """Commission progressive par paliers — identique à l'app FougahShop"""
     if total_eu <= 50:   return 3500
     if total_eu <= 100:  return 5000
     if total_eu <= 200:  return 7000
@@ -78,7 +86,6 @@ def stats(request: Request, db: Session = Depends(get_db),
 
     if role == "patron":
         base["encaisse"] = round(encaisse)
-        # Calcul marge réelle avec paliers par commande
         cmds_payees = db.query(Commande).filter(
             Commande.statut.in_(["paye","achete","expedie","arrive","recupere"])
         ).all()
@@ -102,7 +109,6 @@ def liste_commandes(
     role: str = Depends(require_auth),
 ):
     q = db.query(Commande)
-
     statuts_autorises = STATUTS_PAR_ROLE.get(role, ["paye", "achete"])
 
     if role in ("employe", "logisticien"):
@@ -136,10 +142,14 @@ def liste_commandes(
         result.append(d)
     return result
 
+# ✅ StatutUpdate étendu avec delai_livraison, suivi_num, motif_refus
 class StatutUpdate(BaseModel):
-    statut:      str
-    note_admin:  Optional[str] = None
-    poids_reel:  Optional[float] = None
+    statut:          str
+    note_admin:      Optional[str]   = None
+    poids_reel:      Optional[float] = None
+    delai_livraison: Optional[str]   = None   # ← AJOUTÉ
+    suivi_num:       Optional[str]   = None   # ← AJOUTÉ
+    motif_refus:     Optional[str]   = None   # ← AJOUTÉ
 
 @router.patch("/commandes/{ref}/statut")
 def update_statut(
@@ -157,8 +167,21 @@ def update_statut(
         raise HTTPException(404, "Commande introuvable")
 
     cmd.statut = body.statut
+
     if body.note_admin:
         cmd.note_admin = (cmd.note_admin or "") + " | " + body.note_admin
+
+    # ✅ Délai de livraison mis à jour depuis l'admin
+    if body.delai_livraison:
+        cmd.delai_livraison = body.delai_livraison
+
+    # ✅ Numéro de suivi colis
+    if body.suivi_num and hasattr(cmd, "suivi_num"):
+        cmd.suivi_num = body.suivi_num
+
+    # ✅ Motif de refus (paiement_refuse)
+    if body.motif_refus and hasattr(cmd, "motif_refus"):
+        cmd.motif_refus = body.motif_refus
 
     # Calcul port réel — patron ET logisticien
     if body.poids_reel and role in ("patron", "logisticien"):
@@ -173,16 +196,16 @@ def update_statut(
         port_local = round(port_fcfa * (taux_local / 656))
 
         cmd.total_local = (cmd.total_local or 0) + port_local
-        note = f"Poids réel: {body.poids_reel}kg | Port: {port_local:,} {cmd.monnaie or 'FCFA'}"
-        cmd.note_admin = (cmd.note_admin or "") + " | " + note
+        note_port = f"Poids réel: {body.poids_reel}kg | Port: {port_local:,} {cmd.monnaie or 'FCFA'}"
+        cmd.note_admin = (cmd.note_admin or "") + " | " + note_port
 
     db.commit()
 
     labels = {
-        "paye":     "💰 Paiement confirmé ! On achète votre article.",
-        "achete":   "🛍️ Article acheté ! Préparation en cours.",
-        "expedie":  "✈️ Votre colis est en route depuis l'Europe !",
-        "arrive":   "📦 Votre colis est arrivé ! Contactez-nous.",
+        "paye":            "💰 Paiement confirmé ! On achète votre article.",
+        "achete":          "🛍️ Article acheté ! Préparation en cours.",
+        "expedie":         "✈️ Votre colis est en route depuis l'Europe !",
+        "arrive":          "📦 Votre colis est arrivé ! Contactez-nous.",
         "paiement_refuse": "❌ Paiement non confirmé. Contactez-nous.",
     }
     if body.statut in labels:
@@ -191,7 +214,6 @@ def update_statut(
         if body.statut == "paye":
             notifier_patron(db, "💰 Nouveau paiement reçu",
                 f"{cmd.client_nom} · {cmd.ref} · {round(cmd.total_local or 0):,} {cmd.monnaie or 'FCFA'}", cmd.ref)
-        # Patron notifié quand logisticien met à jour
         if role == "logisticien" and body.statut in ("achete", "expedie", "arrive"):
             notifier_patron(db, f"📦 Logistique — {STATUT_LABELS.get(body.statut, body.statut)}",
                 f"{cmd.ref} · {cmd.client_nom} · {cmd.client_pays}", cmd.ref)
@@ -207,7 +229,7 @@ def export_csv(request: Request, db: Session = Depends(get_db),
     w.writerow([
         "Référence","Date","Client","Téléphone","Pays","Adresse",
         "Opérateur","Monnaie","Total €","Total local","Poids estimé",
-        "Poids réel","Nb articles","Statut","Délai","Notes","Détail articles"
+        "Poids réel","Nb articles","Statut","Délai","N° Suivi","Notes","Détail articles"
     ])
     for c in cmds:
         arts = json.loads(c.articles) if c.articles else []
@@ -222,11 +244,13 @@ def export_csv(request: Request, db: Session = Depends(get_db),
             c.operateur, c.monnaie, c.total_euro, c.total_local,
             c.poids_estime or "", c.poids_reel or "",
             c.nb_articles, STATUT_LABELS.get(c.statut, c.statut),
-            c.delai_livraison or "", c.note_admin or "", detail
+            c.delai_livraison or "",
+            getattr(c, "suivi_num", "") or "",   # ← ajouté dans le CSV aussi
+            c.note_admin or "", detail
         ])
     output.seek(0)
     return StreamingResponse(
         iter([output.getvalue()]),
         media_type="text/csv",
-        headers={"Content-Disposition": "attachment; filename=commandes_proxyshop.csv"}
+        headers={"Content-Disposition": "attachment; filename=commandes_fougahshop.csv"}
     )
