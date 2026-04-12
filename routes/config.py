@@ -104,26 +104,34 @@ def config_public(db: Session = Depends(get_db)):
         for p in db.query(PortKg).all()
     }
 
-    def parse_json_col(col_name):
-        raw = getattr(cfg, col_name, None)
-        if raw:
-            try: return json.loads(raw)
+    # Lire les colonnes migrées en raw SQL (pas dans le modèle SQLAlchemy)
+    try:
+        row = db.execute(text(
+            "SELECT tarifs_unite, tarif_poids_kg, operateurs_pays, numeros_paiement,"
+            " stat_delai, stat_badge1, stat_badge2, stat_label1, stat_label2, stat_label3"
+            " FROM configs WHERE id = :id"
+        ), {"id": cfg.id}).mappings().first() or {}
+    except Exception:
+        row = {}
+
+    def parse_json(val):
+        if val:
+            try: return json.loads(val)
             except Exception: pass
         return None
 
-    tarifs_unite    = parse_json_col("tarifs_unite")
-    tarif_poids_kg  = getattr(cfg, "tarif_poids_kg", None) or 12.0
-    operateurs_pays  = parse_json_col("operateurs_pays") or {}
-    numeros_paiement = parse_json_col("numeros_paiement") or {}
+    tarifs_unite     = parse_json(row.get("tarifs_unite"))
+    tarif_poids_kg   = row.get("tarif_poids_kg") or 12.0
+    operateurs_pays  = parse_json(row.get("operateurs_pays")) or {}
+    numeros_paiement = parse_json(row.get("numeros_paiement")) or {}
 
-    # ✅ Stats configurables landing hero
     stats_landing = {
-        "delai":   getattr(cfg, "stat_delai",  None) or "15-25j",
-        "badge1":  getattr(cfg, "stat_badge1", None) or "100%",
-        "badge2":  getattr(cfg, "stat_badge2", None) or "0€",
-        "label1":  getattr(cfg, "stat_label1", None) or "Authentique",
-        "label2":  getattr(cfg, "stat_label2", None) or "Livraison",
-        "label3":  getattr(cfg, "stat_label3", None) or "Frais cachés",
+        "delai":  row.get("stat_delai")  or "15-25j",
+        "badge1": row.get("stat_badge1") or "100%",
+        "badge2": row.get("stat_badge2") or "0€",
+        "label1": row.get("stat_label1") or "Authentique",
+        "label2": row.get("stat_label2") or "Livraison",
+        "label3": row.get("stat_label3") or "Frais cachés",
     }
 
     return {
@@ -136,7 +144,7 @@ def config_public(db: Session = Depends(get_db)):
         "tarif_poids_kg":  tarif_poids_kg,
         "operateurs_pays":  operateurs_pays,
         "numeros_paiement": numeros_paiement,
-        "stats_landing":    stats_landing,  # ✅ nouveau
+        "stats_landing":    stats_landing,
     }
 
 # ── Mise à jour config globale ✅ PROTÉGÉ ─────────────────────
@@ -175,46 +183,36 @@ def update_config(body: Dict[str, Any], request: Request,
         except Exception:
             pass
 
-    # ✅ Opérateurs Mobile Money par pays
-    # Le frontend envoie des clés de la forme "ops_Bénin", "ops_Sénégal", etc.
+    # Opérateurs Mobile Money par pays (clés "ops_Bénin", "ops_Sénégal"…)
     ops_updates = {k[4:]: v for k, v in body.items() if k.startswith("ops_")}
     if ops_updates:
-        # Fusionner avec les données existantes
-        existing_raw = getattr(cfg, "operateurs_pays", None)
-        existing = {}
-        if existing_raw:
-            try: existing = json.loads(existing_raw)
-            except Exception: pass
-        existing.update(ops_updates)
         try:
-            db.execute(
-                text("UPDATE configs SET operateurs_pays = :v WHERE id = :id"),
-                {"v": json.dumps(existing, ensure_ascii=False), "id": cfg.id}
-            )
+            row = db.execute(text("SELECT operateurs_pays FROM configs WHERE id=:id"), {"id": cfg.id}).mappings().first()
+            existing = {}
+            if row and row.get("operateurs_pays"):
+                try: existing = json.loads(row["operateurs_pays"])
+                except Exception: pass
+            existing.update(ops_updates)
+            db.execute(text("UPDATE configs SET operateurs_pays=:v WHERE id=:id"),
+                       {"v": json.dumps(existing, ensure_ascii=False), "id": cfg.id})
         except Exception:
             pass
 
-    # ✅ Numéros de paiement par opérateur
-    # Le frontend envoie des clés de la forme "num_Orange-Money", "num_MTN-MoMo", etc.
+    # Numéros de paiement (clés "num_Orange-Money", "num_MTN-MoMo"…)
     num_updates = {}
     for k, v in body.items():
         if k.startswith("num_") and v:
-            # Reconvertir "num_Orange-Money" → "Orange Money"
-            op_key = k[4:].replace("-", " ")
-            num_updates[op_key] = str(v).strip()
-
+            num_updates[k[4:].replace("-", " ")] = str(v).strip()
     if num_updates:
-        existing_raw = getattr(cfg, "numeros_paiement", None)
-        existing = {}
-        if existing_raw:
-            try: existing = json.loads(existing_raw)
-            except Exception: pass
-        existing.update(num_updates)
         try:
-            db.execute(
-                text("UPDATE configs SET numeros_paiement = :v WHERE id = :id"),
-                {"v": json.dumps(existing, ensure_ascii=False), "id": cfg.id}
-            )
+            row = db.execute(text("SELECT numeros_paiement FROM configs WHERE id=:id"), {"id": cfg.id}).mappings().first()
+            existing = {}
+            if row and row.get("numeros_paiement"):
+                try: existing = json.loads(row["numeros_paiement"])
+                except Exception: pass
+            existing.update(num_updates)
+            db.execute(text("UPDATE configs SET numeros_paiement=:v WHERE id=:id"),
+                       {"v": json.dumps(existing, ensure_ascii=False), "id": cfg.id})
         except Exception:
             pass
 
