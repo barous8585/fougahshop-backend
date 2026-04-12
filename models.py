@@ -5,21 +5,17 @@ from database import Base
 
 class Config(Base):
     __tablename__ = "config"
-    id              = Column(Integer, primary_key=True, default=1)
-    taux_change     = Column(Float,   default=660.0)
-    commission      = Column(Float,   default=3500.0)
-    taux_gnf        = Column(Float,   default=9500.0)
-    wa_number       = Column(String,  default="33651727112")
-    admin_pwd       = Column(String,  default="admin123")
-    secret_reset    = Column(String,  default="fougah2026")
-    # Tarifs à l'unité — sérialisés en JSON (TEXT)
-    tarifs_unite    = Column(Text,    nullable=True)
-    # Tarif au poids kg affiché sur la landing
-    tarif_poids_kg  = Column(Float,   default=12.0)
-    # ✅ Opérateurs Mobile Money par pays — JSON ex: {"Bénin": ["MTN MoMo", "Moov Money"]}
-    operateurs_pays = Column(Text,    nullable=True)
-    # ✅ Numéros de paiement par opérateur — JSON ex: {"Orange Money": "+224 620 762 815"}
-    numeros_paiement = Column(Text,   nullable=True)
+    id           = Column(Integer, primary_key=True, default=1)
+    taux_change  = Column(Float,  default=660.0)
+    commission   = Column(Float,  default=3500.0)
+    taux_gnf     = Column(Float,  default=9500.0)
+    wa_number    = Column(String, default="33651727112")
+    admin_pwd    = Column(String, default="admin123")
+    secret_reset = Column(String, default="fougah2026")
+    # NOTE : tarifs_unite, tarif_poids_kg, operateurs_pays, numeros_paiement,
+    # stat_* sont gérées uniquement via migration SQL dans config.py
+    # et lues en raw SQL — ne pas les déclarer ici pour éviter le crash
+    # "column does not exist" avant la première migration.
 
 
 class PortKg(Base):
@@ -63,10 +59,7 @@ class Commande(Base):
     note_admin          = Column(Text,    nullable=True)
     delai_livraison     = Column(String,  nullable=True)
     promo_code          = Column(String,  nullable=True)
-    # ✅ Numéro de suivi colis (ex: LY123456789FR)
-    suivi_num           = Column(String,  nullable=True)
-    # ✅ Motif de refus paiement (envoyé au client)
-    motif_refus         = Column(Text,    nullable=True)
+    # NOTE : suivi_num et motif_refus ajoutés via migration dans config.py
     created_at          = Column(DateTime, server_default=func.now())
     updated_at          = Column(DateTime, server_default=func.now(), onupdate=func.now())
 
