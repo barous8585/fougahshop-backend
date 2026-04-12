@@ -17,6 +17,17 @@ except Exception:
     def notifier_client(*a, **kw): pass
     def notifier_patron(*a, **kw): pass
 
+try:
+    from wa_sender import envoyer_whatsapp, message_statut
+except Exception:
+    def envoyer_whatsapp(*a, **kw): return False
+    def message_statut(*a, **kw): return ""
+
+try:
+    from date_estimee import calculer_date_estimee
+except Exception:
+    def calculer_date_estimee(*a, **kw): return ""
+
 router = APIRouter(prefix="/api/admin", tags=["admin"])
 
 STATUTS = ["en_attente_paiement","paye","achete","expedie","arrive","recupere","paiement_refuse","annulee"]
@@ -201,10 +212,30 @@ def update_statut(
 
     db.commit()
 
+    # ✅ Calcul de la date de livraison estimée
+    date_est = calculer_date_estimee(
+        cmd.created_at,
+        cmd.delai_livraison or ""
+    )
+
+    # ✅ WhatsApp automatique au client
+    STATUTS_WA = {"paye", "achete", "expedie", "arrive", "paiement_refuse", "annulee"}
+    if body.statut in STATUTS_WA and cmd.client_tel:
+        wa_msg = message_statut(
+            ref        = cmd.ref,
+            statut     = body.statut,
+            date_estimee = date_est,
+            suivi_num  = getattr(cmd, "suivi_num", "") or "",
+            motif      = body.motif_refus or "",
+        )
+        if wa_msg:
+            envoyer_whatsapp(cmd.client_tel, wa_msg)
+
+    # Notifications push (si activées)
     labels = {
         "paye":            "💰 Paiement confirmé ! On achète votre article.",
         "achete":          "🛍️ Article acheté ! Préparation en cours.",
-        "expedie":         "✈️ Votre colis est en route depuis l'Europe !",
+        "expedie":         f"✈️ Votre colis est en route !{f' Arrivée estimée : {date_est}' if date_est else ''}",
         "arrive":          "📦 Votre colis est arrivé ! Contactez-nous.",
         "paiement_refuse": "❌ Paiement non confirmé. Contactez-nous.",
     }
@@ -218,7 +249,7 @@ def update_statut(
             notifier_patron(db, f"📦 Logistique — {STATUT_LABELS.get(body.statut, body.statut)}",
                 f"{cmd.ref} · {cmd.client_nom} · {cmd.client_pays}", cmd.ref)
 
-    return {"ref": cmd.ref, "statut": cmd.statut}
+    return {"ref": cmd.ref, "statut": cmd.statut, "date_estimee": date_est}
 
 @router.get("/export/csv")
 def export_csv(request: Request, db: Session = Depends(get_db),
