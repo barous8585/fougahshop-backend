@@ -59,10 +59,17 @@ def ensure_tarifs_columns(db):
     migrations = [
         "ALTER TABLE configs ADD COLUMN IF NOT EXISTS tarifs_unite TEXT DEFAULT NULL",
         "ALTER TABLE configs ADD COLUMN IF NOT EXISTS tarif_poids_kg FLOAT DEFAULT 12.0",
-        # ✅ Opérateurs Mobile Money par pays (JSON)
+        # Opérateurs Mobile Money par pays (JSON)
         "ALTER TABLE configs ADD COLUMN IF NOT EXISTS operateurs_pays TEXT DEFAULT NULL",
-        # ✅ Numéros de paiement par opérateur (JSON)
+        # Numéros de paiement par opérateur (JSON)
         "ALTER TABLE configs ADD COLUMN IF NOT EXISTS numeros_paiement TEXT DEFAULT NULL",
+        # ✅ Stats configurables de la landing hero
+        "ALTER TABLE configs ADD COLUMN IF NOT EXISTS stat_delai TEXT DEFAULT '15-25j'",
+        "ALTER TABLE configs ADD COLUMN IF NOT EXISTS stat_badge1 TEXT DEFAULT '100%'",
+        "ALTER TABLE configs ADD COLUMN IF NOT EXISTS stat_badge2 TEXT DEFAULT '0€'",
+        "ALTER TABLE configs ADD COLUMN IF NOT EXISTS stat_label1 TEXT DEFAULT 'Authentique'",
+        "ALTER TABLE configs ADD COLUMN IF NOT EXISTS stat_label2 TEXT DEFAULT 'Livraison'",
+        "ALTER TABLE configs ADD COLUMN IF NOT EXISTS stat_label3 TEXT DEFAULT 'Frais cachés'",
     ]
     for sql in migrations:
         try:
@@ -106,10 +113,18 @@ def config_public(db: Session = Depends(get_db)):
 
     tarifs_unite    = parse_json_col("tarifs_unite")
     tarif_poids_kg  = getattr(cfg, "tarif_poids_kg", None) or 12.0
-    # ✅ Opérateurs par pays — ex: {"Bénin": ["MTN MoMo", "Moov Money"]}
-    operateurs_pays = parse_json_col("operateurs_pays") or {}
-    # ✅ Numéros de paiement — ex: {"Orange Money": "+224 620 762 815"}
+    operateurs_pays  = parse_json_col("operateurs_pays") or {}
     numeros_paiement = parse_json_col("numeros_paiement") or {}
+
+    # ✅ Stats configurables landing hero
+    stats_landing = {
+        "delai":   getattr(cfg, "stat_delai",  None) or "15-25j",
+        "badge1":  getattr(cfg, "stat_badge1", None) or "100%",
+        "badge2":  getattr(cfg, "stat_badge2", None) or "0€",
+        "label1":  getattr(cfg, "stat_label1", None) or "Authentique",
+        "label2":  getattr(cfg, "stat_label2", None) or "Livraison",
+        "label3":  getattr(cfg, "stat_label3", None) or "Frais cachés",
+    }
 
     return {
         "taux_change":     cfg.taux_change,
@@ -119,8 +134,9 @@ def config_public(db: Session = Depends(get_db)):
         "port_kg":         ports,
         "tarifs_unite":    tarifs_unite,
         "tarif_poids_kg":  tarif_poids_kg,
-        "operateurs_pays": operateurs_pays,    # ✅ nouveau
-        "numeros_paiement": numeros_paiement,  # ✅ nouveau
+        "operateurs_pays":  operateurs_pays,
+        "numeros_paiement": numeros_paiement,
+        "stats_landing":    stats_landing,  # ✅ nouveau
     }
 
 # ── Mise à jour config globale ✅ PROTÉGÉ ─────────────────────
@@ -202,10 +218,19 @@ def update_config(body: Dict[str, Any], request: Request,
         except Exception:
             pass
 
+    # ✅ Stats configurables landing hero
+    for field in ["stat_delai","stat_badge1","stat_badge2","stat_label1","stat_label2","stat_label3"]:
+        if field in body and body[field] is not None:
+            try:
+                db.execute(
+                    text(f"UPDATE configs SET {field} = :v WHERE id = :id"),
+                    {"v": str(body[field]).strip(), "id": cfg.id}
+                )
+            except Exception:
+                pass
+
     db.commit()
     return {"ok": True}
-
-# ── Mise à jour frais de port ✅ PROTÉGÉ ──────────────────────
 @router.put("/port")
 def update_port(body: Dict[str, Any], request: Request,
                 db: Session = Depends(get_db),
