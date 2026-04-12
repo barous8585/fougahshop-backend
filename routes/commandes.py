@@ -7,6 +7,11 @@ import json
 from database import get_db
 from models import Commande, Config, PortKg
 
+try:
+    from date_estimee import calculer_date_estimee
+except Exception:
+    def calculer_date_estimee(*a, **kw): return ""
+
 router = APIRouter(prefix="/api/commandes", tags=["commandes"])
 
 try:
@@ -229,9 +234,11 @@ def suivi(ref: str, db: Session = Depends(get_db)):
         "delai_livraison": cmd.delai_livraison,
         "articles":        json.loads(cmd.articles) if cmd.articles else [],
         "note_admin":      cmd.note_admin,
-        "suivi_num":       getattr(cmd, "suivi_num", None),         # ✅ AJOUTÉ
-        "motif_refus":     getattr(cmd, "motif_refus", None),       # ✅ AJOUTÉ
+        "suivi_num":       getattr(cmd, "suivi_num", None),
+        "motif_refus":     getattr(cmd, "motif_refus", None),
         "created_at":      cmd.created_at,
+        # ✅ Date de livraison estimée calculée dynamiquement
+        "date_estimee":    calculer_date_estimee(cmd.created_at, cmd.delai_livraison or ""),
     }
 
 @router.get("/historique/{tel}")
