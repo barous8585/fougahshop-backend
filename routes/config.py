@@ -283,7 +283,9 @@ def list_employes(db: Session = Depends(get_db)):
     ]
 
 @router.post("/employes", status_code=201)
-def create_employe(body: Dict[str, Any], db: Session = Depends(get_db)):
+def create_employe(body: Dict[str, Any], request: Request,
+                   db: Session = Depends(get_db),
+                   role: str = Depends(require_patron)):
     ensure_role_column(db)
 
     nom  = str(body.get("nom", "")).strip()
