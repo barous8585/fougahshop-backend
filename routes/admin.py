@@ -251,6 +251,58 @@ def update_statut(
 
     return {"ref": cmd.ref, "statut": cmd.statut, "date_estimee": date_est}
 
+# ── Archives ──────────────────────────────────────────────────
+@router.post("/commandes/{ref}/archiver")
+def archiver_commande(ref: str, request: Request, db: Session = Depends(get_db),
+                      role: str = Depends(require_auth)):
+    from sqlalchemy import text as sqlt
+    try:
+        db.execute(sqlt("ALTER TABLE commandes ADD COLUMN IF NOT EXISTS archived BOOLEAN DEFAULT FALSE"))
+        db.commit()
+    except Exception:
+        db.rollback()
+    cmd = db.query(Commande).filter(Commande.ref == ref).first()
+    if not cmd:
+        raise HTTPException(404, "Commande introuvable")
+    try:
+        db.execute(sqlt("UPDATE commandes SET archived = TRUE WHERE ref = :r"), {"r": ref})
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise HTTPException(500, "Erreur archivage")
+    return {"ok": True, "ref": ref}
+
+@router.post("/commandes/{ref}/desarchiver")
+def desarchiver_commande(ref: str, request: Request, db: Session = Depends(get_db),
+                         role: str = Depends(require_auth)):
+    from sqlalchemy import text as sqlt
+    try:
+        db.execute(sqlt("UPDATE commandes SET archived = FALSE WHERE ref = :r"), {"r": ref})
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise HTTPException(500, "Erreur désarchivage")
+    return {"ok": True, "ref": ref}
+
+@router.get("/commandes/archives")
+def liste_archives(request: Request, db: Session = Depends(get_db),
+                   role: str = Depends(require_auth)):
+    from sqlalchemy import text as sqlt
+    try:
+        db.execute(sqlt("ALTER TABLE commandes ADD COLUMN IF NOT EXISTS archived BOOLEAN DEFAULT FALSE"))
+        db.commit()
+    except Exception:
+        db.rollback()
+    try:
+        rows = db.execute(sqlt(
+            "SELECT ref, client_nom, client_tel, client_pays, operateur, monnaie, "
+            "total_local, total_euro, nb_articles, statut, created_at "
+            "FROM commandes WHERE archived = TRUE ORDER BY created_at DESC"
+        )).mappings().all()
+        return [dict(r) for r in rows]
+    except Exception:
+        return []
+
 @router.get("/export/csv")
 def export_csv(request: Request, db: Session = Depends(get_db),
                role: str = Depends(require_patron)):
