@@ -16,6 +16,7 @@ from routes.scraper   import router as scraper_router
 from routes.whatsapp  import router as whatsapp_router
 from routes.config    import init_port, get_config
 from database import SessionLocal
+from parrainage import router as parrainage_router  # ✅ NOUVEAU
 
 # ── Créer les tables ──────────────────────────────────────────
 Base.metadata.create_all(bind=engine)
@@ -32,14 +33,14 @@ def startup():
             db.commit()
             print("✅ Mot de passe admin initialisé (valeur par défaut)")
         else:
-            print("✅ Mot de passe admin configuré")   # ← ne pas afficher la valeur
+            print("✅ Mot de passe admin configuré")
 
         if not cfg.secret_reset or cfg.secret_reset == '':
             cfg.secret_reset = 'fougah2026'
             db.commit()
             print("✅ Secret reset initialisé (valeur par défaut)")
         else:
-            print("✅ Secret reset configuré")          # ← ne pas afficher la valeur
+            print("✅ Secret reset configuré")
 
     finally:
         db.close()
@@ -49,12 +50,10 @@ startup()
 # ── App ───────────────────────────────────────────────────────
 app = FastAPI(title="FougahShop API", version="2.0.0")
 
-# ── CORS — domaine Netlify fougahshop.com ─────────────────────
+# ── CORS ─────────────────────────────────────────────────────
 ALLOWED_ORIGINS = [
-    # ── Production — domaine custom Netlify ───────────────────
     "https://fougahshop.com",
     "https://www.fougahshop.com",
-    # ── Développement local ───────────────────────────────────
     "http://localhost:3000",
     "http://localhost:5500",
     "http://127.0.0.1:5500",
@@ -66,7 +65,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["Content-Type", "X-Admin-Token"],  # ← restreint aux headers réellement utilisés
+    allow_headers=["Content-Type", "X-Admin-Token"],
     allow_credentials=False,
 )
 
@@ -75,12 +74,12 @@ app.include_router(commandes_router)
 app.include_router(admin_router)
 app.include_router(auth_router)
 app.include_router(config_router)
-# paiement_router retiré — non utilisé côté frontend
 app.include_router(promo_router)
 app.include_router(notifs_router)
 app.include_router(avis_router)
 app.include_router(scraper_router)
 app.include_router(whatsapp_router)
+app.include_router(parrainage_router)  # ✅ NOUVEAU
 
 # ── Frontend statique ─────────────────────────────────────────
 static_dir = os.path.join(os.path.dirname(__file__), "static")
@@ -116,6 +115,9 @@ def api_info():
             "GET  /api/admin/commandes",
             "PATCH /api/admin/commandes/{ref}/statut",
             "GET  /api/admin/export/csv",
+            "POST /api/admin/commandes/{ref}/archiver",
+            "POST /api/admin/commandes/{ref}/desarchiver",
+            "GET  /api/admin/commandes/archives",
             "POST /api/promo/verifier",
             "GET  /api/promo/admin",
             "POST /api/promo/admin",
@@ -138,5 +140,14 @@ def api_info():
             "PUT  /api/config/",
             "POST /api/scraper/produit",
             "POST /api/scraper/panier",
+            "GET  /api/parrainage/code/{tel}",
+            "GET  /api/parrainage/verifier/{code}",
+            "POST /api/parrainage/utiliser",
+            "GET  /api/admin/parrainage",
+            "GET  /api/galerie",
+            "GET  /api/admin/galerie-all",
+            "POST /api/admin/galerie",
+            "DELETE /api/admin/galerie/{id}",
+            "PATCH /api/admin/galerie/{id}/toggle",
         ]
     }
