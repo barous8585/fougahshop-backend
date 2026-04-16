@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
+from sqlalchemy import text
 from pydantic import BaseModel
 from typing import List, Optional
 from datetime import datetime
@@ -28,6 +29,9 @@ MONNAIES = {
     "Niger":        {"symbole": "FCFA", "taux_base": 656},
     "Congo":        {"symbole": "FCFA", "taux_base": 656},
     "Gabon":        {"symbole": "FCFA", "taux_base": 656},
+    "Sénégal":      {"symbole": "FCFA", "taux_base": 656},
+    "Mali":         {"symbole": "FCFA", "taux_base": 656},
+    "Côte d'Ivoire":{"symbole": "FCFA", "taux_base": 656},
 }
 
 PALIERS_COMMISSION = [
@@ -38,25 +42,33 @@ PALIERS_COMMISSION = [
     {"max": 99999, "comm": 20000},
 ]
 
+
 def get_commission(total_euros: float) -> float:
     for palier in PALIERS_COMMISSION:
         if total_euros <= palier["max"]:
             return palier["comm"]
     return 20000
 
+
 def get_config(db):
     cfg = db.query(Config).first()
     if not cfg:
-        cfg = Config(); db.add(cfg); db.commit(); db.refresh(cfg)
+        cfg = Config()
+        db.add(cfg)
+        db.commit()
+        db.refresh(cfg)
     return cfg
+
 
 def get_port(db, pays):
     p = db.query(PortKg).filter(PortKg.pays == pays).first()
     return p.prix if p else 7000.0
 
+
 def generate_ref(db):
     count = db.query(Commande).count() + 1
     return f"CMD-{datetime.now().year}-{count:04d}"
+
 
 def calc_article_sans_port_ni_commission(prix_eu, qty, pays, cfg):
     taux = cfg.taux_change
@@ -72,7 +84,76 @@ def calc_article_sans_port_ni_commission(prix_eu, qty, pays, cfg):
         "taux_conv":   taux_conv,
     }
 
+
+def appliquer_promo(db, promo_code: str, total_local: float, taux_conv: float) -> float:
+    """
+    Applique un code promo (nouveau système flexible) et incrémente le compteur.
+    Compatible avec l'ancien système (quota/utilisations) et le nouveau (max_uses/uses_count).
+    Retourne le nouveau total après réduction.
+    """
+    if not promo_code:
+        return total_local
+    try:
+        promo = db.execute(
+            text("SELECT * FROM promo_codes WHERE code=:code AND actif=TRUE LIMIT 1"),
+            {"code": promo_code.strip().upper()}
+        ).fetchone()
+
+        if not promo:
+            return total_local
+
+        # Vérifier expiration
+        expiry = getattr(promo, "expiry", None)
+        if expiry:
+            from datetime import date
+            exp_date = expiry if hasattr(expiry, "year") else None
+            if exp_date and exp_date < date.today():
+                return total_local
+
+        # Vérifier quota (nouveau: max_uses, ancien: quota)
+        uses = getattr(promo, "uses_count", None) or getattr(promo, "utilisations", 0) or 0
+        max_u = getattr(promo, "max_uses", None) or getattr(promo, "quota", 0) or 0
+        if max_u > 0 and uses >= max_u:
+            return total_local
+
+        # Calcul de la réduction
+        type_promo = getattr(promo, "type", "fixe") or "fixe"
+        valeur = getattr(promo, "valeur", None) or getattr(promo, "reduction_fcfa", 0) or 0
+
+        if type_promo == "pct":
+            # Pourcentage sur le total local
+            reduction = round(total_local * valeur / 100)
+        else:
+            # Montant fixe en FCFA converti en monnaie locale
+            reduction = round(float(valeur) * taux_conv)
+
+        nouveau_total = max(0, total_local - reduction)
+
+        # Incrémenter les compteurs (nouveau + ancien pour compat)
+        try:
+            db.execute(
+                text("UPDATE promo_codes SET uses_count = COALESCE(uses_count,0) + 1 WHERE code=:code"),
+                {"code": promo_code.strip().upper()}
+            )
+        except Exception:
+            pass
+        try:
+            db.execute(
+                text("UPDATE promo_codes SET utilisations = COALESCE(utilisations,0) + 1 WHERE code=:code"),
+                {"code": promo_code.strip().upper()}
+            )
+        except Exception:
+            pass
+
+        return nouveau_total
+
+    except Exception as e:
+        print(f"[promo] Erreur application code: {e}")
+        return total_local
+
+
 # ── Schemas ───────────────────────────────────────────────────
+
 class ArticleIn(BaseModel):
     lien:      str
     nom:       str
@@ -85,6 +166,7 @@ class ArticleIn(BaseModel):
     poids:     float = 0.5
     qty:       int = 1
 
+
 class CommandeCreate(BaseModel):
     client_nom:          str
     client_tel:          str
@@ -93,7 +175,12 @@ class CommandeCreate(BaseModel):
     client_instructions: Optional[str] = None
     operateur:           str
     promo_code:          Optional[str] = None
+    promo_type:          Optional[str] = None   # 'fixe' | 'pct' — info frontend
+    promo_valeur:        Optional[float] = None  # valeur frontend (indicatif)
+    mode_paiement:       Optional[str] = None   # 'kkiapay' | 'manuel'
+    kkiapay_transaction_id: Optional[str] = None
     articles:            List[ArticleIn]
+
 
 class CalculRequest(BaseModel):
     prix_eu: float
@@ -101,12 +188,20 @@ class CalculRequest(BaseModel):
     pays:    str
     qty:     int = 1
 
+
 class AnnulationBody(BaseModel):
     ref:        str
     client_tel: str
     motif:      Optional[str] = None
 
+
+class KkiapayConfirmBody(BaseModel):
+    ref:            str
+    transaction_id: Optional[str] = None
+
+
 # ── Routes ────────────────────────────────────────────────────
+
 @router.post("/calculer")
 def calculer(body: CalculRequest, db: Session = Depends(get_db)):
     cfg = get_config(db)
@@ -119,18 +214,20 @@ def calculer(body: CalculRequest, db: Session = Depends(get_db)):
     port_fcfa = get_port(db, body.pays)
     port_local = round(port_fcfa * body.poids * taux_conv)
     return {
-        "base_fcfa":        detail["base_fcfa"],
-        "commission":       commission,
-        "port_estime":      port_local,
-        "total_local":      detail["total_local"] + comm_local,
-        "total_avec_port":  detail["total_local"] + comm_local + port_local,
-        "monnaie":          detail["monnaie"],
+        "base_fcfa":       detail["base_fcfa"],
+        "commission":      commission,
+        "port_estime":     port_local,
+        "total_local":     detail["total_local"] + comm_local,
+        "total_avec_port": detail["total_local"] + comm_local + port_local,
+        "monnaie":         detail["monnaie"],
     }
+
 
 @router.post("/", status_code=201)
 def creer_commande(body: CommandeCreate, db: Session = Depends(get_db)):
     if not body.articles:
         raise HTTPException(400, "Panier vide")
+
     cfg = get_config(db)
     m = MONNAIES.get(body.client_pays, {"symbole": "FCFA"})
     port_info = db.query(PortKg).filter(PortKg.pays == body.client_pays).first()
@@ -146,7 +243,7 @@ def creer_commande(body: CommandeCreate, db: Session = Depends(get_db)):
         articles_detail.append({
             "lien":        a.lien,
             "nom":         a.nom,
-            "img":         None,
+            "img":         a.img,
             "categorie":   a.categorie,
             "taille":      a.taille,
             "couleur":     a.couleur,
@@ -166,22 +263,19 @@ def creer_commande(body: CommandeCreate, db: Session = Depends(get_db)):
     commission_locale = round(commission_fcfa * taux_conv)
     total_local = total_local_sans_comm + commission_locale
 
+    # ── Appliquer le code promo (nouveau système) ─────────────
     if body.promo_code:
-        try:
-            from sqlalchemy import text
-            promo = db.execute(
-                text("SELECT * FROM promo_codes WHERE code=:code AND actif=TRUE LIMIT 1"),
-                {"code": body.promo_code.upper()}
-            ).fetchone()
-            if promo and promo.utilisations < promo.quota:
-                reduction = round(promo.reduction_fcfa * taux_conv)
-                total_local = max(0, total_local - reduction)
-                db.execute(
-                    text("UPDATE promo_codes SET utilisations = utilisations + 1 WHERE code=:code"),
-                    {"code": body.promo_code.upper()}
-                )
-        except Exception:
-            pass
+        total_local = appliquer_promo(db, body.promo_code, total_local, taux_conv)
+
+    # ── Statut initial selon le mode de paiement ─────────────
+    # Kkiapay = paiement déjà effectué → statut "paye" directement
+    # Manuel  = en attente de virement → statut "en_attente_paiement"
+    statut_initial = "paye" if body.mode_paiement == "kkiapay" else "en_attente_paiement"
+
+    # Note auto pour Kkiapay
+    note_auto = None
+    if body.mode_paiement == "kkiapay" and body.kkiapay_transaction_id:
+        note_auto = f"[KKIAPAY] Transaction: {body.kkiapay_transaction_id}"
 
     commande = Commande(
         ref=generate_ref(db),
@@ -197,24 +291,76 @@ def creer_commande(body: CommandeCreate, db: Session = Depends(get_db)):
         poids_estime=round(poids_total, 2),
         articles=json.dumps(articles_detail, ensure_ascii=False),
         nb_articles=len(body.articles),
-        statut="en_attente_paiement",
+        statut=statut_initial,
         delai_livraison=port_info.delai if port_info else "—",
+        note_admin=note_auto,
+        promo_code=body.promo_code,
     )
     db.add(commande)
     db.commit()
     db.refresh(commande)
 
-    notifier_patron(db, "🛍️ Nouvelle commande reçue !",
-        f"{commande.client_nom} · {commande.ref} · {round(commande.total_local or 0):,} {commande.monnaie or 'FCFA'}",
-        commande.ref)
+    # Notif patron
+    mode_label = "💳 Kkiapay ✅" if body.mode_paiement == "kkiapay" else "📱 Virement manuel"
+    notifier_patron(
+        db,
+        "🛍️ Nouvelle commande" + (" — PAYÉE ✅" if statut_initial == "paye" else ""),
+        f"{commande.client_nom} · {commande.ref} · "
+        f"{round(commande.total_local or 0):,} {commande.monnaie or 'FCFA'} · {mode_label}",
+        commande.ref
+    )
+
+    db.commit()  # Commit final après les updates promo
 
     return {
         "ref":         commande.ref,
         "total_local": commande.total_local,
+        "total_euro":  commande.total_euro,
         "monnaie":     commande.monnaie,
         "nb_articles": commande.nb_articles,
         "statut":      commande.statut,
     }
+
+
+@router.post("/confirmer-kkiapay")
+def confirmer_kkiapay(body: KkiapayConfirmBody, db: Session = Depends(get_db)):
+    """
+    Appelé après un paiement Kkiapay réussi.
+    Passe la commande en statut 'paye' si elle est encore en attente.
+    (Normalement déjà fait lors de la création — cet endpoint est une sécurité.)
+    """
+    ref = body.ref.strip().upper()
+    cmd = db.query(Commande).filter(Commande.ref == ref).first()
+
+    if not cmd:
+        raise HTTPException(404, "Commande introuvable")
+
+    # Si déjà payée (créée avec mode kkiapay), rien à faire
+    if cmd.statut == "paye":
+        return {"ok": True, "ref": cmd.ref, "statut": cmd.statut, "already_paid": True}
+
+    # Sinon, confirmer le paiement
+    cmd.statut = "paye"
+    note = "[KKIAPAY] Paiement confirmé automatiquement"
+    if body.transaction_id:
+        note += f" — Transaction: {body.transaction_id}"
+    cmd.note_admin = (cmd.note_admin or "") + " | " + note if cmd.note_admin else note
+
+    db.commit()
+
+    try:
+        notifier_patron(
+            db,
+            "✅ Paiement Kkiapay confirmé",
+            f"{cmd.ref} · {cmd.client_nom} · "
+            f"{round(cmd.total_local or 0):,} {cmd.monnaie or 'FCFA'}",
+            cmd.ref
+        )
+    except Exception:
+        pass
+
+    return {"ok": True, "ref": cmd.ref, "statut": "paye"}
+
 
 @router.get("/suivi/{ref}")
 def suivi(ref: str, db: Session = Depends(get_db)):
@@ -224,7 +370,7 @@ def suivi(ref: str, db: Session = Depends(get_db)):
     return {
         "ref":             cmd.ref,
         "statut":          cmd.statut,
-        "client_nom":      cmd.client_nom,                          # ✅ AJOUTÉ
+        "client_nom":      cmd.client_nom,
         "client_tel":      cmd.client_tel,
         "nb_articles":     cmd.nb_articles,
         "total_local":     cmd.total_local,
@@ -236,10 +382,11 @@ def suivi(ref: str, db: Session = Depends(get_db)):
         "note_admin":      cmd.note_admin,
         "suivi_num":       getattr(cmd, "suivi_num", None),
         "motif_refus":     getattr(cmd, "motif_refus", None),
+        "promo_code":      getattr(cmd, "promo_code", None),
         "created_at":      cmd.created_at,
-        # ✅ Date de livraison estimée calculée dynamiquement
         "date_estimee":    calculer_date_estimee(cmd.created_at, cmd.delai_livraison or ""),
     }
+
 
 @router.get("/historique/{tel}")
 def historique(tel: str, db: Session = Depends(get_db)):
@@ -259,11 +406,12 @@ def historique(tel: str, db: Session = Depends(get_db)):
             "delai_livraison": c.delai_livraison,
             "note_admin":      c.note_admin,
             "client_nom":      c.client_nom,
-            "client_tel":      c.client_tel,    # ✅ AJOUTÉ
+            "client_tel":      c.client_tel,
             "created_at":      c.created_at,
         }
         for c in cmds
     ]
+
 
 @router.post("/annuler")
 def annuler_commande(body: AnnulationBody, db: Session = Depends(get_db)):
