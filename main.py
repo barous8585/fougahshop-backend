@@ -9,7 +9,7 @@ from routes.commandes import router as commandes_router
 from routes.admin     import router as admin_router
 from routes.auth      import router as auth_router
 from routes.config    import router as config_router
-from routes.promos    import router as promos_router   # ✅ renommé promos (avec s)
+from routes.promo     import router as promos_router   # fichier routes/promo.py existant
 from routes.notifs    import router as notifs_router
 from routes.avis      import router as avis_router
 from routes.scraper   import router as scraper_router
