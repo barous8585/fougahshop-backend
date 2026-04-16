@@ -9,14 +9,14 @@ from routes.commandes import router as commandes_router
 from routes.admin     import router as admin_router
 from routes.auth      import router as auth_router
 from routes.config    import router as config_router
-from routes.promo     import router as promo_router
+from routes.promos    import router as promos_router   # ✅ renommé promos (avec s)
 from routes.notifs    import router as notifs_router
 from routes.avis      import router as avis_router
 from routes.scraper   import router as scraper_router
 from routes.whatsapp  import router as whatsapp_router
 from routes.config    import init_port, get_config
 from database import SessionLocal
-from parrainage import router as parrainage_router  # ✅ NOUVEAU
+from parrainage import router as parrainage_router
 
 # ── Créer les tables ──────────────────────────────────────────
 Base.metadata.create_all(bind=engine)
@@ -35,12 +35,16 @@ def startup():
         else:
             print("✅ Mot de passe admin configuré")
 
-        if not cfg.secret_reset or cfg.secret_reset == '':
-            cfg.secret_reset = 'fougah2026'
+        # ✅ Secret reset lu depuis variable d'environnement — jamais en dur dans le code
+        secret_env = os.environ.get("SECRET_RESET", "")
+        if secret_env and (not cfg.secret_reset or cfg.secret_reset == ''):
+            cfg.secret_reset = secret_env
             db.commit()
-            print("✅ Secret reset initialisé (valeur par défaut)")
-        else:
+            print("✅ Secret reset initialisé depuis variable d'environnement")
+        elif cfg.secret_reset:
             print("✅ Secret reset configuré")
+        else:
+            print("⚠️  SECRET_RESET non défini — définissez la variable d'environnement")
 
     finally:
         db.close()
@@ -48,7 +52,7 @@ def startup():
 startup()
 
 # ── App ───────────────────────────────────────────────────────
-app = FastAPI(title="FougahShop API", version="2.0.0")
+app = FastAPI(title="FougahShop API", version="2.1.0")
 
 # ── CORS ─────────────────────────────────────────────────────
 ALLOWED_ORIGINS = [
@@ -74,12 +78,12 @@ app.include_router(commandes_router)
 app.include_router(admin_router)
 app.include_router(auth_router)
 app.include_router(config_router)
-app.include_router(promo_router)
+app.include_router(promos_router)        # ✅ nouveau router promos
 app.include_router(notifs_router)
 app.include_router(avis_router)
 app.include_router(scraper_router)
 app.include_router(whatsapp_router)
-app.include_router(parrainage_router)  # ✅ NOUVEAU
+app.include_router(parrainage_router)
 
 # ── Frontend statique ─────────────────────────────────────────
 static_dir = os.path.join(os.path.dirname(__file__), "static")
@@ -93,24 +97,26 @@ if os.path.exists(static_dir):
 # ── Health check ──────────────────────────────────────────────
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "2.0.0"}
+    return {"status": "ok", "version": "2.1.0"}
 
 # ── Documentation des routes ──────────────────────────────────
 @app.get("/api")
 def api_info():
     return {
         "app": "FougahShop API",
-        "version": "2.0.0",
+        "version": "2.1.0",
         "endpoints": [
+            # Commandes (public)
             "GET  /api/config/public",
-            "POST /api/commandes/calculer",
             "POST /api/commandes/",
             "GET  /api/commandes/suivi/{ref}",
             "GET  /api/commandes/historique/{tel}",
             "POST /api/commandes/annuler",
+            # Auth
             "POST /api/auth/login",
             "POST /api/auth/reset",
             "GET  /api/auth/check",
+            # Admin commandes
             "GET  /api/admin/stats",
             "GET  /api/admin/commandes",
             "PATCH /api/admin/commandes/{ref}/statut",
@@ -118,19 +124,26 @@ def api_info():
             "POST /api/admin/commandes/{ref}/archiver",
             "POST /api/admin/commandes/{ref}/desarchiver",
             "GET  /api/admin/commandes/archives",
-            "POST /api/promo/verifier",
-            "GET  /api/promo/admin",
-            "POST /api/promo/admin",
-            "PATCH /api/promo/admin/{id}",
-            "DELETE /api/promo/admin/{id}",
+            # Codes promo (nouveau — préfixe /api/promos)
+            "GET  /api/promos/verifier/{code}",   # public — client
+            "POST /api/promos/verifier",          # rétro-compat
+            "GET  /api/promos/admin",             # admin
+            "POST /api/promos",                   # admin — créer
+            "PATCH /api/promos/{code}/toggle",    # admin — activer/désactiver
+            "PATCH /api/promos/admin/{id}",       # admin — modifier par ID
+            "DELETE /api/promos/{code}",          # admin — supprimer par code
+            "DELETE /api/promos/admin/{id}",      # admin — supprimer par ID
+            # Notifs
             "POST /api/notifs/register",
             "POST /api/notifs/send",
+            # Avis
             "GET  /api/avis/",
             "POST /api/avis/",
             "GET  /api/avis/admin",
             "PATCH /api/avis/admin/{id}/reponse",
             "PATCH /api/avis/admin/{id}/visibilite",
             "DELETE /api/avis/admin/{id}",
+            # Config
             "GET  /api/config/pays",
             "PATCH /api/config/pays/{pays}/toggle",
             "POST /api/config/employes",
@@ -138,12 +151,15 @@ def api_info():
             "GET  /api/config/employes",
             "PUT  /api/config/port",
             "PUT  /api/config/",
+            # Scraper
             "POST /api/scraper/produit",
             "POST /api/scraper/panier",
+            # Parrainage
             "GET  /api/parrainage/code/{tel}",
             "GET  /api/parrainage/verifier/{code}",
             "POST /api/parrainage/utiliser",
             "GET  /api/admin/parrainage",
+            # Galerie
             "GET  /api/galerie",
             "GET  /api/admin/galerie-all",
             "POST /api/admin/galerie",
