@@ -112,6 +112,7 @@ def api_info():
             "GET  /api/commandes/suivi/{ref}",
             "GET  /api/commandes/historique/{tel}",
             "POST /api/commandes/annuler",
+            "POST /api/commandes/confirmer-kkiapay",
             # Auth
             "POST /api/auth/login",
             "POST /api/auth/reset",
