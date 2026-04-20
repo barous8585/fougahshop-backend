@@ -13,22 +13,20 @@ from routes.promo      import router as promos_router
 from routes.notifs     import router as notifs_router
 from routes.avis       import router as avis_router
 from routes.whatsapp   import router as whatsapp_router
-from routes.parrainage import router as parrainage_router          # ✅ dans routes/
-from routes.parrainage import ensure_parrainage_tables             # ✅ migration au startup
+from routes.parrainage import router as parrainage_router
+from routes.parrainage import ensure_parrainage_tables
 from routes.config     import init_port, get_config
 
 # ── Créer les tables SQLAlchemy ───────────────────────────────
 Base.metadata.create_all(bind=engine)
 
-# ── Startup : initialisation des données par défaut ──────────
+# ── Startup ───────────────────────────────────────────────────
 def startup():
     db = SessionLocal()
     try:
-        # Config de base
         cfg = get_config(db)
         init_port(db)
 
-        # Mot de passe admin
         if not cfg.admin_pwd or cfg.admin_pwd == '':
             cfg.admin_pwd = 'admin123'
             db.commit()
@@ -36,7 +34,6 @@ def startup():
         else:
             print("✅ Mot de passe admin configuré")
 
-        # Secret reset depuis variable d'environnement
         secret_env = os.environ.get("SECRET_RESET", "")
         if secret_env and (not cfg.secret_reset or cfg.secret_reset == ''):
             cfg.secret_reset = secret_env
@@ -47,9 +44,21 @@ def startup():
         else:
             print("⚠️  SECRET_RESET non défini — définissez la variable d'environnement sur Render")
 
-        # ✅ Migration tables parrainage + galerie (une seule fois au démarrage)
+        # Tables parrainage + galerie (une seule fois)
         ensure_parrainage_tables(db)
         print("✅ Tables parrainage et galerie vérifiées")
+
+        # Table sessions WhatsApp
+        from sqlalchemy import text
+        db.execute(text("""
+            CREATE TABLE IF NOT EXISTS whatsapp_sessions (
+                tel        VARCHAR PRIMARY KEY,
+                data       TEXT NOT NULL DEFAULT '{}',
+                updated_at TIMESTAMP DEFAULT NOW()
+            )
+        """))
+        db.commit()
+        print("✅ Table sessions WhatsApp vérifiée")
 
     finally:
         db.close()
@@ -78,7 +87,7 @@ app.add_middleware(
     allow_credentials=False,
 )
 
-# ── Routes API ────────────────────────────────────────────────
+# ── Routes ────────────────────────────────────────────────────
 app.include_router(commandes_router)
 app.include_router(admin_router)
 app.include_router(auth_router)
@@ -87,8 +96,8 @@ app.include_router(promos_router)
 app.include_router(notifs_router)
 app.include_router(avis_router)
 app.include_router(whatsapp_router)
-app.include_router(parrainage_router)   # ✅ parrainage + galerie
-# ✅ scraper_router retiré — scraper supprimé du frontend
+app.include_router(parrainage_router)
+# scraper_router supprimé — scraper retiré du frontend
 
 # ── Frontend statique ─────────────────────────────────────────
 static_dir = os.path.join(os.path.dirname(__file__), "static")
@@ -104,69 +113,6 @@ if os.path.exists(static_dir):
 def health():
     return {"status": "ok", "version": "2.2.0"}
 
-# ── Documentation des routes ──────────────────────────────────
 @app.get("/api")
 def api_info():
-    return {
-        "app": "FougahShop API",
-        "version": "2.2.0",
-        "endpoints": [
-            # Commandes (public)
-            "GET  /api/config/public",
-            "POST /api/commandes/",
-            "GET  /api/commandes/suivi/{ref}",
-            "GET  /api/commandes/historique/{tel}",
-            "POST /api/commandes/annuler",
-            "POST /api/commandes/confirmer-kkiapay",
-            # Auth
-            "POST /api/auth/login",
-            "POST /api/auth/reset",
-            "GET  /api/auth/check",
-            # Admin commandes
-            "GET  /api/admin/stats",
-            "GET  /api/admin/commandes",
-            "PATCH /api/admin/commandes/{ref}/statut",
-            "GET  /api/admin/export/csv",
-            "POST /api/admin/commandes/{ref}/archiver",
-            "POST /api/admin/commandes/{ref}/desarchiver",
-            "GET  /api/admin/commandes/archives",
-            # Codes promo
-            "GET  /api/promos/verifier/{code}",
-            "POST /api/promos/verifier",
-            "GET  /api/promos/admin",
-            "POST /api/promos",
-            "PATCH /api/promos/{code}/toggle",
-            "PATCH /api/promos/admin/{id}",
-            "DELETE /api/promos/{code}",
-            "DELETE /api/promos/admin/{id}",
-            # Notifs
-            "POST /api/notifs/register",
-            "POST /api/notifs/send",
-            # Avis
-            "GET  /api/avis/",
-            "POST /api/avis/",
-            "GET  /api/avis/admin",
-            "PATCH /api/avis/admin/{id}/reponse",
-            "PATCH /api/avis/admin/{id}/visibilite",
-            "DELETE /api/avis/admin/{id}",
-            # Config
-            "GET  /api/config/pays",
-            "PATCH /api/config/pays/{pays}/toggle",
-            "POST /api/config/employes",
-            "DELETE /api/config/employes/{id}",
-            "GET  /api/config/employes",
-            "PUT  /api/config/port",
-            "PUT  /api/config/",
-            # Parrainage
-            "GET  /api/parrainage/code/{tel}",
-            "GET  /api/parrainage/verifier/{code}",
-            "POST /api/parrainage/utiliser",
-            "GET  /api/admin/parrainage",
-            # Galerie
-            "GET  /api/galerie",
-            "GET  /api/admin/galerie-all",
-            "POST /api/admin/galerie",
-            "DELETE /api/admin/galerie/{id}",
-            "PATCH /api/admin/galerie/{id}/toggle",
-        ]
-    }
+    return {"app": "FougahShop API", "version": "2.2.0"}
