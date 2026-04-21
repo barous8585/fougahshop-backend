@@ -15,7 +15,7 @@ from routes.avis       import router as avis_router
 from routes.whatsapp   import router as whatsapp_router
 from routes.parrainage import router as parrainage_router
 from routes.parrainage import ensure_parrainage_tables
-from routes.config     import init_port, get_config
+from routes.config     import init_port, get_config, ensure_tarifs_columns, auto_refresh_taux_gnf, refresh_taux_gnf_en_base
 
 # ── Créer les tables SQLAlchemy ───────────────────────────────
 Base.metadata.create_all(bind=engine)
@@ -48,6 +48,10 @@ def startup():
         ensure_parrainage_tables(db)
         print("✅ Tables parrainage et galerie vérifiées")
 
+        # ✅ Migrations colonnes config (une seule fois au startup)
+        ensure_tarifs_columns(db)
+        print("✅ Colonnes config vérifiées")
+
         # Table sessions WhatsApp
         from sqlalchemy import text
         db.execute(text("""
@@ -60,6 +64,18 @@ def startup():
         db.commit()
         print("✅ Table sessions WhatsApp vérifiée")
 
+        # ✅ Première mise à jour du taux GNF au démarrage
+        import asyncio
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                asyncio.ensure_future(refresh_taux_gnf_en_base(db))
+            else:
+                loop.run_until_complete(refresh_taux_gnf_en_base(db))
+            print("✅ Taux GNF initialisé depuis open.er-api.com")
+        except Exception as e:
+            print(f"⚠️  Taux GNF non initialisé au startup: {e}")
+
     finally:
         db.close()
 
@@ -67,6 +83,13 @@ startup()
 
 # ── App ───────────────────────────────────────────────────────
 app = FastAPI(title="FougahShop API", version="2.2.0")
+
+@app.on_event("startup")
+async def on_startup():
+    """Lance la mise à jour automatique du taux GNF toutes les heures."""
+    import asyncio
+    asyncio.create_task(auto_refresh_taux_gnf())
+    print("✅ Tâche auto-refresh taux GNF démarrée (toutes les heures)")
 
 # ── CORS ──────────────────────────────────────────────────────
 ALLOWED_ORIGINS = [
