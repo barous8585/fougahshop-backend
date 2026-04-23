@@ -14,6 +14,7 @@ from routes.notifs     import router as notifs_router
 from routes.avis       import router as avis_router
 from routes.whatsapp   import router as whatsapp_router
 from routes.parrainage import router as parrainage_router
+from routes.promo      import ensure_tables as ensure_promo_tables
 from routes.parrainage import ensure_parrainage_tables
 from routes.config     import init_port, get_config, ensure_tarifs_columns, auto_refresh_taux_gnf, refresh_taux_gnf_en_base
 
@@ -47,6 +48,10 @@ def startup():
         # Tables parrainage + galerie (une seule fois)
         ensure_parrainage_tables(db)
         print("✅ Tables parrainage et galerie vérifiées")
+
+        # ✅ Migration table promo_codes (une seule fois)
+        ensure_promo_tables(db)
+        print("✅ Table promo_codes vérifiée")
 
         # ✅ Migrations colonnes config (une seule fois au startup)
         ensure_tarifs_columns(db)
