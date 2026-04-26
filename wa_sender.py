@@ -2,13 +2,15 @@
 wa_sender.py — envoi de messages WhatsApp via Twilio
 Importé par admin.py et commandes.py
 """
-import os, httpx
+import os
+import httpx
 from sqlalchemy.orm import Session
-from sqlalchemy import text
 
 TWILIO_SID   = os.environ.get("TWILIO_ACCOUNT_SID", "")
 TWILIO_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN",  "")
-TWILIO_FROM  = "whatsapp:+14155238886"
+# ✅ TWILIO_FROM depuis variable d'env — fallback sandbox pour les tests
+TWILIO_FROM  = os.environ.get("TWILIO_FROM", "whatsapp:+14155238886")
+
 
 def _get_wa_number(db: Session) -> str:
     """Récupère le numéro WA admin depuis la base."""
@@ -18,6 +20,7 @@ def _get_wa_number(db: Session) -> str:
         return cfg.wa_number or "" if cfg else ""
     except Exception:
         return ""
+
 
 def envoyer_whatsapp(to_tel: str, message: str) -> bool:
     """
@@ -55,47 +58,69 @@ def envoyer_whatsapp(to_tel: str, message: str) -> bool:
 
 
 # ── Messages par statut ───────────────────────────────────────
+
 def message_statut(ref: str, statut: str, date_estimee: str = "",
                    suivi_num: str = "", motif: str = "") -> str:
-    """Génère le message WhatsApp client selon le statut."""
-    msgs = {
-        "paye": (
+    """
+    Génère le message WhatsApp client selon le statut.
+    ✅ CORRIGÉ — f-strings imbriquées remplacées par variables pré-calculées
+    (compatibilité Python 3.10 et 3.11 sur Render)
+    """
+
+    if statut == "paye":
+        return (
             f"✅ *Paiement confirmé !*\n\n"
             f"Bonjour, nous avons bien reçu votre paiement pour la commande *{ref}*.\n"
             f"Nous allons maintenant acheter votre article sur le site officiel.\n\n"
             f"Vous serez notifié dès l'expédition. Merci de votre confiance 🙏"
-        ),
-        "achete": (
+        )
+
+    if statut == "achete":
+        # ✅ Variables pré-calculées — pas de f-string imbriquée
+        ligne_date = f"📅 Livraison estimée : *{date_estimee}*\n" if date_estimee else ""
+        return (
             f"🛍️ *Article acheté !*\n\n"
             f"Votre commande *{ref}* a été passée sur le site officiel.\n"
             f"Votre colis sera bientôt expédié vers l'Afrique.\n\n"
-            f"{"📅 Livraison estimée : *" + date_estimee + "*" + chr(10) if date_estimee else ""}"
+            f"{ligne_date}"
             f"Nous vous notifierons dès l'expédition."
-        ),
-        "expedie": (
+        )
+
+    if statut == "expedie":
+        ligne_suivi = f"📦 Numéro de suivi : *{suivi_num}*\n" if suivi_num else ""
+        ligne_date  = f"📅 Arrivée estimée : *{date_estimee}*\n" if date_estimee else ""
+        return (
             f"✈️ *Votre colis est en route !*\n\n"
             f"Commande *{ref}* expédiée depuis l'Europe.\n"
-            f"{"📦 Numéro de suivi : *" + suivi_num + "*" + chr(10) if suivi_num else ""}"
-            f"{"📅 Arrivée estimée : *" + date_estimee + "*" + chr(10) if date_estimee else ""}\n"
+            f"{ligne_suivi}"
+            f"{ligne_date}\n"
             f"Vous serez notifié à l'arrivée en Afrique."
-        ),
-        "arrive": (
+        )
+
+    if statut == "arrive":
+        return (
             f"📦 *Votre colis est arrivé !*\n\n"
             f"Commande *{ref}* est arrivée en Afrique et prête pour récupération.\n\n"
             f"Contactez-nous sur WhatsApp pour organiser la livraison finale.\n"
             f"Merci de votre patience ! 🎉"
-        ),
-        "paiement_refuse": (
+        )
+
+    if statut == "paiement_refuse":
+        ligne_motif = f"Motif : {motif}\n" if motif else ""
+        return (
             f"❌ *Paiement non confirmé*\n\n"
             f"Nous n'avons pas pu valider le paiement de la commande *{ref}*.\n"
-            f"{"Motif : " + motif + chr(10) if motif else ""}\n"
+            f"{ligne_motif}\n"
             f"Merci de nous contacter sur WhatsApp pour régulariser."
-        ),
-        "annulee": (
+        )
+
+    if statut == "annulee":
+        ligne_motif = f"Motif : {motif}\n" if motif else ""
+        return (
             f"🔴 *Commande annulée*\n\n"
             f"Votre commande *{ref}* a été annulée.\n"
-            f"{"Motif : " + motif + chr(10) if motif else ""}\n"
+            f"{ligne_motif}\n"
             f"Contactez-nous si vous avez des questions."
-        ),
-    }
-    return msgs.get(statut, "")
+        )
+
+    return ""
