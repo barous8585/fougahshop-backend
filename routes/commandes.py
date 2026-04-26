@@ -85,17 +85,27 @@ def generate_ref(db) -> str:
 
 
 def calc_article_sans_port_ni_commission(prix_eu, qty, pays, cfg):
-    taux = cfg.taux_change or 660
-    base_fcfa = round(prix_eu * taux)
-    m = MONNAIES.get(pays, {"symbole": "FCFA", "taux_base": 656})
-    # ✅ CORRIGÉ — Fallback si taux_gnf absent/invalide → évite total_local = 0
-    taux_gnf = cfg.taux_gnf if (cfg.taux_gnf and cfg.taux_gnf >= 1000) else 9500
-    taux_local = taux_gnf if m["symbole"] == "GNF" else 656
-    taux_conv = taux_local / 656
-    total_local = round(base_fcfa * taux_conv * qty)
+    m         = MONNAIES.get(pays, {"symbole": "FCFA", "taux_base": 656})
+    taux_gnf  = cfg.taux_gnf   if (cfg.taux_gnf  and cfg.taux_gnf  >= 1000) else 9500
+    taux_fcfa = cfg.taux_change or 660
+
+    if m["symbole"] == "GNF":
+        # ✅ CORRIGÉ — calcul direct avec taux_gnf (identique au frontend)
+        # Ancienne formule : round(prix * taux_fcfa) * taux_gnf/656
+        #   → 660 * 10318/656 = 10380 ≠ 10318 → écart de ~4700 GNF sur 75€
+        # Nouvelle formule : prix * taux_gnf directement → 0 écart
+        taux_conv  = taux_gnf / 656           # pour convertir commission FCFA→GNF
+        base_local = round(prix_eu * taux_gnf * qty)
+        base_fcfa  = round(prix_eu * taux_fcfa)   # conservé pour archivage
+    else:
+        # FCFA : formule inchangée
+        taux_conv  = 1.0
+        base_fcfa  = round(prix_eu * taux_fcfa)
+        base_local = round(base_fcfa * qty)
+
     return {
         "base_fcfa":   base_fcfa,
-        "total_local": total_local,
+        "total_local": base_local,
         "monnaie":     m["symbole"],
         "taux_conv":   taux_conv,
     }
@@ -229,13 +239,11 @@ class KkiapayConfirmBody(BaseModel):
 
 @router.post("/calculer")
 def calculer(body: CalculRequest, db: Session = Depends(get_db)):
-    cfg = get_config(db)
-    detail   = calc_article_sans_port_ni_commission(body.prix_eu, body.qty, body.pays, cfg)
+    cfg        = get_config(db)
+    detail     = calc_article_sans_port_ni_commission(body.prix_eu, body.qty, body.pays, cfg)
     commission = get_commission(body.prix_eu * body.qty)
-    m        = MONNAIES.get(body.pays, {"symbole": "FCFA", "taux_base": 656})
-    taux_gnf = cfg.taux_gnf if (cfg.taux_gnf and cfg.taux_gnf >= 1000) else 9500
-    taux_local = taux_gnf if m["symbole"] == "GNF" else 656
-    taux_conv  = taux_local / 656
+    # ✅ Utiliser taux_conv retourné par calc (déjà correct pour GNF et FCFA)
+    taux_conv  = detail["taux_conv"]
     comm_local = round(commission * taux_conv)
     port_fcfa  = get_port(db, body.pays)
     port_local = round(port_fcfa * body.poids * taux_conv)
