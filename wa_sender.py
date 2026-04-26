@@ -60,7 +60,8 @@ def envoyer_whatsapp(to_tel: str, message: str) -> bool:
 # ── Messages par statut ───────────────────────────────────────
 
 def message_statut(ref: str, statut: str, date_estimee: str = "",
-                   suivi_num: str = "", motif: str = "") -> str:
+                   suivi_num: str = "", motif: str = "",
+                   port_local: int = 0, monnaie: str = "FCFA") -> str:
     """
     Génère le message WhatsApp client selon le statut.
     ✅ CORRIGÉ — f-strings imbriquées remplacées par variables pré-calculées
@@ -76,12 +77,18 @@ def message_statut(ref: str, statut: str, date_estimee: str = "",
         )
 
     if statut == "achete":
-        # ✅ Variables pré-calculées — pas de f-string imbriquée
         ligne_date = f"📅 Livraison estimée : *{date_estimee}*\n" if date_estimee else ""
+        # ✅ Inclure les frais de port si calculés
+        if port_local and port_local > 0:
+            ligne_port = f"💰 *Frais de port : {port_local:,} {monnaie}*\n"
+            ligne_port += f"_(à régler avant expédition)_\n"
+        else:
+            ligne_port = ""
         return (
             f"🛍️ *Article acheté !*\n\n"
             f"Votre commande *{ref}* a été passée sur le site officiel.\n"
             f"Votre colis sera bientôt expédié vers l'Afrique.\n\n"
+            f"{ligne_port}"
             f"{ligne_date}"
             f"Nous vous notifierons dès l'expédition."
         )
