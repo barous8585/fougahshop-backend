@@ -7,14 +7,16 @@ from routes.auth import require_auth
 
 router = APIRouter(prefix="/api/notifs", tags=["notifs"])
 
-def ensure_tokens_table(db):
+
+def ensure_tokens_table(db: Session):
+    """✅ À appeler au startup dans main.py — pas à chaque requête."""
     try:
         db.execute(text("""
             CREATE TABLE IF NOT EXISTS fcm_tokens (
-                id SERIAL PRIMARY KEY,
-                token VARCHAR UNIQUE NOT NULL,
-                role VARCHAR DEFAULT 'client',
-                ref VARCHAR,
+                id         SERIAL PRIMARY KEY,
+                token      VARCHAR UNIQUE NOT NULL,
+                role       VARCHAR DEFAULT 'client',
+                ref        VARCHAR,
                 created_at TIMESTAMP DEFAULT NOW(),
                 updated_at TIMESTAMP DEFAULT NOW()
             )
@@ -23,12 +25,25 @@ def ensure_tokens_table(db):
     except Exception:
         db.rollback()
 
+
+def purge_old_tokens(db: Session):
+    """✅ Supprime les tokens FCM inactifs depuis > 90 jours."""
+    try:
+        db.execute(text(
+            "DELETE FROM fcm_tokens WHERE updated_at < NOW() - INTERVAL '90 days'"
+        ))
+        db.commit()
+    except Exception:
+        db.rollback()
+
+
 @router.post("/register")
 def register_token(body: Dict[str, Any], db: Session = Depends(get_db)):
-    ensure_tokens_table(db)
+    # ✅ ensure_tokens_table() retiré — appelé au startup
     token = str(body.get("token", "")).strip()
-    role = str(body.get("role", "client"))
-    ref = body.get("ref")
+    role  = str(body.get("role", "client"))
+    ref   = body.get("ref")
+
     if not token:
         raise HTTPException(400, "Token manquant")
     try:
@@ -43,6 +58,7 @@ def register_token(body: Dict[str, Any], db: Session = Depends(get_db)):
         raise HTTPException(500, f"Erreur enregistrement: {e}")
     return {"ok": True}
 
+
 @router.post("/send")
 def send_notification(
     body: Dict[str, Any],
@@ -52,11 +68,14 @@ def send_notification(
 ):
     return {"ok": False, "message": "Notifications push désactivées"}
 
+
 def _send_fcm(token: str, title: str, body: str, ref: Optional[str] = None) -> bool:
     return False
 
+
 def notifier_patron(db, title: str, body: str, ref: Optional[str] = None):
     pass
+
 
 def notifier_client(db, ref: str, title: str, body: str):
     pass
