@@ -15,6 +15,7 @@ from routes.avis       import router as avis_router
 from routes.whatsapp   import router as whatsapp_router
 from routes.parrainage import router as parrainage_router
 from routes.promo      import ensure_tables as ensure_promo_tables
+from routes.annonce    import router as annonce_router, ensure_annonces_table
 from routes.parrainage import ensure_parrainage_tables
 from routes.config     import init_port, get_config, ensure_tarifs_columns, auto_refresh_taux_gnf, refresh_taux_gnf_en_base
 
@@ -52,6 +53,10 @@ def startup():
         # ✅ Migration table promo_codes (une seule fois)
         ensure_promo_tables(db)
         print("✅ Table promo_codes vérifiée")
+
+        # ✅ Migration table annonces
+        ensure_annonces_table(db)
+        print("✅ Table annonces vérifiée")
 
         # ✅ Migrations colonnes config (une seule fois au startup)
         ensure_tarifs_columns(db)
@@ -125,6 +130,7 @@ app.include_router(notifs_router)
 app.include_router(avis_router)
 app.include_router(whatsapp_router)
 app.include_router(parrainage_router)
+app.include_router(annonce_router)
 # scraper_router supprimé — scraper retiré du frontend
 
 # ── Frontend statique ─────────────────────────────────────────
