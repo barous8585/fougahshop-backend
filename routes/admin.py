@@ -266,26 +266,75 @@ def update_statut(
             ), {"id": cfg.id if cfg else 1}).mappings().first()
             tarifs_unite = json.loads(tarifs_row["tarifs_unite"]) if tarifs_row and tarifs_row.get("tarifs_unite") else []
 
-            # Pour chaque article, chercher s'il a un tarif à l'unité
+            # ✅ Mapping catégorie frontend → mot-clé dans tarifs_unite
+            # Basé sur les catégories réelles et la grille tarifaire
+            # Mapping catégorie frontend → mot-clé dans tarifs_unite
+            # Catégories au poids (vêtements, sacs, etc.) = absentes du mapping
+            CAT_TARIF_UNITE = {
+                # Chaussures (la paire) → 20€ à l'unité
+                "baskets":           "chaussures",
+                "bottes":            "chaussures",
+                # Cosmétiques / Parfum → 30€
+                "cosmetique":        "parfum",
+                # Montre / Bijoux → 70€
+                "bijou":             "montre",
+                # smartphone géré séparément (iPhone vs standard)
+            }
+            # Catégories au POIDS (pas dans CAT_TARIF_UNITE) :
+            # tshirt, chemise, robe, pantalon, veste, manteau, lingerie,
+            # accessoire, sac, sacados, maison, sport, combi, ens2h, ens2f, ens3
+            # informatique-acc, electromenager-s, electromenager-m, ordinateur, velo, lourd, custom
+
             for art in articles:
-                nom_art = (art.get("nom") or "").lower()
-                categorie = (art.get("categorie") or "").lower()
-                prix_eu = float(art.get("prix_eu") or 0)
-                qty = int(art.get("qty") or 1)
+                categorie = (art.get("categorie") or "").lower().strip()
+                prix_eu   = float(art.get("prix_eu") or 0)
+                qty       = int(art.get("qty") or 1)
 
                 tarif_unite_trouve = None
-                for tu in tarifs_unite:
-                    nom_tu = (tu.get("nom") or "").lower()
-                    # Correspondance par nom ou catégorie
-                    if nom_tu in nom_art or nom_tu in categorie:
-                        # Vérifier condition de prix si présente (ex: ">800€")
-                        note = (tu.get("note") or "").replace(" ", "")
-                        if note.startswith(">"):
-                            seuil = float(note.replace(">","").replace("€","").replace("€",""))
-                            if prix_eu > seuil:
+
+                # 1. Chercher par catégorie (fiable)
+                nom_tarif = CAT_TARIF_UNITE.get(categorie)
+
+                # Cas spécial smartphone : iPhone (>800€) ou téléphone standard
+                if categorie == "smartphone":
+                    for tu in tarifs_unite:
+                        nom_tu = (tu.get("nom") or "").lower()
+                        note   = (tu.get("note") or "").replace(" ", "")
+                        if "iphone" in nom_tu or "haut de gamme" in nom_tu:
+                            # iPhone haut de gamme — vérifier seuil de prix
+                            if note.startswith(">"):
+                                try:
+                                    seuil = float(note.replace(">","").replace("€",""))
+                                    if prix_eu > seuil:
+                                        tarif_unite_trouve = tu
+                                        break
+                                except Exception:
+                                    pass
+                        elif "t" in nom_tu and "l" in nom_tu and "phone" in nom_tu:
+                            # Téléphone standard — fallback si pas iPhone
+                            if not tarif_unite_trouve:
+                                tarif_unite_trouve = tu
+                    # Si iPhone non trouvé, prendre le téléphone standard
+                    if not tarif_unite_trouve:
+                        for tu in tarifs_unite:
+                            nom_tu = (tu.get("nom") or "").lower()
+                            if "t" in nom_tu and "phone" in nom_tu:
                                 tarif_unite_trouve = tu
                                 break
-                        else:
+
+                elif nom_tarif and tarifs_unite:
+                    for tu in tarifs_unite:
+                        nom_tu = (tu.get("nom") or "").lower()
+                        if nom_tarif in nom_tu:
+                            tarif_unite_trouve = tu
+                            break
+
+                # 2. Fallback : chercher par nom de l'article si catégorie non trouvée
+                if not tarif_unite_trouve and tarifs_unite:
+                    nom_art = (art.get("nom") or "").lower()
+                    for tu in tarifs_unite:
+                        nom_tu = (tu.get("nom") or "").lower()
+                        if nom_tu and nom_tu in nom_art:
                             tarif_unite_trouve = tu
                             break
 
