@@ -17,6 +17,7 @@ from routes.parrainage import router as parrainage_router
 from routes.promo      import ensure_tables as ensure_promo_tables
 from routes.annonce    import router as annonce_router, ensure_annonces_table
 from routes.admin      import ensure_archived_column
+from routes.auth       import ensure_sessions_table, purge_expired_sessions
 from routes.parrainage import ensure_parrainage_tables
 from routes.config     import init_port, get_config, ensure_tarifs_columns, auto_refresh_taux_gnf, refresh_taux_gnf_en_base
 
@@ -62,6 +63,14 @@ def startup():
         # ✅ Migration colonne archived sur commandes
         ensure_archived_column(db)
         print("✅ Colonne archived vérifiée")
+
+        # ✅ Migration table sessions admin
+        ensure_sessions_table(db)
+        print("✅ Table admin_sessions vérifiée")
+
+        # ✅ Nettoyer les sessions expirées (> 7 jours)
+        purge_expired_sessions(db)
+        print("✅ Sessions expirées nettoyées")
 
         # ✅ Migrations colonnes config (une seule fois au startup)
         ensure_tarifs_columns(db)
