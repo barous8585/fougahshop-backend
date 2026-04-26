@@ -3,7 +3,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import func
 from pydantic import BaseModel
 from typing import Optional
-import json, csv, io
+import json, csv, io, re
 from fastapi.responses import StreamingResponse
 from database import get_db
 from models import Commande, Config
@@ -48,7 +48,53 @@ STATUTS_PAR_ROLE = {
     "employe":     ["paye","achete"],
 }
 
+
+def ensure_archived_column(db: Session):
+    """✅ À appeler au startup — pas à chaque requête."""
+    from sqlalchemy import text
+    try:
+        db.execute(text("ALTER TABLE commandes ADD COLUMN IF NOT EXISTS archived BOOLEAN DEFAULT FALSE"))
+        db.commit()
+    except Exception:
+        db.rollback()
+
+
+def parse_cadeau(instructions: str) -> dict:
+    """
+    ✅ Extrait les infos cadeau depuis client_instructions.
+    Format : '🎁 CADEAU POUR: Mamadou | Tel:+224... | Payeur: ...'
+    Retourne un dict avec dest_nom, dest_tel, payeur_nom, payeur_tel
+    ou None si ce n'est pas une commande cadeau.
+    """
+    if not instructions or "CADEAU POUR" not in instructions:
+        return {}
+    try:
+        cadeau = {}
+        # Extraire nom destinataire
+        m = re.search(r"CADEAU POUR:\s*([^|]+)", instructions)
+        if m: cadeau["dest_nom"] = m.group(1).strip()
+        # Extraire tel destinataire
+        m = re.search(r"Tel:([^\s|]+)", instructions)
+        if m: cadeau["dest_tel"] = m.group(1).strip()
+        # Extraire payeur
+        m = re.search(r"Payeur:\s*([^|]+)\s*\(([^)]+)\)", instructions)
+        if m:
+            cadeau["payeur_nom"] = m.group(1).strip()
+            cadeau["payeur_tel"] = m.group(2).strip()
+        return cadeau
+    except Exception:
+        return {}
+
+
 def serialize_cmd(c):
+    instructions = c.client_instructions or ""
+    cadeau_info  = parse_cadeau(instructions)
+
+    # Nettoyer les instructions affichées (retirer le bloc cadeau technique)
+    instructions_propres = re.sub(
+        r"\s*\|?\s*🎁 CADEAU POUR:.*$", "", instructions, flags=re.DOTALL
+    ).strip(" |")
+
     return {
         "id":                   c.id,
         "ref":                  c.ref,
@@ -58,7 +104,7 @@ def serialize_cmd(c):
         "client_tel":           c.client_tel,
         "client_pays":          c.client_pays,
         "client_adresse":       c.client_adresse,
-        "client_instructions":  c.client_instructions,
+        "client_instructions":  instructions_propres,
         "operateur":            c.operateur,
         "monnaie":              c.monnaie,
         "total_euro":           c.total_euro,
@@ -70,11 +116,17 @@ def serialize_cmd(c):
         "note_admin":           c.note_admin,
         "delai_livraison":      c.delai_livraison,
         "paiement_ref":         c.paiement_ref,
-        # ✅ Champs ajoutés pour suivi colis et motif refus
         "suivi_num":            getattr(c, "suivi_num", None),
         "motif_refus":          getattr(c, "motif_refus", None),
         "created_at":           c.created_at,
+        # ✅ Champs cadeau dédiés — visibles clairement dans l'admin
+        "is_cadeau":            bool(cadeau_info),
+        "dest_nom":             cadeau_info.get("dest_nom"),
+        "dest_tel":             cadeau_info.get("dest_tel"),
+        "payeur_nom":           cadeau_info.get("payeur_nom"),
+        "payeur_tel":           cadeau_info.get("payeur_tel"),
     }
+
 
 def get_commission_palier(total_eu: float) -> int:
     if total_eu <= 50:   return 3500
@@ -83,10 +135,11 @@ def get_commission_palier(total_eu: float) -> int:
     if total_eu <= 500:  return 12000
     return 20000
 
+
 @router.get("/stats")
 def stats(request: Request, db: Session = Depends(get_db),
           role: str = Depends(require_auth)):
-    total = db.query(Commande).count()
+    total    = db.query(Commande).count()
     by_statut = {s: db.query(Commande).filter(Commande.statut == s).count()
                  for s in STATUTS}
     encaisse = db.query(func.sum(Commande.total_local)).filter(
@@ -101,23 +154,23 @@ def stats(request: Request, db: Session = Depends(get_db),
             Commande.statut.in_(["paye","achete","expedie","arrive","recupere"])
         ).all()
         marge_totale = sum(
-            get_commission_palier(c.total_euro or 0)
-            for c in cmds_payees
+            get_commission_palier(c.total_euro or 0) for c in cmds_payees
         )
-        base["marge_estimee"] = round(marge_totale)
+        base["marge_estimee"]        = round(marge_totale)
         base["nb_commandes_actives"] = len(cmds_payees)
 
     return base
 
+
 @router.get("/commandes")
 def liste_commandes(
     request: Request,
-    statut: Optional[str] = None,
-    search: Optional[str] = None,
+    statut: Optional[str]     = None,
+    search: Optional[str]     = None,
     date_debut: Optional[str] = None,
-    date_fin: Optional[str] = None,
+    date_fin: Optional[str]   = None,
     db: Session = Depends(get_db),
-    role: str = Depends(require_auth),
+    role: str   = Depends(require_auth),
 ):
     q = db.query(Commande)
     statuts_autorises = STATUTS_PAR_ROLE.get(role, ["paye", "achete"])
@@ -141,33 +194,33 @@ def liste_commandes(
     if date_fin:
         q = q.filter(Commande.created_at <= date_fin + " 23:59:59")
 
-    cmds = q.order_by(Commande.created_at.desc()).all()
-
+    cmds   = q.order_by(Commande.created_at.desc()).all()
     result = []
     for c in cmds:
         d = serialize_cmd(c)
         if role in ("employe", "logisticien"):
             d.pop("total_local", None)
-            d.pop("total_euro", None)
-            d.pop("monnaie", None)
+            d.pop("total_euro",  None)
+            d.pop("monnaie",     None)
         result.append(d)
     return result
 
-# ✅ StatutUpdate étendu avec delai_livraison, suivi_num, motif_refus
+
 class StatutUpdate(BaseModel):
     statut:          str
     note_admin:      Optional[str]   = None
     poids_reel:      Optional[float] = None
-    delai_livraison: Optional[str]   = None   # ← AJOUTÉ
-    suivi_num:       Optional[str]   = None   # ← AJOUTÉ
-    motif_refus:     Optional[str]   = None   # ← AJOUTÉ
+    delai_livraison: Optional[str]   = None
+    suivi_num:       Optional[str]   = None
+    motif_refus:     Optional[str]   = None
+
 
 @router.patch("/commandes/{ref}/statut")
 def update_statut(
     ref: str, body: StatutUpdate,
     request: Request,
     db: Session = Depends(get_db),
-    role: str = Depends(require_auth),
+    role: str   = Depends(require_auth),
 ):
     statuts_autorises = STATUTS_PAR_ROLE.get(role, ["paye", "achete"])
     if body.statut not in statuts_autorises:
@@ -180,58 +233,60 @@ def update_statut(
     cmd.statut = body.statut
 
     if body.note_admin:
-        cmd.note_admin = (cmd.note_admin or "") + " | " + body.note_admin
+        note_existante = (cmd.note_admin or "")[-1500:]
+        # ✅ Tronquer pour éviter dépassement de colonne
+        cmd.note_admin = (note_existante + " | " + body.note_admin)[-2000:]
 
-    # ✅ Délai de livraison mis à jour depuis l'admin
     if body.delai_livraison:
         cmd.delai_livraison = body.delai_livraison
 
-    # ✅ Numéro de suivi colis
     if body.suivi_num and hasattr(cmd, "suivi_num"):
         cmd.suivi_num = body.suivi_num
 
-    # ✅ Motif de refus (paiement_refuse)
     if body.motif_refus and hasattr(cmd, "motif_refus"):
         cmd.motif_refus = body.motif_refus
 
-    # Calcul port réel — patron ET logisticien
     if body.poids_reel and role in ("patron", "logisticien"):
         cmd.poids_reel = body.poids_reel
-        cfg = db.query(Config).first()
+        cfg  = db.query(Config).first()
         from models import PortKg
         port = db.query(PortKg).filter(PortKg.pays == cmd.client_pays).first()
-        port_kg = port.prix if port else 7000
-
+        port_kg   = port.prix if port else 7000
         port_fcfa = round(port_kg * body.poids_reel)
         taux_local = (cfg.taux_gnf if cfg else 9500) if cmd.monnaie == "GNF" else 656
         port_local = round(port_fcfa * (taux_local / 656))
-
         cmd.total_local = (cmd.total_local or 0) + port_local
         note_port = f"Poids réel: {body.poids_reel}kg | Port: {port_local:,} {cmd.monnaie or 'FCFA'}"
-        cmd.note_admin = (cmd.note_admin or "") + " | " + note_port
+        note_existante = (cmd.note_admin or "")[-1500:]
+        cmd.note_admin  = (note_existante + " | " + note_port)[-2000:]
 
     db.commit()
 
-    # ✅ Calcul de la date de livraison estimée
-    date_est = calculer_date_estimee(
-        cmd.created_at,
-        cmd.delai_livraison or ""
-    )
+    date_est = calculer_date_estimee(cmd.created_at, cmd.delai_livraison or "")
 
-    # ✅ WhatsApp automatique au client
-    STATUTS_WA = {"paye", "achete", "expedie", "arrive", "paiement_refuse", "annulee"}
+    # ✅ WhatsApp — détecter mode cadeau pour contacter aussi le destinataire
+    cadeau_info = parse_cadeau(cmd.client_instructions or "")
+    STATUTS_WA  = {"paye","achete","expedie","arrive","paiement_refuse","annulee"}
+
     if body.statut in STATUTS_WA and cmd.client_tel:
         wa_msg = message_statut(
-            ref        = cmd.ref,
-            statut     = body.statut,
+            ref          = cmd.ref,
+            statut       = body.statut,
             date_estimee = date_est,
-            suivi_num  = getattr(cmd, "suivi_num", "") or "",
-            motif      = body.motif_refus or "",
+            suivi_num    = getattr(cmd, "suivi_num", "") or "",
+            motif        = body.motif_refus or "",
         )
         if wa_msg:
+            # Toujours envoyer au payeur (client_tel)
             envoyer_whatsapp(cmd.client_tel, wa_msg)
+            # ✅ Pour arrive et recupere — envoyer aussi au destinataire cadeau
+            if cadeau_info.get("dest_tel") and body.statut in ("arrive", "recupere"):
+                msg_dest = f"📦 Bonjour {cadeau_info.get('dest_nom', '')} !\n\n" \
+                           f"Un colis vous est destiné — Réf: {cmd.ref}\n" \
+                           f"Statut : {STATUT_LABELS.get(body.statut, body.statut)}\n" \
+                           f"Veuillez contacter FougahShop pour le récupérer."
+                envoyer_whatsapp(cadeau_info["dest_tel"], msg_dest)
 
-    # Notifications push (si activées)
     labels = {
         "paye":            "💰 Paiement confirmé ! On achète votre article.",
         "achete":          "🛍️ Article acheté ! Préparation en cours.",
@@ -245,25 +300,24 @@ def update_statut(
         if body.statut == "paye":
             notifier_patron(db, "💰 Nouveau paiement reçu",
                 f"{cmd.client_nom} · {cmd.ref} · {round(cmd.total_local or 0):,} {cmd.monnaie or 'FCFA'}", cmd.ref)
-        if role == "logisticien" and body.statut in ("achete", "expedie", "arrive"):
+        if role == "logisticien" and body.statut in ("achete","expedie","arrive"):
             notifier_patron(db, f"📦 Logistique — {STATUT_LABELS.get(body.statut, body.statut)}",
                 f"{cmd.ref} · {cmd.client_nom} · {cmd.client_pays}", cmd.ref)
 
     return {"ref": cmd.ref, "statut": cmd.statut, "date_estimee": date_est}
 
+
 # ── Archives ──────────────────────────────────────────────────
+# ✅ ensure_archived_column() appelé au startup — pas ici
+
 @router.post("/commandes/{ref}/archiver")
-def archiver_commande(ref: str, request: Request, db: Session = Depends(get_db),
+def archiver_commande(ref: str, request: Request,
+                      db: Session = Depends(get_db),
                       role: str = Depends(require_auth)):
-    from sqlalchemy import text as sqlt
-    try:
-        db.execute(sqlt("ALTER TABLE commandes ADD COLUMN IF NOT EXISTS archived BOOLEAN DEFAULT FALSE"))
-        db.commit()
-    except Exception:
-        db.rollback()
     cmd = db.query(Commande).filter(Commande.ref == ref).first()
     if not cmd:
         raise HTTPException(404, "Commande introuvable")
+    from sqlalchemy import text as sqlt
     try:
         db.execute(sqlt("UPDATE commandes SET archived = TRUE WHERE ref = :r"), {"r": ref})
         db.commit()
@@ -272,8 +326,10 @@ def archiver_commande(ref: str, request: Request, db: Session = Depends(get_db),
         raise HTTPException(500, "Erreur archivage")
     return {"ok": True, "ref": ref}
 
+
 @router.post("/commandes/{ref}/desarchiver")
-def desarchiver_commande(ref: str, request: Request, db: Session = Depends(get_db),
+def desarchiver_commande(ref: str, request: Request,
+                         db: Session = Depends(get_db),
                          role: str = Depends(require_auth)):
     from sqlalchemy import text as sqlt
     try:
@@ -284,15 +340,11 @@ def desarchiver_commande(ref: str, request: Request, db: Session = Depends(get_d
         raise HTTPException(500, "Erreur désarchivage")
     return {"ok": True, "ref": ref}
 
+
 @router.get("/commandes/archives")
 def liste_archives(request: Request, db: Session = Depends(get_db),
                    role: str = Depends(require_auth)):
     from sqlalchemy import text as sqlt
-    try:
-        db.execute(sqlt("ALTER TABLE commandes ADD COLUMN IF NOT EXISTS archived BOOLEAN DEFAULT FALSE"))
-        db.commit()
-    except Exception:
-        db.rollback()
     try:
         rows = db.execute(sqlt(
             "SELECT ref, client_nom, client_tel, client_pays, operateur, monnaie, "
@@ -303,23 +355,26 @@ def liste_archives(request: Request, db: Session = Depends(get_db),
     except Exception:
         return []
 
+
 @router.get("/export/csv")
 def export_csv(request: Request, db: Session = Depends(get_db),
                role: str = Depends(require_patron)):
-    cmds = db.query(Commande).order_by(Commande.created_at.desc()).all()
+    cmds   = db.query(Commande).order_by(Commande.created_at.desc()).all()
     output = io.StringIO()
-    w = csv.writer(output)
+    w      = csv.writer(output)
     w.writerow([
         "Référence","Date","Client","Téléphone","Pays","Adresse",
         "Opérateur","Monnaie","Total €","Total local","Poids estimé",
-        "Poids réel","Nb articles","Statut","Délai","N° Suivi","Notes","Détail articles"
+        "Poids réel","Nb articles","Statut","Délai","N° Suivi","Notes",
+        "Détail articles","Cadeau","Destinataire","Tel destinataire"
     ])
     for c in cmds:
-        arts = json.loads(c.articles) if c.articles else []
+        arts   = json.loads(c.articles) if c.articles else []
         detail = " | ".join([
             f"{a['nom']} x{a.get('qty',1)} ({a.get('poids',0.5)}kg)"
             for a in arts
         ])
+        cadeau = parse_cadeau(c.client_instructions or "")
         w.writerow([
             c.ref,
             c.created_at.strftime("%d/%m/%Y %H:%M") if c.created_at else "",
@@ -328,8 +383,12 @@ def export_csv(request: Request, db: Session = Depends(get_db),
             c.poids_estime or "", c.poids_reel or "",
             c.nb_articles, STATUT_LABELS.get(c.statut, c.statut),
             c.delai_livraison or "",
-            getattr(c, "suivi_num", "") or "",   # ← ajouté dans le CSV aussi
-            c.note_admin or "", detail
+            getattr(c, "suivi_num", "") or "",
+            c.note_admin or "", detail,
+            # ✅ Colonnes cadeau dans le CSV
+            "Oui" if cadeau else "",
+            cadeau.get("dest_nom", ""),
+            cadeau.get("dest_tel", ""),
         ])
     output.seek(0)
     return StreamingResponse(
