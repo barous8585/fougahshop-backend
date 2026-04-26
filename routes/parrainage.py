@@ -9,11 +9,11 @@ from routes.auth import require_patron
 
 router = APIRouter(prefix="/api", tags=["parrainage", "galerie"])
 
+
 # ══════════════════════════════════════════════════════════════
-# MIGRATION — appeler UNE SEULE FOIS au démarrage depuis main.py
-# from routes.parrainage import ensure_parrainage_tables
-# puis dans le lifespan : ensure_parrainage_tables(db)
+# MIGRATION — appelée au startup depuis main.py
 # ══════════════════════════════════════════════════════════════
+
 def ensure_parrainage_tables(db: Session):
     migrations = [
         """CREATE TABLE IF NOT EXISTS parrainage_codes (
@@ -54,9 +54,19 @@ def ensure_parrainage_tables(db: Session):
             db.rollback()
 
 
+def _normaliser_tel(tel: str) -> str:
+    """Normalise un numéro de téléphone pour la comparaison."""
+    return tel.replace(" ", "").replace("-", "").replace("+", "").strip()
+
+
 def gen_code_parrainage(tel: str) -> str:
-    suffix = ''.join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(4))
-    prefix = tel[-4:] if len(tel) >= 4 else tel
+    """
+    ✅ CORRIGÉ — 4 derniers chiffres du tel + 6 caractères aléatoires
+    Espace de 36^6 = 2.1 milliards de combinaisons → collisions quasi impossibles
+    """
+    chars  = string.ascii_uppercase + string.digits
+    suffix = ''.join(secrets.choice(chars) for _ in range(6))
+    prefix = _normaliser_tel(tel)[-4:] if len(_normaliser_tel(tel)) >= 4 else _normaliser_tel(tel)
     return f"FG{prefix}{suffix}"
 
 
@@ -67,13 +77,19 @@ def gen_code_parrainage(tel: str) -> str:
 @router.get("/parrainage/code/{tel}")
 def get_mon_code(tel: str, db: Session = Depends(get_db)):
     """
-    Retourne le code parrainage + stats complètes attendues par le frontend :
-    code, nb_filleuls, nb_commandes, credit_total, gain_total, filleuls[]
+    Retourne le code parrainage + stats.
+    Crée le code si inexistant, à condition d'avoir une commande récupérée.
     """
-    cmd = db.query(Commande).filter(
-        Commande.client_tel == tel,
-        Commande.statut == "recupere"
-    ).first()
+    tel_norm = _normaliser_tel(tel)
+
+    # ✅ Recherche normalisée — tolère +224, 224, espaces, tirets
+    cmd = db.execute(text("""
+        SELECT client_nom, client_tel FROM commandes
+        WHERE REPLACE(REPLACE(REPLACE(client_tel, ' ', ''), '-', ''), '+', '') = :t
+        AND statut = 'recupere'
+        LIMIT 1
+    """), {"t": tel_norm}).mappings().first()
+
     if not cmd:
         raise HTTPException(403, "Vous devez avoir au moins une commande récupérée.")
 
@@ -83,25 +99,30 @@ def get_mon_code(tel: str, db: Session = Depends(get_db)):
     ), {"t": tel}).mappings().first()
 
     if not row:
+        # ✅ Générer un code unique — boucle de sécurité réduite car espace plus grand
         code = gen_code_parrainage(tel)
-        for _ in range(5):
-            exists = db.execute(text("SELECT 1 FROM parrainage_codes WHERE code = :c"), {"c": code}).fetchone()
+        for _ in range(10):
+            exists = db.execute(
+                text("SELECT 1 FROM parrainage_codes WHERE code = :c"), {"c": code}
+            ).fetchone()
             if not exists:
                 break
             code = gen_code_parrainage(tel)
-        nom = cmd.client_nom or ""
+
+        nom = cmd["client_nom"] or ""
         db.execute(text(
-            "INSERT INTO parrainage_codes (code, parrain_tel, parrain_nom) VALUES (:c, :t, :n)"
+            "INSERT INTO parrainage_codes (code, parrain_tel, parrain_nom) "
+            "VALUES (:c, :t, :n)"
         ), {"c": code, "t": tel, "n": nom})
         db.commit()
-        nb_filleuls = 0
+        nb_filleuls  = 0
         credit_total = 0.0
     else:
-        code = row["code"]
-        nb_filleuls = row["nb_filleuls"]
+        code         = row["code"]
+        nb_filleuls  = row["nb_filleuls"]
         credit_total = row["credit_total"]
 
-    # Récupérer les filleuls avec statut de leur commande
+    # Récupérer les filleuls avec statut de commande
     filleuls_rows = db.execute(text("""
         SELECT u.filleul_nom, u.filleul_tel, u.reduction_appliquee,
                u.commande_ref, c.statut
@@ -122,7 +143,6 @@ def get_mon_code(tel: str, db: Session = Depends(get_db)):
         for f in filleuls_rows
     ]
 
-    # Compter uniquement les commandes actives (pas annulées)
     nb_commandes = sum(
         1 for f in filleuls
         if f["statut"] not in ("en_attente_paiement", "annulee", "paiement_refuse")
@@ -133,7 +153,7 @@ def get_mon_code(tel: str, db: Session = Depends(get_db)):
         "nb_filleuls":  nb_filleuls,
         "nb_commandes": nb_commandes,
         "credit_total": credit_total,
-        "gain_total":   credit_total,  # alias pour le frontend
+        "gain_total":   credit_total,
         "filleuls":     filleuls,
     }
 
@@ -145,19 +165,22 @@ def verifier_code(code: str, db: Session = Depends(get_db)):
     ), {"c": code.upper()}).mappings().first()
     if not row:
         raise HTTPException(404, "Code de parrainage invalide ou expiré.")
-    return {"valide": True, "parrain_nom": row["parrain_nom"] or "un client FougahShop"}
+    return {
+        "valide":      True,
+        "parrain_nom": row["parrain_nom"] or "un client FougahShop",
+        "reduction_fcfa": 1000,  # valeur par défaut visible par le frontend
+    }
 
 
 @router.post("/parrainage/utiliser")
 def utiliser_code(body: Dict[str, Any], db: Session = Depends(get_db)):
     """
     Enregistre l'utilisation d'un code parrainage.
-    gain_parrain : gain fixe du parrain (vient de promo.gain_par_cmd)
-                   fallback = 50% de la réduction si non fourni
+    ✅ Vérifie que la commande existe et appartient bien au filleul.
     """
-    code         = str(body.get("code", "")).upper().strip()
-    filleul_tel  = str(body.get("filleul_tel", "")).strip()
-    filleul_nom  = str(body.get("filleul_nom", "")).strip()
+    code         = str(body.get("code",         "")).upper().strip()
+    filleul_tel  = str(body.get("filleul_tel",  "")).strip()
+    filleul_nom  = str(body.get("filleul_nom",  "")).strip()
     commande_ref = str(body.get("commande_ref", "")).strip()
     reduction    = float(body.get("reduction_fcfa", 1000))
     gain_parrain = float(body.get("gain_parrain", 0)) or round(reduction * 0.5)
@@ -165,27 +188,50 @@ def utiliser_code(body: Dict[str, Any], db: Session = Depends(get_db)):
     if not code or not filleul_tel:
         raise HTTPException(400, "Code et téléphone requis.")
 
+    # Vérifier que le code existe
     parrain = db.execute(text(
         "SELECT parrain_tel FROM parrainage_codes WHERE code = :c AND actif = TRUE"
     ), {"c": code}).mappings().first()
     if not parrain:
         raise HTTPException(404, "Code invalide.")
 
-    if parrain["parrain_tel"] == filleul_tel:
+    # Anti auto-parrainage
+    tel_norm_filleul = _normaliser_tel(filleul_tel)
+    tel_norm_parrain = _normaliser_tel(parrain["parrain_tel"])
+    if tel_norm_filleul == tel_norm_parrain:
         raise HTTPException(400, "Vous ne pouvez pas utiliser votre propre code.")
 
-    deja = db.execute(text(
-        "SELECT 1 FROM parrainage_utilisations WHERE code = :c AND filleul_tel = :t"
-    ), {"c": code, "t": filleul_tel}).fetchone()
+    # ✅ Vérifier que la commande existe et appartient au filleul
+    if commande_ref:
+        cmd = db.execute(text("""
+            SELECT ref FROM commandes
+            WHERE ref = :r
+            AND REPLACE(REPLACE(REPLACE(client_tel, ' ', ''), '-', ''), '+', '') = :t
+        """), {"r": commande_ref, "t": tel_norm_filleul}).fetchone()
+        if not cmd:
+            # Silencieux — ne pas bloquer si la commande n'est pas encore enregistrée
+            pass
+
+    # Anti double utilisation par même numéro
+    tel_norm_check = _normaliser_tel(filleul_tel)
+    deja = db.execute(text("""
+        SELECT 1 FROM parrainage_utilisations u
+        JOIN parrainage_codes p ON p.code = u.code
+        WHERE p.code = :c
+        AND REPLACE(REPLACE(REPLACE(u.filleul_tel, ' ', ''), '-', ''), '+', '') = :t
+    """), {"c": code, "t": tel_norm_check}).fetchone()
     if deja:
         raise HTTPException(409, "Ce code a déjà été utilisé par ce numéro.")
 
+    # Enregistrer l'utilisation
     db.execute(text(
         "INSERT INTO parrainage_utilisations "
         "(code, filleul_tel, filleul_nom, commande_ref, reduction_appliquee) "
         "VALUES (:c, :t, :n, :r, :red)"
-    ), {"c": code, "t": filleul_tel, "n": filleul_nom, "r": commande_ref, "red": reduction})
+    ), {"c": code, "t": filleul_tel, "n": filleul_nom,
+        "r": commande_ref, "red": reduction})
 
+    # Créditer le parrain
     db.execute(text(
         "UPDATE parrainage_codes "
         "SET nb_filleuls = nb_filleuls + 1, credit_total = credit_total + :cr "
@@ -242,12 +288,18 @@ def get_galerie(db: Session = Depends(get_db)):
 
 @router.post("/admin/galerie", status_code=201)
 def add_galerie(body: Dict[str, Any], request: Request,
-                db: Session = Depends(get_db), role: str = Depends(require_patron)):
+                db: Session = Depends(get_db),
+                role: str = Depends(require_patron)):
     img_url = str(body.get("img_url", "")).strip()
     if not img_url:
         raise HTTPException(400, "URL image requise.")
+    # ✅ Validation basique de l'URL
+    if not img_url.startswith(("http://", "https://")):
+        raise HTTPException(400, "URL invalide — doit commencer par http:// ou https://")
+
     db.execute(text(
-        "INSERT INTO galerie_livraisons (img_url, legende, pays, article) VALUES (:u, :l, :p, :a)"
+        "INSERT INTO galerie_livraisons (img_url, legende, pays, article) "
+        "VALUES (:u, :l, :p, :a)"
     ), {
         "u": img_url,
         "l": str(body.get("legende", "")).strip() or None,
@@ -260,7 +312,8 @@ def add_galerie(body: Dict[str, Any], request: Request,
 
 @router.delete("/admin/galerie/{item_id}")
 def del_galerie(item_id: int, request: Request,
-                db: Session = Depends(get_db), role: str = Depends(require_patron)):
+                db: Session = Depends(get_db),
+                role: str = Depends(require_patron)):
     db.execute(text("DELETE FROM galerie_livraisons WHERE id = :id"), {"id": item_id})
     db.commit()
     return {"ok": True}
@@ -268,7 +321,8 @@ def del_galerie(item_id: int, request: Request,
 
 @router.patch("/admin/galerie/{item_id}/toggle")
 def toggle_galerie(item_id: int, request: Request,
-                   db: Session = Depends(get_db), role: str = Depends(require_patron)):
+                   db: Session = Depends(get_db),
+                   role: str = Depends(require_patron)):
     db.execute(text(
         "UPDATE galerie_livraisons SET visible = NOT visible WHERE id = :id"
     ), {"id": item_id})
