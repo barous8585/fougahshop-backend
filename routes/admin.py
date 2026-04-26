@@ -231,6 +231,7 @@ def update_statut(
         raise HTTPException(404, "Commande introuvable")
 
     cmd.statut = body.statut
+    port_local = 0  # ✅ Initialisé à 0 — mis à jour si poids_reel fourni
 
     if body.note_admin:
         note_existante = (cmd.note_admin or "")[-1500:]
@@ -250,9 +251,61 @@ def update_statut(
         cmd.poids_reel = body.poids_reel
         cfg  = db.query(Config).first()
         from models import PortKg
+        from sqlalchemy import text as sqlt
         port = db.query(PortKg).filter(PortKg.pays == cmd.client_pays).first()
-        port_kg   = port.prix if port else 7000
-        port_fcfa = round(port_kg * body.poids_reel)
+        port_kg = port.prix if port else 7000
+
+        # ✅ Vérifier si un article a un tarif à l'unité
+        # Les tarifs à l'unité sont stockés dans configs.tarifs_unite (JSON)
+        # Format : [{"nom": "iPhone / Haut de gamme", "prix": 100, "note": ">800€"}, ...]
+        port_fcfa = 0
+        try:
+            articles = json.loads(cmd.articles) if cmd.articles else []
+            tarifs_row = db.execute(sqlt(
+                "SELECT tarifs_unite FROM configs WHERE id = :id"
+            ), {"id": cfg.id if cfg else 1}).mappings().first()
+            tarifs_unite = json.loads(tarifs_row["tarifs_unite"]) if tarifs_row and tarifs_row.get("tarifs_unite") else []
+
+            # Pour chaque article, chercher s'il a un tarif à l'unité
+            for art in articles:
+                nom_art = (art.get("nom") or "").lower()
+                categorie = (art.get("categorie") or "").lower()
+                prix_eu = float(art.get("prix_eu") or 0)
+                qty = int(art.get("qty") or 1)
+
+                tarif_unite_trouve = None
+                for tu in tarifs_unite:
+                    nom_tu = (tu.get("nom") or "").lower()
+                    # Correspondance par nom ou catégorie
+                    if nom_tu in nom_art or nom_tu in categorie:
+                        # Vérifier condition de prix si présente (ex: ">800€")
+                        note = (tu.get("note") or "").replace(" ", "")
+                        if note.startswith(">"):
+                            seuil = float(note.replace(">","").replace("€","").replace("€",""))
+                            if prix_eu > seuil:
+                                tarif_unite_trouve = tu
+                                break
+                        else:
+                            tarif_unite_trouve = tu
+                            break
+
+                if tarif_unite_trouve:
+                    # Tarif à l'unité en euros → convertir en FCFA
+                    taux_ch = cfg.taux_change if cfg else 660
+                    port_fcfa += round(float(tarif_unite_trouve.get("prix", 0)) * taux_ch * qty)
+                else:
+                    # Tarif au poids
+                    poids_art = float(art.get("poids") or 0.5) * qty
+                    port_fcfa += round(port_kg * poids_art)
+
+        except Exception as e:
+            print(f"[port] Erreur calcul tarif: {e}")
+            # Fallback : calcul au poids
+            port_fcfa = round(port_kg * body.poids_reel)
+
+        if port_fcfa == 0:
+            port_fcfa = round(port_kg * body.poids_reel)
+
         taux_local = (cfg.taux_gnf if cfg else 9500) if cmd.monnaie == "GNF" else 656
         port_local = round(port_fcfa * (taux_local / 656))
         cmd.total_local = (cmd.total_local or 0) + port_local
@@ -273,8 +326,11 @@ def update_statut(
             ref          = cmd.ref,
             statut       = body.statut,
             date_estimee = date_est,
-            suivi_num    = getattr(cmd, "suivi_num", "") or "",
+            suivi_num    = cmd.suivi_num or "",
             motif        = body.motif_refus or "",
+            # ✅ Frais de port — utile pour le message "Acheté"
+            port_local   = port_local if body.poids_reel else 0,
+            monnaie      = cmd.monnaie or "FCFA",
         )
         if wa_msg:
             # Toujours envoyer au payeur (client_tel)
