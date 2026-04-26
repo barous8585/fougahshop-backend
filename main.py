@@ -18,6 +18,7 @@ from routes.promo      import ensure_tables as ensure_promo_tables
 from routes.annonce    import router as annonce_router, ensure_annonces_table
 from routes.admin      import ensure_archived_column
 from routes.auth       import ensure_sessions_table, purge_expired_sessions
+from routes.notifs     import ensure_tokens_table, purge_old_tokens
 from routes.parrainage import ensure_parrainage_tables
 from routes.config     import init_port, get_config, ensure_tarifs_columns, auto_refresh_taux_gnf, refresh_taux_gnf_en_base
 
@@ -71,6 +72,11 @@ def startup():
         # ✅ Nettoyer les sessions expirées (> 7 jours)
         purge_expired_sessions(db)
         print("✅ Sessions expirées nettoyées")
+
+        # ✅ Migration table FCM tokens + nettoyage tokens inactifs
+        ensure_tokens_table(db)
+        purge_old_tokens(db)
+        print("✅ Table FCM tokens vérifiée")
 
         # ✅ Migrations colonnes config (une seule fois au startup)
         ensure_tarifs_columns(db)
