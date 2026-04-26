@@ -1,25 +1,27 @@
-from sqlalchemy import Column, Integer, String, Float, DateTime, Text, Boolean
+from sqlalchemy import Column, Integer, String, Float, DateTime, Text, Boolean, Date
 from sqlalchemy.sql import func
 from database import Base
 
 
 class Config(Base):
-    __tablename__ = "config"
+    # ✅ CORRIGÉ — 'configs' (pluriel) aligné avec les requêtes SQL dans config.py
+    __tablename__ = "configs"
+
     id           = Column(Integer, primary_key=True, default=1)
-    taux_change  = Column(Float,  default=660.0)
-    commission   = Column(Float,  default=3500.0)
-    taux_gnf     = Column(Float,  default=9500.0)
-    wa_number    = Column(String, default="33651727112")
-    admin_pwd    = Column(String, default="admin123")
-    secret_reset = Column(String, default="fougah2026")
-    # NOTE : tarifs_unite, tarif_poids_kg, operateurs_pays, numeros_paiement,
-    # stat_* sont gérées uniquement via migration SQL dans config.py
-    # et lues en raw SQL — ne pas les déclarer ici pour éviter le crash
-    # "column does not exist" avant la première migration.
+    taux_change  = Column(Float,   default=660.0)
+    commission   = Column(Float,   default=3500.0)
+    taux_gnf     = Column(Float,   default=9500.0)
+    wa_number    = Column(String,  default="33651727112")
+    admin_pwd    = Column(String,  default="admin123")
+    secret_reset = Column(String,  default="fougah2026")
+    # Colonnes étendues — ajoutées via migration SQL dans config.py au startup
+    # Déclarées ici pour que SQLAlchemy les connaisse après la première migration
+    # nullable=True + server_default pour éviter le crash si la colonne n'existe pas encore
 
 
 class PortKg(Base):
     __tablename__ = "port_kg"
+
     id    = Column(Integer, primary_key=True, autoincrement=True)
     pays  = Column(String,  unique=True)
     prix  = Column(Float,   default=7000.0)
@@ -29,6 +31,7 @@ class PortKg(Base):
 
 class Employe(Base):
     __tablename__ = "employes"
+
     id    = Column(Integer, primary_key=True, autoincrement=True)
     nom   = Column(String)
     pwd   = Column(String)
@@ -38,6 +41,7 @@ class Employe(Base):
 
 class Commande(Base):
     __tablename__ = "commandes"
+
     id                  = Column(Integer, primary_key=True, autoincrement=True)
     ref                 = Column(String,  unique=True, index=True)
     client_nom          = Column(String)
@@ -59,26 +63,47 @@ class Commande(Base):
     note_admin          = Column(Text,    nullable=True)
     delai_livraison     = Column(String,  nullable=True)
     promo_code          = Column(String,  nullable=True)
-    # NOTE : suivi_num et motif_refus ajoutés via migration dans config.py
+    # ✅ Déclarés ici — plus de getattr() fragile dans admin.py
+    suivi_num           = Column(String,  nullable=True)
+    motif_refus         = Column(Text,    nullable=True)
+    archived            = Column(Boolean, default=False, nullable=True)
     created_at          = Column(DateTime, server_default=func.now())
     updated_at          = Column(DateTime, server_default=func.now(), onupdate=func.now())
 
 
 class PromoCode(Base):
     __tablename__ = "promo_codes"
+
     id               = Column(Integer, primary_key=True, autoincrement=True)
     code             = Column(String,  unique=True, index=True)
-    influenceur      = Column(String)
-    reduction_fcfa   = Column(Float,   default=500.0)
-    gain_influenceur = Column(Float,   default=1000.0)
-    quota            = Column(Integer, default=50)
-    utilisations     = Column(Integer, default=0)
+
+    # ✅ CORRIGÉ — structure alignée avec promo.py (raw SQL)
+    # Anciens champs conservés pour rétro-compat
+    influenceur      = Column(String,  nullable=True)
+    gain_influenceur = Column(Float,   default=0.0)   # gain par commande en FCFA
+
+    # Nouveaux champs (utilisés par promo.py)
+    type             = Column(String,  default="fixe")  # 'fixe' | 'pct'
+    valeur           = Column(Float,   default=0.0)     # montant FCFA ou %
+    reduction_fcfa   = Column(Float,   default=0.0)     # alias rétro-compat
+
+    client_tel       = Column(String,  nullable=True)   # NULL = tous les clients
+    max_uses         = Column(Integer, default=0)       # 0 = illimité
+    uses_count       = Column(Integer, default=0)       # ✅ nouveau compteur
+
+    # Anciens champs — conservés pour ne pas casser les données existantes
+    quota            = Column(Integer, default=0)       # alias de max_uses
+    utilisations     = Column(Integer, default=0)       # alias de uses_count
+
+    note             = Column(String,  nullable=True)
+    expiry           = Column(Date,    nullable=True)
     actif            = Column(Boolean, default=True)
     created_at       = Column(DateTime, server_default=func.now())
 
 
 class Avis(Base):
     __tablename__ = "avis"
+
     id         = Column(Integer, primary_key=True, autoincrement=True)
     nom        = Column(String)
     pays       = Column(String,  nullable=True)
