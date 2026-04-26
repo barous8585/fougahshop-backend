@@ -116,8 +116,8 @@ def serialize_cmd(c):
         "note_admin":           c.note_admin,
         "delai_livraison":      c.delai_livraison,
         "paiement_ref":         c.paiement_ref,
-        "suivi_num":            getattr(c, "suivi_num", None),
-        "motif_refus":          getattr(c, "motif_refus", None),
+        "suivi_num":            c.suivi_num,
+        "motif_refus":          c.motif_refus,
         "created_at":           c.created_at,
         # ✅ Champs cadeau dédiés — visibles clairement dans l'admin
         "is_cadeau":            bool(cadeau_info),
@@ -240,10 +240,10 @@ def update_statut(
     if body.delai_livraison:
         cmd.delai_livraison = body.delai_livraison
 
-    if body.suivi_num and hasattr(cmd, "suivi_num"):
+    if body.suivi_num:
         cmd.suivi_num = body.suivi_num
 
-    if body.motif_refus and hasattr(cmd, "motif_refus"):
+    if body.motif_refus:
         cmd.motif_refus = body.motif_refus
 
     if body.poids_reel and role in ("patron", "logisticien"):
@@ -383,7 +383,7 @@ def export_csv(request: Request, db: Session = Depends(get_db),
             c.poids_estime or "", c.poids_reel or "",
             c.nb_articles, STATUT_LABELS.get(c.statut, c.statut),
             c.delai_livraison or "",
-            getattr(c, "suivi_num", "") or "",
+            c.suivi_num or "",
             c.note_admin or "", detail,
             # ✅ Colonnes cadeau dans le CSV
             "Oui" if cadeau else "",
