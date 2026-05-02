@@ -207,11 +207,12 @@ class CommandeCreate(BaseModel):
     promo_code:             Optional[str]   = None
     promo_type:             Optional[str]   = None
     promo_valeur:           Optional[float] = None
+    # ✅ Code parrainage séparé du code promo
+    code_parrainage:        Optional[str]   = None
+    reduction_parrainage:   Optional[float] = None
     mode_paiement:          Optional[str]   = None
     kkiapay_transaction_id: Optional[str]   = None
     articles:               List[ArticleIn]
-    # ✅ Vrai montant calculé côté frontend avec taux live figé
-    # Si fourni, prioritaire sur le calcul backend
     total_local_client:     Optional[float] = None
     monnaie_client:         Optional[str]   = None
     taux_utilise:           Optional[float] = None
@@ -300,6 +301,38 @@ def creer_commande(body: CommandeCreate, db: Session = Depends(get_db)):
     if body.promo_code:
         total_local = appliquer_promo(db, body.promo_code, total_local, taux_conv)
 
+    # ✅ Traitement code parrainage — créditer le parrain directement en DB
+    if body.code_parrainage:
+        try:
+            code_p = body.code_parrainage.upper().strip()
+            parrain = db.execute(
+                text("SELECT parrain_tel FROM parrainage_codes WHERE code=:c AND actif=TRUE"),
+                {"c": code_p}
+            ).mappings().first()
+            if parrain and parrain["parrain_tel"] != body.client_tel:
+                # Anti auto-parrainage
+                deja = db.execute(
+                    text("SELECT 1 FROM parrainage_utilisations WHERE code=:c AND filleul_tel=:t"),
+                    {"c": code_p, "t": body.client_tel}
+                ).fetchone()
+                if not deja:
+                    gain = float(body.reduction_parrainage or 1000) * 0.5
+                    db.execute(text(
+                        "INSERT INTO parrainage_utilisations "
+                        "(code, filleul_tel, filleul_nom, commande_ref, reduction_appliquee) "
+                        "VALUES (:c, :t, :n, :r, :red)"
+                    ), {"c": code_p, "t": body.client_tel, "n": body.client_nom,
+                        "r": "", "red": body.reduction_parrainage or 1000})
+                    db.execute(text(
+                        "UPDATE parrainage_codes "
+                        "SET nb_filleuls=nb_filleuls+1, credit_total=credit_total+:g "
+                        "WHERE code=:c"
+                    ), {"g": gain, "c": code_p})
+                    db.commit()
+        except Exception as e:
+            print(f"[parrainage] Erreur: {e}")
+            db.rollback()
+
     # ✅ Priorité au montant frontend (taux live figé au moment de confirmer)
     # Fallback sur calcul backend si le champ est absent (bot WhatsApp, ancien client)
     if body.total_local_client and body.total_local_client > 0:
@@ -335,6 +368,18 @@ def creer_commande(body: CommandeCreate, db: Session = Depends(get_db)):
     db.add(commande)
     db.commit()
     db.refresh(commande)
+
+    # ✅ Mettre à jour la ref de commande dans parrainage_utilisations
+    if body.code_parrainage:
+        try:
+            db.execute(text(
+                "UPDATE parrainage_utilisations SET commande_ref=:r "
+                "WHERE code=:c AND filleul_tel=:t AND commande_ref=''"
+            ), {"r": commande.ref, "c": body.code_parrainage.upper().strip(),
+                "t": body.client_tel})
+            db.commit()
+        except Exception:
+            pass
 
     mode_label = "💳 Kkiapay ✅" if body.mode_paiement == "kkiapay" else "📱 Virement manuel"
     notifier_patron(
