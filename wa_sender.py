@@ -115,15 +115,22 @@ def message_statut(ref: str, statut: str, date_estimee: str = "",
         ligne_delai   = f"⏱️ Délai : {livraison_delai}\n" if livraison_delai else ""
         ligne_retrait = f"🏠 Retrait sur place disponible{' — ' + livraison_adresse if livraison_adresse else ''}\n" if livraison_retrait else ""
         ligne_note    = f"📝 {livraison_note}\n" if livraison_note else ""
+        bloc_livraison = ""
+        if ligne_prix or ligne_zones or ligne_delai:
+            bloc_livraison = (
+                f"🚚 *Livraison à domicile disponible :*\n"
+                f"{ligne_prix}"
+                f"{ligne_zones}"
+                f"{ligne_delai}"
+                f"{ligne_retrait}"
+                f"{ligne_note}"
+                f"_(Frais de livraison locale — indépendant du transport France → Guinée)_\n\n"
+            )
         return (
-            f"📦 *Votre colis est arrivé !*\n\n"
-            f"Commande *{ref}* est arrivée en Afrique et prête pour récupération.\n\n"
-            f"{ligne_prix}"
-            f"{ligne_zones}"
-            f"{ligne_delai}"
-            f"{ligne_retrait}"
-            f"{ligne_note}\n"
-            f"Contactez-nous sur WhatsApp pour organiser la livraison.\n"
+            f"📦 *Votre colis est arrivé en Guinée !*\n\n"
+            f"Votre commande *{ref}* est arrivée et prête à être récupérée ou livrée.\n\n"
+            f"{bloc_livraison}"
+            f"Contactez-nous sur WhatsApp pour organiser la suite.\n"
             f"Merci de votre patience ! 🎉"
         )
 
