@@ -92,6 +92,8 @@ def ensure_tarifs_columns(db):
         "ALTER TABLE configs ADD COLUMN IF NOT EXISTS reduction_parrainage FLOAT DEFAULT 1000.0",
         # ✅ Gain parrain par filleul (FCFA) — configurable dans l'admin
         "ALTER TABLE configs ADD COLUMN IF NOT EXISTS gain_parrain FLOAT DEFAULT 500.0",
+        # ✅ Livraison locale (domicile) — configurable par pays
+        "ALTER TABLE configs ADD COLUMN IF NOT EXISTS livraison_domicile TEXT DEFAULT NULL",
     ]
     for sql in migrations:
         try:
@@ -244,10 +246,28 @@ def config_public(db: Session = Depends(get_db)):
         # ✅ Paramètres parrainage configurables
         "reduction_parrainage":  float(row.get("reduction_parrainage") or 1000),
         "gain_parrain":          float(row.get("gain_parrain") or 500),
+        # ✅ Livraison locale configurable
+        "livraison_domicile":    json.loads(row.get("livraison_domicile") or "{}"),
     }
 
 
 # ── Endpoint manuel pour forcer le refresh du taux GNF ───────
+@router.post("/livraison-domicile")
+def save_livraison_domicile(
+    body: Dict[str, Any],
+    db: Session = Depends(get_db),
+    role: str = Depends(require_patron)
+):
+    try:
+        data = json.dumps(body, ensure_ascii=False)
+        db.execute(text("UPDATE configs SET livraison_domicile=:d WHERE id=1"), {"d": data})
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, str(e))
+    return {"ok": True}
+
+
 @router.post("/parrainage")
 def save_parrainage_config(
     body: Dict[str, Any],
