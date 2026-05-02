@@ -146,12 +146,15 @@ def appliquer_promo(db, promo_code: str, total_local: float, taux_conv: float) -
         type_promo = getattr(promo, "type", "fixe") or "fixe"
         valeur     = getattr(promo, "valeur", None) or getattr(promo, "reduction_fcfa", 0) or 0
 
-        if type_promo == "pct":
-            reduction = round(total_local * valeur / 100)
+        # ✅ Type livraison — pas de réduction sur le montant, juste incrémenter uses_count
+        if type_promo == "livraison":
+            nouveau_total = total_local  # aucune déduction
+        elif type_promo == "pct":
+            reduction = round(total_local * float(valeur) / 100)
+            nouveau_total = max(0, total_local - reduction)
         else:
             reduction = round(float(valeur) * taux_conv)
-
-        nouveau_total = max(0, total_local - reduction)
+            nouveau_total = max(0, total_local - reduction)
 
         # ✅ Incrémenter UNE SEULE FOIS : uses_count d'abord, utilisations en fallback
         incremente = False
