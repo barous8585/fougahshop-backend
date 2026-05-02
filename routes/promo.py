@@ -114,15 +114,20 @@ def verifier_code_get(code: str, db: Session = Depends(get_db)):
 
     valeur = row.valeur or row.reduction_fcfa or 0
     type_  = row.type or "fixe"
+    if type_ == "livraison":
+        msg = "Code valide — livraison locale gratuite"
+    else:
+        msg = f"Code valide — réduction de {int(valeur)}{'%' if type_ == 'pct' else ' FCFA'}"
+
     return {
-        "valide":        True,
-        "code":          row.code,
-        "type":          type_,
-        "valeur":        valeur,
-        "valeur_fcfa":   valeur if type_ == "fixe" else None,
-        "reduction_fcfa": valeur if type_ == "fixe" else None,
-        "influenceur":   getattr(row, "influenceur", None),
-        "message":       f"Code valide — réduction de {int(valeur)}{'%' if type_ == 'pct' else ' FCFA'}",
+        "valide":         True,
+        "code":           row.code,
+        "type":           type_,
+        "valeur":         valeur,
+        "valeur_fcfa":    valeur if type_ == "fixe" else None,
+        "reduction_fcfa": valeur if type_ in ("fixe",) else None,
+        "influenceur":    getattr(row, "influenceur", None),
+        "message":        msg,
     }
 
 
