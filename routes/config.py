@@ -88,6 +88,10 @@ def ensure_tarifs_columns(db):
         "ALTER TABLE configs ADD COLUMN IF NOT EXISTS stat_label3 TEXT DEFAULT 'Frais cachés'",
         # ✅ Nouveau : timestamp de dernière mise à jour du taux GNF
         "ALTER TABLE configs ADD COLUMN IF NOT EXISTS taux_gnf_updated_at TIMESTAMP DEFAULT NULL",
+        # ✅ Réduction filleul parrainage (FCFA) — configurable dans l'admin
+        "ALTER TABLE configs ADD COLUMN IF NOT EXISTS reduction_parrainage FLOAT DEFAULT 1000.0",
+        # ✅ Gain parrain par filleul (FCFA) — configurable dans l'admin
+        "ALTER TABLE configs ADD COLUMN IF NOT EXISTS gain_parrain FLOAT DEFAULT 500.0",
     ]
     for sql in migrations:
         try:
@@ -226,17 +230,20 @@ def config_public(db: Session = Depends(get_db)):
     taux_gnf_updated_at = row.get("taux_gnf_updated_at")
 
     return {
-        "taux_change":          cfg.taux_change,
-        "commission":           cfg.commission,
-        "taux_gnf":             cfg.taux_gnf,
-        "taux_gnf_updated_at":  str(taux_gnf_updated_at) if taux_gnf_updated_at else None,
-        "wa_number":            cfg.wa_number,
-        "port_kg":              ports,
-        "tarifs_unite":         tarifs_unite,
-        "tarif_poids_kg":       tarif_poids_kg,
-        "operateurs_pays":      operateurs_pays,
-        "numeros_paiement":     numeros_paiement,
-        "stats_landing":        stats_landing,
+        "taux_change":           cfg.taux_change,
+        "commission":            cfg.commission,
+        "taux_gnf":              cfg.taux_gnf,
+        "taux_gnf_updated_at":   str(taux_gnf_updated_at) if taux_gnf_updated_at else None,
+        "wa_number":             cfg.wa_number,
+        "port_kg":               ports,
+        "tarifs_unite":          tarifs_unite,
+        "tarif_poids_kg":        tarif_poids_kg,
+        "operateurs_pays":       operateurs_pays,
+        "numeros_paiement":      numeros_paiement,
+        "stats_landing":         stats_landing,
+        # ✅ Paramètres parrainage configurables
+        "reduction_parrainage":  float(row.get("reduction_parrainage") or 1000),
+        "gain_parrain":          float(row.get("gain_parrain") or 500),
     }
 
 
