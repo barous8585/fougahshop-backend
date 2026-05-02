@@ -155,7 +155,6 @@ def get_stats_influenceur(code: str, db: Session = Depends(get_db)):
 
     uses_count   = int(promo.get("uses_count") or promo.get("utilisations") or 0)
     gain_par_cmd = float(promo.get("gain_influenceur") or 0)
-    gain_total   = round(gain_par_cmd * uses_count)
 
     # Commandes générées par ce code
     try:
@@ -170,7 +169,11 @@ def get_stats_influenceur(code: str, db: Session = Depends(get_db)):
     except Exception:
         commandes = []
 
-    ca_euro = sum(float(c.get("total_euro") or 0) for c in commandes)
+    # ✅ Gain calculé sur commandes actives seulement (exclut annulées/refusées)
+    STATUTS_EXCLUS = {"annulee", "paiement_refuse", "en_attente_paiement"}
+    commandes_actives = [c for c in commandes if c.get("statut") not in STATUTS_EXCLUS]
+    gain_total = round(gain_par_cmd * len(commandes_actives))
+    ca_euro    = sum(float(c.get("total_euro") or 0) for c in commandes_actives)
 
     return {
         "code":         promo["code"],
