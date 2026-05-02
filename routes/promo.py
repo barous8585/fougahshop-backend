@@ -278,8 +278,8 @@ def create_promo(
         raise HTTPException(400, "Ce code existe déjà")
 
     type_ = str(body.get("type", "fixe")).lower()
-    if type_ not in ("fixe", "pct"):
-        raise HTTPException(400, "Type invalide (fixe ou pct)")
+    if type_ not in ("fixe", "pct", "livraison"):
+        raise HTTPException(400, "Type invalide (fixe, pct ou livraison)")
 
     valeur = float(body.get("valeur", body.get("reduction_fcfa", 0)))
     if valeur <= 0:
