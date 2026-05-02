@@ -165,10 +165,21 @@ def verifier_code(code: str, db: Session = Depends(get_db)):
     ), {"c": code.upper()}).mappings().first()
     if not row:
         raise HTTPException(404, "Code de parrainage invalide ou expiré.")
+    # Lire la réduction parrainage depuis la config
+    reduction_cfg = 1000.0
+    try:
+        cfg_row = db.execute(text(
+            "SELECT reduction_parrainage FROM configs WHERE id=1 LIMIT 1"
+        )).fetchone()
+        if cfg_row and cfg_row[0]:
+            reduction_cfg = float(cfg_row[0])
+    except Exception:
+        pass
+
     return {
-        "valide":      True,
-        "parrain_nom": row["parrain_nom"] or "un client FougahShop",
-        "reduction_fcfa": 1000,  # valeur par défaut visible par le frontend
+        "valide":         True,
+        "parrain_nom":    row["parrain_nom"] or "un client FougahShop",
+        "reduction_fcfa": reduction_cfg,
     }
 
 
@@ -183,7 +194,16 @@ def utiliser_code(body: Dict[str, Any], db: Session = Depends(get_db)):
     filleul_nom  = str(body.get("filleul_nom",  "")).strip()
     commande_ref = str(body.get("commande_ref", "")).strip()
     reduction    = float(body.get("reduction_fcfa", 1000))
-    gain_parrain = float(body.get("gain_parrain", 0)) or round(reduction * 0.5)
+    gain_parrain = float(body.get("gain_parrain", 0))
+    if not gain_parrain:
+        # Lire le gain parrain depuis la config
+        try:
+            cfg_row = db.execute(text(
+                "SELECT gain_parrain FROM configs WHERE id=1 LIMIT 1"
+            )).fetchone()
+            gain_parrain = float(cfg_row[0]) if cfg_row and cfg_row[0] else round(reduction * 0.5)
+        except Exception:
+            gain_parrain = round(reduction * 0.5)
 
     if not code or not filleul_tel:
         raise HTTPException(400, "Code et téléphone requis.")
