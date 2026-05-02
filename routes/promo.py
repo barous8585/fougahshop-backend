@@ -282,7 +282,8 @@ def create_promo(
         raise HTTPException(400, "Type invalide (fixe, pct ou livraison)")
 
     valeur = float(body.get("valeur", body.get("reduction_fcfa", 0)))
-    if valeur <= 0:
+    # ✅ Type livraison → valeur = 0 est valide (pas de réduction sur le prix)
+    if type_ != "livraison" and valeur <= 0:
         raise HTTPException(400, "La valeur doit être positive")
     if type_ == "pct" and valeur > 100:
         raise HTTPException(400, "Le pourcentage ne peut pas dépasser 100")
