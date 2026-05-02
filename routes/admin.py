@@ -213,6 +213,7 @@ class StatutUpdate(BaseModel):
     delai_livraison: Optional[str]   = None
     suivi_num:       Optional[str]   = None
     motif_refus:     Optional[str]   = None
+    port_categorie:  Optional[str]   = None   # catégorie tarif unité choisie par l'admin
 
 
 @router.patch("/commandes/{ref}/statut")
@@ -255,37 +256,35 @@ def update_statut(
         port = db.query(PortKg).filter(PortKg.pays == cmd.client_pays).first()
         port_kg = port.prix if port else 7000
 
-        # ✅ Vérifier si un article a un tarif à l'unité
-        # Les tarifs à l'unité sont stockés dans configs.tarifs_unite (JSON)
-        # Format : [{"nom": "iPhone / Haut de gamme", "prix": 100, "note": ">800€"}, ...]
+        # ✅ Calcul frais de port — catégorie choisie par l'admin OU détection automatique
         port_fcfa = 0
         try:
-            articles = json.loads(cmd.articles) if cmd.articles else []
             tarifs_row = db.execute(sqlt(
                 "SELECT tarifs_unite FROM configs WHERE id = :id"
             ), {"id": cfg.id if cfg else 1}).mappings().first()
             tarifs_unite = json.loads(tarifs_row["tarifs_unite"]) if tarifs_row and tarifs_row.get("tarifs_unite") else []
 
-            # ✅ Mapping catégorie frontend → mot-clé dans tarifs_unite
-            # Basé sur les catégories réelles et la grille tarifaire
-            # Mapping catégorie frontend → mot-clé dans tarifs_unite
-            # Catégories au poids (vêtements, sacs, etc.) = absentes du mapping
-            CAT_TARIF_UNITE = {
-                # Chaussures (la paire) → 20€ à l'unité
-                "baskets":           "chaussures",
-                "bottes":            "chaussures",
-                # Cosmétiques / Parfum → 30€
-                "cosmetique":        "parfum",
-                # Montre / Bijoux → 70€
-                "bijou":             "montre",
-                # smartphone géré séparément (iPhone vs standard)
-            }
-            # Catégories au POIDS (pas dans CAT_TARIF_UNITE) :
-            # tshirt, chemise, robe, pantalon, veste, manteau, lingerie,
-            # accessoire, sac, sacados, maison, sport, combi, ens2h, ens2f, ens3
-            # informatique-acc, electromenager-s, electromenager-m, ordinateur, velo, lourd, custom
+            # ✅ PRIORITÉ : catégorie choisie manuellement par l'admin dans la modal
+            if body.port_categorie and tarifs_unite:
+                def match_cat(nom, cat):
+                    n = (nom or "").lower()
+                    if cat == "iphone":     return "iphone" in n or "haut de gamme" in n
+                    if cat == "telephone":  return "phone" in n and "iphone" not in n
+                    if cat == "parfum":     return "parfum" in n
+                    if cat == "montre":     return "montre" in n or "bijou" in n
+                    if cat == "chaussures": return "chaussure" in n
+                    return False
+                for tu in tarifs_unite:
+                    if match_cat(tu.get("nom"), body.port_categorie):
+                        taux_ch   = cfg.taux_change or 660
+                        port_fcfa = round(float(tu.get("prix", 0)) * taux_ch)
+                        break
+                if not port_fcfa:
+                    port_fcfa = round(port_kg * body.poids_reel)
 
-            for art in articles:
+            else:
+                # Détection automatique depuis les articles de la commande
+                articles = json.loads(cmd.articles) if cmd.articles else []
                 categorie = (art.get("categorie") or "").lower().strip()
                 prix_eu   = float(art.get("prix_eu") or 0)
                 qty       = int(art.get("qty") or 1)
