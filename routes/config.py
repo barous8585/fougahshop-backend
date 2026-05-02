@@ -248,6 +248,25 @@ def config_public(db: Session = Depends(get_db)):
 
 
 # ── Endpoint manuel pour forcer le refresh du taux GNF ───────
+@router.post("/parrainage")
+def save_parrainage_config(
+    body: Dict[str, Any],
+    db: Session = Depends(get_db),
+    role: str = Depends(require_patron)
+):
+    red  = float(body.get("reduction_parrainage", 1000))
+    gain = float(body.get("gain_parrain", 500))
+    try:
+        db.execute(text(
+            "UPDATE configs SET reduction_parrainage=:r, gain_parrain=:g WHERE id=1"
+        ), {"r": red, "g": gain})
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, str(e))
+    return {"ok": True, "reduction_parrainage": red, "gain_parrain": gain}
+
+
 @router.post("/refresh-taux-gnf")
 async def refresh_taux_gnf(
     request: Request,
