@@ -370,15 +370,27 @@ def update_statut(
     STATUTS_WA  = {"paye","achete","expedie","arrive","paiement_refuse","annulee"}
 
     if body.statut in STATUTS_WA and cmd.client_tel:
+        # Récupérer infos livraison locale depuis la config
+        livraison_info = {}
+        try:
+            import json as _json
+            livr_row = db.execute(text(
+                "SELECT livraison_domicile FROM configs WHERE id=1 LIMIT 1"
+            )).fetchone()
+            if livr_row and livr_row[0]:
+                livraison_info = _json.loads(livr_row[0])
+        except Exception:
+            pass
+
         wa_msg = message_statut(
-            ref          = cmd.ref,
-            statut       = body.statut,
-            date_estimee = date_est,
-            suivi_num    = cmd.suivi_num or "",
-            motif        = body.motif_refus or "",
-            # ✅ Frais de port — utile pour le message "Acheté"
-            port_local   = port_local if body.poids_reel else 0,
-            monnaie      = cmd.monnaie or "FCFA",
+            ref            = cmd.ref,
+            statut         = body.statut,
+            date_estimee   = date_est,
+            suivi_num      = cmd.suivi_num or "",
+            motif          = body.motif_refus or "",
+            port_local     = port_local if body.poids_reel else 0,
+            monnaie        = cmd.monnaie or "FCFA",
+            livraison_info = livraison_info,
         )
         if wa_msg:
             # Toujours envoyer au payeur (client_tel)
