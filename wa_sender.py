@@ -61,12 +61,17 @@ def envoyer_whatsapp(to_tel: str, message: str) -> bool:
 
 def message_statut(ref: str, statut: str, date_estimee: str = "",
                    suivi_num: str = "", motif: str = "",
-                   port_local: int = 0, monnaie: str = "FCFA") -> str:
-    """
-    Génère le message WhatsApp client selon le statut.
-    ✅ CORRIGÉ — f-strings imbriquées remplacées par variables pré-calculées
-    (compatibilité Python 3.10 et 3.11 sur Render)
-    """
+                   port_local: int = 0, monnaie: str = "FCFA",
+                   livraison_info: dict = None) -> str:
+    # Extraire les infos livraison locale
+    livr = livraison_info or {}
+    livraison_prix    = int(livr.get("prix", 0) or 0)
+    livraison_zones   = str(livr.get("zones", "") or "").strip()
+    livraison_delai   = str(livr.get("delai", "") or "").strip()
+    livraison_retrait = bool(livr.get("retrait", False))
+    livraison_adresse = str(livr.get("adresse", "") or "").strip()
+    livraison_note    = str(livr.get("note", "") or "").strip()
+
 
     if statut == "paye":
         return (
@@ -105,10 +110,20 @@ def message_statut(ref: str, statut: str, date_estimee: str = "",
         )
 
     if statut == "arrive":
+        ligne_prix    = f"💰 Livraison à domicile : *{livraison_prix:,} GNF*\n" if livraison_prix else ("💰 Livraison à domicile : *Gratuite* 🎁\n" if livraison_info else "")
+        ligne_zones   = f"📍 Zones : {livraison_zones}\n" if livraison_zones else ""
+        ligne_delai   = f"⏱️ Délai : {livraison_delai}\n" if livraison_delai else ""
+        ligne_retrait = f"🏠 Retrait sur place disponible{' — ' + livraison_adresse if livraison_adresse else ''}\n" if livraison_retrait else ""
+        ligne_note    = f"📝 {livraison_note}\n" if livraison_note else ""
         return (
             f"📦 *Votre colis est arrivé !*\n\n"
             f"Commande *{ref}* est arrivée en Afrique et prête pour récupération.\n\n"
-            f"Contactez-nous sur WhatsApp pour organiser la livraison finale.\n"
+            f"{ligne_prix}"
+            f"{ligne_zones}"
+            f"{ligne_delai}"
+            f"{ligne_retrait}"
+            f"{ligne_note}\n"
+            f"Contactez-nous sur WhatsApp pour organiser la livraison.\n"
             f"Merci de votre patience ! 🎉"
         )
 
