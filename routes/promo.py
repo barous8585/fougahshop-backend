@@ -44,6 +44,7 @@ def ensure_tables(db: Session):
             "ALTER TABLE promo_codes ADD COLUMN IF NOT EXISTS note VARCHAR",
             "ALTER TABLE promo_codes ADD COLUMN IF NOT EXISTS expiry DATE",
             "ALTER TABLE promo_codes ADD COLUMN IF NOT EXISTS gain_influenceur FLOAT DEFAULT 0",
+            "ALTER TABLE promo_codes ADD COLUMN IF NOT EXISTS pays VARCHAR DEFAULT NULL",
             "ALTER TABLE promo_codes ADD COLUMN IF NOT EXISTS quota INTEGER DEFAULT 0",
             "UPDATE promo_codes SET valeur = reduction_fcfa WHERE valeur = 0 AND reduction_fcfa > 0",
             "ALTER TABLE commandes ADD COLUMN IF NOT EXISTS promo_code VARCHAR",
@@ -159,7 +160,7 @@ def get_stats_influenceur(code: str, db: Session = Depends(get_db)):
     # Commandes générées par ce code
     try:
         cmds_rows = db.execute(text("""
-            SELECT ref, client_nom, statut, total_euro, created_at
+            SELECT ref, statut, created_at
             FROM commandes
             WHERE promo_code = :code
             ORDER BY created_at DESC
@@ -176,19 +177,19 @@ def get_stats_influenceur(code: str, db: Session = Depends(get_db)):
     ca_euro    = sum(float(c.get("total_euro") or 0) for c in commandes_actives)
 
     return {
-        "code":         promo["code"],
-        "influenceur":  influenceur,
-        "actif":        True,
-        "type":         promo.get("type", "fixe"),
-        "valeur":       float(promo.get("valeur") or 0),
-        "uses_count":   uses_count,
-        "nb_commandes": len(commandes),
-        "gain_par_cmd": gain_par_cmd,       # nom attendu par le frontend
-        "gain_influenceur": gain_par_cmd,   # alias rétro-compat
-        "gain_total":   gain_total,
-        "ca_euro":      round(ca_euro, 2),
-        "expiry":       str(promo.get("expiry") or ""),
-        "commandes":    commandes,
+        "code":             promo["code"],
+        "influenceur":      influenceur,
+        "pays":             promo.get("pays") or "",   # ✅ pays de l'influenceur
+        "actif":            True,
+        "type":             promo.get("type", "fixe"),
+        "valeur":           float(promo.get("valeur") or 0),
+        "uses_count":       uses_count,
+        "nb_commandes":     len(commandes_actives),
+        "gain_par_cmd":     gain_par_cmd,
+        "gain_influenceur": gain_par_cmd,
+        "gain_total":       gain_total,
+        "expiry":           str(promo.get("expiry") or ""),
+        "commandes":        commandes,
     }
 
 
@@ -295,12 +296,12 @@ def create_promo(
             (code, type, valeur, reduction_fcfa,
              influenceur, gain_influenceur,
              client_tel, max_uses, quota,
-             uses_count, note, expiry, actif)
+             uses_count, note, expiry, pays, actif)
         VALUES
             (:code, :type, :valeur, :reduction_fcfa,
              :influenceur, :gain_influenceur,
              :client_tel, :max_uses, :max_uses,
-             0, :note, :expiry, TRUE)
+             0, :note, :expiry, :pays, TRUE)
         RETURNING id, code
     """), {
         "code":             code,
@@ -313,6 +314,7 @@ def create_promo(
         "max_uses":         max_uses,
         "note":             body.get("note") or None,
         "expiry":           expiry,
+        "pays":             str(body.get("pays", "")).strip() or None,
     }).fetchone()
 
     db.commit()
