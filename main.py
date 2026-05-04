@@ -4,6 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 import os, asyncio
+from security import SecurityMiddleware, cleanup_rate_limits
 from database import engine, Base, SessionLocal
 import models  # noqa — déclenche la création des tables
 
@@ -125,9 +126,13 @@ async def lifespan(app: FastAPI):
     task = asyncio.create_task(auto_refresh_taux_gnf())
     print("✅ Tâche auto-refresh taux GNF démarrée (toutes les heures)")
 
+    task_cleanup = asyncio.create_task(cleanup_rate_limits())
+    print("✅ Tâche nettoyage rate limits démarrée")
+
     yield  # ← l'app tourne ici
 
     # ── Shutdown ──────────────────────────────────────────────
+    task_cleanup.cancel()
     task.cancel()
     try:
         await task
@@ -146,15 +151,23 @@ app = FastAPI(
 )
 
 # ── CORS ──────────────────────────────────────────────────────
+# En production, seul fougahshop.com est autorisé
+# En développement, les localhost sont ajoutés
+_is_prod = os.environ.get("RENDER", "") == "true"
+
 ALLOWED_ORIGINS = [
     "https://fougahshop.com",
     "https://www.fougahshop.com",
+] + ([] if _is_prod else [
     "http://localhost:3000",
     "http://localhost:5500",
     "http://127.0.0.1:5500",
     "http://localhost:8000",
     "http://127.0.0.1:8000",
-]
+])
+
+# ── Sécurité — Rate limiting + Headers ───────────────────────
+app.add_middleware(SecurityMiddleware)
 
 app.add_middleware(
     CORSMiddleware,
