@@ -140,7 +140,8 @@ def _get_token(request: Request) -> str:
 # ── Routes ────────────────────────────────────────────────────
 
 @router.post("/login")
-def login(body: Dict[str, Any], response: Response, db: Session = Depends(get_db)):
+def login(body: Dict[str, Any], response: Response, request: Request, db: Session = Depends(get_db)):
+    import time as _time
     password = str(body.get("password", "")).strip()
     if not password:
         raise HTTPException(401, "Mot de passe requis")
@@ -163,6 +164,13 @@ def login(body: Dict[str, Any], response: Response, db: Session = Depends(get_db
                 role = "employe"
 
     if not role:
+        # ✅ Log la tentative échouée
+        ip = (request.headers.get("CF-Connecting-IP")
+              or request.headers.get("X-Forwarded-For", "").split(",")[0]
+              or (request.client.host if request.client else "?"))
+        print(f"🚨 Tentative login échouée — IP: {ip} — pwd: {'*'*len(password)}")
+        # ✅ Délai anti timing-attack (empêche de deviner si le mdp est proche)
+        _time.sleep(0.5)
         raise HTTPException(401, "Mot de passe incorrect")
 
     token = secrets.token_hex(32)
