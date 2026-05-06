@@ -188,15 +188,16 @@ def appliquer_promo(db, promo_code: str, total_local: float, taux_conv: float) -
 # ── Schemas ───────────────────────────────────────────────────
 
 class ArticleIn(BaseModel):
-    lien:      str
-    nom:       str
-    img:       Optional[str]   = None
-    categorie: Optional[str]   = None
-    taille:    Optional[str]   = None
-    couleur:   Optional[str]   = None
-    specs:     Optional[str]   = None
-    prix_eu:   float
-    poids:     float           = 0.5
+    lien:                    str
+    nom:                     str
+    img:                     Optional[str]   = None
+    categorie:               Optional[str]   = None
+    taille:                  Optional[str]   = None
+    couleur:                 Optional[str]   = None
+    specs:                   Optional[str]   = None
+    prix_eu:                 float
+    frais_livraison_boutique: Optional[float] = 0.0
+    poids:                   float           = 0.5
     qty:       int             = 1
 
 
@@ -262,6 +263,17 @@ def calculer(body: CalculRequest, db: Session = Depends(get_db)):
 
 
 @router.post("/", status_code=201)
+def _sanitize_url(url: str) -> str:
+    # Bloquer les URLs malveillantes - ne garder que http/https
+    if not url:
+        return ""
+    url = url.strip()
+    lower = url.lower()
+    if lower.startswith("http://") or lower.startswith("https://"):
+        return url
+    return ""
+
+
 def creer_commande(body: CommandeCreate, db: Session = Depends(get_db)):
     if not body.articles:
         raise HTTPException(400, "Panier vide")
@@ -279,7 +291,7 @@ def creer_commande(body: CommandeCreate, db: Session = Depends(get_db)):
     for a in body.articles:
         detail = calc_article_sans_port_ni_commission(a.prix_eu, a.qty, body.client_pays, cfg)
         articles_detail.append({
-            "lien":        a.lien,
+            "lien":        _sanitize_url(a.lien or ""),
             "nom":         a.nom,
             "img":         a.img,
             "categorie":   a.categorie,
