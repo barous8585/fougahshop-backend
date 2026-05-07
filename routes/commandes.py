@@ -90,18 +90,15 @@ def calc_article_sans_port_ni_commission(prix_eu, qty, pays, cfg):
     taux_fcfa = cfg.taux_change or 660
 
     if m["symbole"] == "GNF":
-        # ✅ CORRIGÉ — calcul direct avec taux_gnf (identique au frontend)
-        # Ancienne formule : round(prix * taux_fcfa) * taux_gnf/656
-        #   → 660 * 10318/656 = 10380 ≠ 10318 → écart de ~4700 GNF sur 75€
-        # Nouvelle formule : prix * taux_gnf directement → 0 écart
-        taux_conv  = taux_gnf / 656           # pour convertir commission FCFA→GNF
-        base_local = round(prix_eu * taux_gnf * qty)
-        base_fcfa  = round(prix_eu * taux_fcfa)   # conservé pour archivage
+        taux_conv  = taux_gnf / 656
+        # ✅ Aligné frontend : round(prix * taux) × qty — évite l'écart d'arrondi flottant
+        base_local = round(prix_eu * taux_gnf) * qty
+        base_fcfa  = round(prix_eu * taux_fcfa)
     else:
-        # FCFA : formule inchangée
+        # FCFA
         taux_conv  = 1.0
         base_fcfa  = round(prix_eu * taux_fcfa)
-        base_local = round(base_fcfa * qty)
+        base_local = round(prix_eu * taux_fcfa) * qty
 
     return {
         "base_fcfa":   base_fcfa,
