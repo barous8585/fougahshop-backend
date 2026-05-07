@@ -28,13 +28,13 @@ _blocked_ips:  dict = {}  # { ip: unblock_timestamp }
 # CONFIGURATION
 # ══════════════════════════════════════════════════════════════
 
-# Rate limiting général
+# Rate limiting général — fenêtre courte pour moins de RAM
 RATE_LIMIT_REQUESTS = 120        # max requêtes par fenêtre
-RATE_LIMIT_WINDOW   = 60         # fenêtre en secondes
+RATE_LIMIT_WINDOW   = 30         # ✅ 30s au lieu de 60s → 2× moins de RAM
 
 # Rate limiting strict (routes sensibles : paiement, commande)
 STRICT_RATE_REQUESTS = 20
-STRICT_RATE_WINDOW   = 60
+STRICT_RATE_WINDOW   = 30        # ✅ 30s
 
 # Brute force login
 LOGIN_MAX_ATTEMPTS  = 5          # tentatives avant blocage
@@ -154,6 +154,9 @@ class SecurityMiddleware(BaseHTTPMiddleware):
         # ── 6. Rate limiting général ──
         _request_log[ip] = clean_old_entries(_request_log[ip], RATE_LIMIT_WINDOW)
         _request_log[ip].append(time.time())
+        # ✅ Limiter la taille max pour éviter fuite mémoire
+        if len(_request_log[ip]) > RATE_LIMIT_REQUESTS * 2:
+            _request_log[ip] = _request_log[ip][-RATE_LIMIT_REQUESTS:]
         if len(_request_log[ip]) > RATE_LIMIT_REQUESTS:
             print(f"⚠️  Rate limit général: {ip}")
             return JSONResponse(
@@ -193,7 +196,7 @@ class SecurityMiddleware(BaseHTTPMiddleware):
 async def cleanup_rate_limits():
     """Nettoyer les logs toutes les heures."""
     while True:
-        await asyncio.sleep(3600)
+        await asyncio.sleep(900)   # ✅ toutes les 15 min au lieu de 1h → libère RAM plus souvent
         now = time.time()
         # Nettoyer les IPs débloquées
         expired = [ip for ip, t in _blocked_ips.items() if now > t]
