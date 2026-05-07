@@ -289,26 +289,31 @@ def creer_commande(body: CommandeCreate, db: Session = Depends(get_db)):
     taux_conv             = 1.0
 
     for a in body.articles:
-        detail = calc_article_sans_port_ni_commission(a.prix_eu, a.qty, body.client_pays, cfg)
+        # ✅ Inclure frais livraison boutique dans le prix de base
+        frais_b = float(getattr(a, 'frais_livraison_boutique', 0) or 0)
+        prix_total_eu = a.prix_eu + frais_b
+        detail = calc_article_sans_port_ni_commission(prix_total_eu, a.qty, body.client_pays, cfg)
         articles_detail.append({
-            "lien":        _sanitize_url(a.lien or ""),
-            "nom":         a.nom,
-            "img":         a.img,
-            "categorie":   a.categorie,
-            "taille":      a.taille,
-            "couleur":     a.couleur,
-            "specs":       a.specs,
-            "prix_eu":     a.prix_eu,
-            "poids":       a.poids,
-            "qty":         a.qty,
-            "total_local": detail["total_local"],
-            "monnaie":     detail["monnaie"],
+            "lien":                     _sanitize_url(a.lien or ""),
+            "nom":                      a.nom,
+            "img":                      a.img,
+            "categorie":                a.categorie,
+            "taille":                   a.taille,
+            "couleur":                  a.couleur,
+            "specs":                    a.specs,
+            "prix_eu":                  a.prix_eu,
+            "frais_livraison_boutique": frais_b,
+            "poids":                    a.poids,
+            "qty":                      a.qty,
+            "total_local":              detail["total_local"],
+            "monnaie":                  detail["monnaie"],
         })
-        total_eu              += a.prix_eu * a.qty
+        total_eu              += prix_total_eu * a.qty
         total_local_sans_comm += detail["total_local"]
         poids_total           += a.poids * a.qty
         taux_conv              = detail["taux_conv"]
 
+    # ✅ Commission calculée sur le total incluant les frais de livraison boutique
     commission_fcfa   = get_commission(total_eu)
     commission_locale = round(commission_fcfa * taux_conv)
     total_local       = total_local_sans_comm + commission_locale
