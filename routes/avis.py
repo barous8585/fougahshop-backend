@@ -17,6 +17,7 @@ class AvisCreate(BaseModel):
     taille_retour: Optional[str]  = None   # "Trop petit" / "Taille correcte" / "Trop grand"
     photo_url:     Optional[str]  = None   # URL Cloudinary
     client_nom:    Optional[str]  = None
+    commande_ref:  Optional[str]  = None   # ✅ Référence de commande pour badge vérifié
 
 class AvisReponse(BaseModel):
     reponse: str
@@ -42,7 +43,7 @@ def get_avis_public(db: Session = Depends(get_db)):
     rows = db.execute(text("""
         SELECT id, nom, client_nom, pays, drapeau, note,
                texte, commentaire, reponse, created_at,
-               taille_retour, photo_url, verifie, utile_count
+               taille_retour, photo_url, verifie, utile_count, commande_ref
         FROM avis
         WHERE visible = TRUE
         ORDER BY created_at DESC
@@ -52,6 +53,8 @@ def get_avis_public(db: Session = Depends(get_db)):
     result = []
     for r in rows:
         r = dict(r._mapping)
+        # ✅ Masquer la ref complète — seulement les 4 derniers chiffres côté frontend
+        ref = r.get("commande_ref") or ""
         result.append({
             "id":            r.get("id"),
             "client_nom":    r.get("client_nom") or r.get("nom") or "Client",
@@ -64,6 +67,7 @@ def get_avis_public(db: Session = Depends(get_db)):
             "photo_url":     r.get("photo_url"),
             "verifie":       r.get("verifie") or False,
             "utile_count":   r.get("utile_count") or 0,
+            "commande_ref":  ref if ref else None,  # ✅ envoyé tel quel, frontend affiche …XXXX
         })
     return result
 
@@ -75,22 +79,36 @@ def creer_avis(body: AvisCreate, db: Session = Depends(get_db)):
 
     # ✅ Récupérer le nom du client depuis ses commandes
     nom_client = body.client_nom or "Client FougahShop"
+    commande_ref = body.commande_ref or None
+
     if body.client_tel:
         row = db.execute(text("""
-            SELECT client_nom, client_pays FROM commandes
+            SELECT client_nom, client_pays, ref FROM commandes
             WHERE client_tel = :tel
             ORDER BY created_at DESC LIMIT 1
         """), {"tel": body.client_tel}).fetchone()
         if row:
             nom_client = row.client_nom or nom_client
+            # ✅ Si pas de ref fournie, prendre la dernière commande du client
+            if not commande_ref:
+                commande_ref = row.ref
+
+    # ✅ Vérifier que la commande_ref appartient bien à ce client (sécurité)
+    if commande_ref and body.client_tel:
+        check = db.execute(text("""
+            SELECT 1 FROM commandes
+            WHERE ref = :ref AND client_tel = :tel
+        """), {"ref": commande_ref, "tel": body.client_tel}).fetchone()
+        if not check:
+            commande_ref = None  # Ref invalide — on l'ignore silencieusement
 
     db.execute(text("""
         INSERT INTO avis
             (nom, client_nom, client_tel, note, texte, commentaire,
-             taille_retour, photo_url, visible, verifie, utile_count)
+             taille_retour, photo_url, commande_ref, visible, verifie, utile_count)
         VALUES
             (:nom, :nom, :tel, :note, :commentaire, :commentaire,
-             :taille_retour, :photo_url, FALSE, FALSE, 0)
+             :taille_retour, :photo_url, :commande_ref, FALSE, FALSE, 0)
     """), {
         "nom":           nom_client,
         "tel":           body.client_tel or "",
@@ -98,6 +116,7 @@ def creer_avis(body: AvisCreate, db: Session = Depends(get_db)):
         "commentaire":   (body.commentaire or "").strip(),
         "taille_retour": body.taille_retour,
         "photo_url":     body.photo_url,
+        "commande_ref":  commande_ref,
     })
     db.commit()
     return {"ok": True, "message": "Avis enregistré — merci !"}
@@ -123,7 +142,7 @@ def get_avis_admin(db: Session = Depends(get_db),
     rows = db.execute(text("""
         SELECT id, nom, client_nom, client_tel, pays, note,
                texte, commentaire, reponse, visible, created_at,
-               taille_retour, photo_url, verifie, utile_count
+               taille_retour, photo_url, verifie, utile_count, commande_ref
         FROM avis
         ORDER BY created_at DESC
     """)).fetchall()
