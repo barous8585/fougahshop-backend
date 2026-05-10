@@ -181,7 +181,7 @@ async def auto_refresh_taux_gnf():
             except Exception:
                 pass
         # Attendre 1 heure avant la prochaine mise à jour
-        await asyncio.sleep(60 * 60)
+        await asyncio.sleep(60)       # ✅ Toutes les minutes
 
 
 # ── Config publique ───────────────────────────────────────────
