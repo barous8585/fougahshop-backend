@@ -90,6 +90,20 @@ async def lifespan(app: FastAPI):
 
         ensure_tarifs_columns(db)
         print("✅ Colonnes config vérifiées")
+        # ✅ Migration colonnes avis (Cloudinary)
+        for col_sql in [
+            "ALTER TABLE avis ADD COLUMN IF NOT EXISTS client_tel VARCHAR",
+            "ALTER TABLE avis ADD COLUMN IF NOT EXISTS taille_retour VARCHAR",
+            "ALTER TABLE avis ADD COLUMN IF NOT EXISTS photo_url VARCHAR",
+            "ALTER TABLE avis ADD COLUMN IF NOT EXISTS verifie BOOLEAN DEFAULT FALSE",
+            "ALTER TABLE avis ADD COLUMN IF NOT EXISTS utile_count INTEGER DEFAULT 0",
+        ]:
+            try:
+                db.execute(text(col_sql))
+                db.commit()
+            except Exception:
+                db.rollback()
+        print("✅ Colonnes avis Cloudinary vérifiées")
 
         # ── Table sessions WhatsApp ───────────────────────────
         from sqlalchemy import text
