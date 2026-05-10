@@ -136,22 +136,23 @@ async def lifespan(app: FastAPI):
     finally:
         db.close()
 
-    # ── Tâche de fond — refresh taux GNF toutes les heures ───
-    task = asyncio.create_task(auto_refresh_taux_gnf())
-    print("✅ Tâche auto-refresh taux GNF démarrée (toutes les heures)")
-
+    # ── Tâches de fond ───────────────────────────────────────
     task_cleanup = asyncio.create_task(cleanup_rate_limits())
     print("✅ Tâche nettoyage rate limits démarrée")
+
+    task_taux = asyncio.create_task(auto_refresh_taux_gnf())
+    print("✅ Tâche auto-refresh taux GNF démarrée (toutes les minutes)")
 
     yield  # ← l'app tourne ici
 
     # ── Shutdown ──────────────────────────────────────────────
     task_cleanup.cancel()
-    task.cancel()
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass
+    task_taux.cancel()
+    for t in [task_cleanup, task_taux]:
+        try:
+            await t
+        except asyncio.CancelledError:
+            pass
 
 
 # ══════════════════════════════════════════════════════════════
