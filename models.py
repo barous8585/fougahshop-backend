@@ -104,12 +104,18 @@ class PromoCode(Base):
 class Avis(Base):
     __tablename__ = "avis"
 
-    id         = Column(Integer, primary_key=True, autoincrement=True)
-    nom        = Column(String)
-    pays       = Column(String,  nullable=True)
-    drapeau    = Column(String,  nullable=True)
-    note       = Column(Integer, default=5)
-    texte      = Column(Text)
-    reponse    = Column(Text,    nullable=True)
-    visible    = Column(Boolean, default=True)
-    created_at = Column(DateTime, server_default=func.now())
+    id            = Column(Integer, primary_key=True, autoincrement=True)
+    nom           = Column(String)
+    pays          = Column(String,  nullable=True)
+    drapeau       = Column(String,  nullable=True)
+    note          = Column(Integer, default=5)
+    texte         = Column(Text)
+    reponse       = Column(Text,    nullable=True)
+    visible       = Column(Boolean, default=True)
+    created_at    = Column(DateTime, server_default=func.now())
+    # ✅ Nouveaux champs Cloudinary
+    client_tel    = Column(String,  nullable=True)
+    taille_retour = Column(String,  nullable=True)
+    photo_url     = Column(String,  nullable=True)
+    verifie       = Column(Boolean, default=False)
+    utile_count   = Column(Integer, default=0)
