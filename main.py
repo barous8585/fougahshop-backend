@@ -19,7 +19,6 @@ from routes.avis       import router as avis_router
 from routes.whatsapp   import router as whatsapp_router
 from routes.parrainage import router as parrainage_router
 from routes.annonce    import router as annonce_router
-from routes.paiement   import router as paiement_router  # ✅ Ajouté
 
 # ── Imports fonctions startup ─────────────────────────────────
 from routes.promo      import ensure_tables as ensure_promo_tables
@@ -43,13 +42,8 @@ Base.metadata.create_all(bind=engine)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """
-    ✅ Toutes les migrations et initialisations au démarrage.
-    Utilise le lifespan context manager (FastAPI 0.95+).
-    """
     db = SessionLocal()
     try:
-        # ── Config de base ────────────────────────────────────
         cfg = get_config(db)
         init_port(db)
 
@@ -70,7 +64,6 @@ async def lifespan(app: FastAPI):
         else:
             print("⚠️  SECRET_RESET non défini — définissez la variable d'environnement sur Render")
 
-        # ── Migrations tables ─────────────────────────────────
         ensure_parrainage_tables(db)
         print("✅ Tables parrainage et galerie vérifiées")
 
@@ -92,7 +85,6 @@ async def lifespan(app: FastAPI):
         ensure_tarifs_columns(db)
         print("✅ Colonnes config vérifiées")
 
-        # ✅ Migration colonnes avis (Cloudinary)
         from sqlalchemy import text
         for col_sql in [
             "ALTER TABLE avis ADD COLUMN IF NOT EXISTS client_tel VARCHAR",
@@ -109,7 +101,6 @@ async def lifespan(app: FastAPI):
                 db.rollback()
         print("✅ Colonnes avis vérifiées")
 
-        # ── Table sessions WhatsApp ───────────────────────────
         db.execute(text("""
             CREATE TABLE IF NOT EXISTS whatsapp_sessions (
                 tel        VARCHAR PRIMARY KEY,
@@ -120,14 +111,12 @@ async def lifespan(app: FastAPI):
         db.commit()
         print("✅ Table sessions WhatsApp vérifiée")
 
-        # ── Nettoyages ────────────────────────────────────────
         purge_expired_sessions(db)
         print("✅ Sessions expirées nettoyées")
 
         purge_old_tokens(db)
         print("✅ Tokens FCM obsolètes nettoyés")
 
-        # ── Taux GNF — première mise à jour ──────────────────
         try:
             await refresh_taux_gnf_en_base(db)
             print("✅ Taux GNF initialisé depuis open.er-api.com")
@@ -139,16 +128,14 @@ async def lifespan(app: FastAPI):
     finally:
         db.close()
 
-    # ── Tâches de fond ───────────────────────────────────────
     task_cleanup = asyncio.create_task(cleanup_rate_limits())
     print("✅ Tâche nettoyage rate limits démarrée")
 
     task_taux = asyncio.create_task(auto_refresh_taux_gnf())
-    print("✅ Tâche auto-refresh taux GNF démarrée")
+    print("✅ Tâche auto-refresh taux GNF démarrée (toutes les minutes)")
 
-    yield  # ← l'app tourne ici
+    yield
 
-    # ── Shutdown ──────────────────────────────────────────────
     task_cleanup.cancel()
     task_taux.cancel()
     for t in [task_cleanup, task_taux]:
@@ -182,7 +169,6 @@ ALLOWED_ORIGINS = [
     "http://127.0.0.1:8000",
 ])
 
-# ── Sécurité — Rate limiting + Headers ───────────────────────
 app.add_middleware(SecurityMiddleware)
 
 app.add_middleware(
@@ -204,7 +190,6 @@ app.include_router(avis_router)
 app.include_router(whatsapp_router)
 app.include_router(parrainage_router)
 app.include_router(annonce_router)
-app.include_router(paiement_router)  # ✅ Ajouté
 
 # ── Frontend statique ─────────────────────────────────────────
 static_dir = os.path.join(os.path.dirname(__file__), "static")
