@@ -3,6 +3,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
+from sqlalchemy import text   # ✅ CORRECTION : import en haut, avant tout usage
 import os, asyncio
 from security import SecurityMiddleware, cleanup_rate_limits
 from database import engine, Base, SessionLocal
@@ -27,6 +28,7 @@ from routes.admin      import ensure_archived_column
 from routes.auth       import ensure_sessions_table, purge_expired_sessions
 from routes.notifs     import ensure_tokens_table, purge_old_tokens
 from routes.parrainage import ensure_parrainage_tables
+from routes.avis       import ensure_avis_columns          # ✅ NOUVEAU
 from routes.config     import (
     init_port, get_config, ensure_tarifs_columns,
     auto_refresh_taux_gnf, refresh_taux_gnf_en_base
@@ -37,15 +39,11 @@ Base.metadata.create_all(bind=engine)
 
 
 # ══════════════════════════════════════════════════════════════
-# LIFESPAN — remplace @app.on_event("startup") déprécié
+# LIFESPAN
 # ══════════════════════════════════════════════════════════════
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """
-    ✅ Toutes les migrations et initialisations au démarrage.
-    Utilise le lifespan context manager (FastAPI 0.95+).
-    """
     db = SessionLocal()
     try:
         # ── Config de base ────────────────────────────────────
@@ -90,23 +88,12 @@ async def lifespan(app: FastAPI):
 
         ensure_tarifs_columns(db)
         print("✅ Colonnes config vérifiées")
-        # ✅ Migration colonnes avis (Cloudinary)
-        for col_sql in [
-            "ALTER TABLE avis ADD COLUMN IF NOT EXISTS client_tel VARCHAR",
-            "ALTER TABLE avis ADD COLUMN IF NOT EXISTS taille_retour VARCHAR",
-            "ALTER TABLE avis ADD COLUMN IF NOT EXISTS photo_url VARCHAR",
-            "ALTER TABLE avis ADD COLUMN IF NOT EXISTS verifie BOOLEAN DEFAULT FALSE",
-            "ALTER TABLE avis ADD COLUMN IF NOT EXISTS utile_count INTEGER DEFAULT 0",
-        ]:
-            try:
-                db.execute(text(col_sql))
-                db.commit()
-            except Exception:
-                db.rollback()
-        print("✅ Colonnes avis Cloudinary vérifiées")
+
+        # ✅ CORRECTION : appel via fonction dédiée (text déjà importé en haut)
+        ensure_avis_columns(db)
+        print("✅ Colonnes avis vérifiées (photos_urls, client_tel, commande_ref...)")
 
         # ── Table sessions WhatsApp ───────────────────────────
-        from sqlalchemy import text
         db.execute(text("""
             CREATE TABLE IF NOT EXISTS whatsapp_sessions (
                 tel        VARCHAR PRIMARY KEY,
@@ -166,8 +153,6 @@ app = FastAPI(
 )
 
 # ── CORS ──────────────────────────────────────────────────────
-# En production, seul fougahshop.com est autorisé
-# En développement, les localhost sont ajoutés
 _is_prod = os.environ.get("RENDER", "") == "true"
 
 ALLOWED_ORIGINS = [
@@ -181,7 +166,7 @@ ALLOWED_ORIGINS = [
     "http://127.0.0.1:8000",
 ])
 
-# ── Sécurité — Rate limiting + Headers ───────────────────────
+# ── Sécurité ─────────────────────────────────────────────────
 app.add_middleware(SecurityMiddleware)
 
 app.add_middleware(
@@ -189,7 +174,6 @@ app.add_middleware(
     allow_origins     = ALLOWED_ORIGINS,
     allow_methods     = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers     = ["Content-Type", "X-Admin-Token"],
-    # ✅ allow_credentials=True pour que les cookies de session fonctionnent
     allow_credentials = True,
 )
 
