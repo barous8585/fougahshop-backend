@@ -42,8 +42,13 @@ Base.metadata.create_all(bind=engine)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """
+    ✅ Toutes les migrations et initialisations au démarrage.
+    Utilise le lifespan context manager (FastAPI 0.95+).
+    """
     db = SessionLocal()
     try:
+        # ── Config de base ────────────────────────────────────
         cfg = get_config(db)
         init_port(db)
 
@@ -64,6 +69,7 @@ async def lifespan(app: FastAPI):
         else:
             print("⚠️  SECRET_RESET non défini — définissez la variable d'environnement sur Render")
 
+        # ── Migrations tables ─────────────────────────────────
         ensure_parrainage_tables(db)
         print("✅ Tables parrainage et galerie vérifiées")
 
@@ -84,23 +90,23 @@ async def lifespan(app: FastAPI):
 
         ensure_tarifs_columns(db)
         print("✅ Colonnes config vérifiées")
-
-        from sqlalchemy import text
+        # ✅ Migration colonnes avis (Cloudinary)
         for col_sql in [
             "ALTER TABLE avis ADD COLUMN IF NOT EXISTS client_tel VARCHAR",
             "ALTER TABLE avis ADD COLUMN IF NOT EXISTS taille_retour VARCHAR",
             "ALTER TABLE avis ADD COLUMN IF NOT EXISTS photo_url VARCHAR",
             "ALTER TABLE avis ADD COLUMN IF NOT EXISTS verifie BOOLEAN DEFAULT FALSE",
             "ALTER TABLE avis ADD COLUMN IF NOT EXISTS utile_count INTEGER DEFAULT 0",
-            "ALTER TABLE avis ADD COLUMN IF NOT EXISTS commande_ref VARCHAR DEFAULT NULL",
         ]:
             try:
                 db.execute(text(col_sql))
                 db.commit()
             except Exception:
                 db.rollback()
-        print("✅ Colonnes avis vérifiées")
+        print("✅ Colonnes avis Cloudinary vérifiées")
 
+        # ── Table sessions WhatsApp ───────────────────────────
+        from sqlalchemy import text
         db.execute(text("""
             CREATE TABLE IF NOT EXISTS whatsapp_sessions (
                 tel        VARCHAR PRIMARY KEY,
@@ -111,12 +117,14 @@ async def lifespan(app: FastAPI):
         db.commit()
         print("✅ Table sessions WhatsApp vérifiée")
 
+        # ── Nettoyages ────────────────────────────────────────
         purge_expired_sessions(db)
         print("✅ Sessions expirées nettoyées")
 
         purge_old_tokens(db)
         print("✅ Tokens FCM obsolètes nettoyés")
 
+        # ── Taux GNF — première mise à jour ──────────────────
         try:
             await refresh_taux_gnf_en_base(db)
             print("✅ Taux GNF initialisé depuis open.er-api.com")
@@ -128,14 +136,16 @@ async def lifespan(app: FastAPI):
     finally:
         db.close()
 
+    # ── Tâches de fond ───────────────────────────────────────
     task_cleanup = asyncio.create_task(cleanup_rate_limits())
     print("✅ Tâche nettoyage rate limits démarrée")
 
     task_taux = asyncio.create_task(auto_refresh_taux_gnf())
     print("✅ Tâche auto-refresh taux GNF démarrée (toutes les minutes)")
 
-    yield
+    yield  # ← l'app tourne ici
 
+    # ── Shutdown ──────────────────────────────────────────────
     task_cleanup.cancel()
     task_taux.cancel()
     for t in [task_cleanup, task_taux]:
@@ -156,6 +166,8 @@ app = FastAPI(
 )
 
 # ── CORS ──────────────────────────────────────────────────────
+# En production, seul fougahshop.com est autorisé
+# En développement, les localhost sont ajoutés
 _is_prod = os.environ.get("RENDER", "") == "true"
 
 ALLOWED_ORIGINS = [
@@ -169,6 +181,7 @@ ALLOWED_ORIGINS = [
     "http://127.0.0.1:8000",
 ])
 
+# ── Sécurité — Rate limiting + Headers ───────────────────────
 app.add_middleware(SecurityMiddleware)
 
 app.add_middleware(
@@ -176,6 +189,7 @@ app.add_middleware(
     allow_origins     = ALLOWED_ORIGINS,
     allow_methods     = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers     = ["Content-Type", "X-Admin-Token"],
+    # ✅ allow_credentials=True pour que les cookies de session fonctionnent
     allow_credentials = True,
 )
 
