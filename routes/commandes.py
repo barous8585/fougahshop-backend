@@ -66,11 +66,6 @@ def get_port(db, pays):
 
 
 def generate_ref(db) -> str:
-    """
-    ✅ CORRIGÉ — Race condition supprimée.
-    Ancienne version : count() + 1 → deux commandes simultanées généraient la même ref.
-    Nouvelle version : MAX sur les refs existantes → atomique et sans collision.
-    """
     year = datetime.now().year
     prefix = f"CMD-{year}-"
     result = db.execute(
@@ -91,11 +86,9 @@ def calc_article_sans_port_ni_commission(prix_eu, qty, pays, cfg):
 
     if m["symbole"] == "GNF":
         taux_conv  = taux_gnf / 656
-        # ✅ Aligné frontend : round(prix * taux) × qty — évite l'écart d'arrondi flottant
         base_local = round(prix_eu * taux_gnf) * qty
         base_fcfa  = round(prix_eu * taux_fcfa)
     else:
-        # FCFA
         taux_conv  = 1.0
         base_fcfa  = round(prix_eu * taux_fcfa)
         base_local = round(prix_eu * taux_fcfa) * qty
@@ -109,11 +102,6 @@ def calc_article_sans_port_ni_commission(prix_eu, qty, pays, cfg):
 
 
 def appliquer_promo(db, promo_code: str, total_local: float, taux_conv: float) -> float:
-    """
-    ✅ CORRIGÉ — Double incrément supprimé.
-    Ancienne version : uses_count ET utilisations incrémentés ensemble → comptait double.
-    Nouvelle version : uses_count en priorité, utilisations uniquement en fallback.
-    """
     if not promo_code:
         return total_local
     try:
@@ -125,7 +113,6 @@ def appliquer_promo(db, promo_code: str, total_local: float, taux_conv: float) -
         if not promo:
             return total_local
 
-        # Vérifier expiration
         expiry = getattr(promo, "expiry", None)
         if expiry:
             from datetime import date
@@ -133,19 +120,16 @@ def appliquer_promo(db, promo_code: str, total_local: float, taux_conv: float) -
             if exp_date and exp_date < date.today():
                 return total_local
 
-        # Vérifier quota — lire les deux colonnes pour compat, ne pas additionner
         uses  = getattr(promo, "uses_count", 0)  or getattr(promo, "utilisations", 0) or 0
         max_u = getattr(promo, "max_uses",   0)  or getattr(promo, "quota",        0) or 0
         if max_u > 0 and uses >= max_u:
             return total_local
 
-        # Calcul réduction
         type_promo = getattr(promo, "type", "fixe") or "fixe"
         valeur     = getattr(promo, "valeur", None) or getattr(promo, "reduction_fcfa", 0) or 0
 
-        # ✅ Type livraison — pas de réduction sur le montant, juste incrémenter uses_count
         if type_promo == "livraison":
-            nouveau_total = total_local  # aucune déduction
+            nouveau_total = total_local
         elif type_promo == "pct":
             reduction = round(total_local * float(valeur) / 100)
             nouveau_total = max(0, total_local - reduction)
@@ -153,7 +137,6 @@ def appliquer_promo(db, promo_code: str, total_local: float, taux_conv: float) -
             reduction = round(float(valeur) * taux_conv)
             nouveau_total = max(0, total_local - reduction)
 
-        # ✅ Incrémenter UNE SEULE FOIS : uses_count d'abord, utilisations en fallback
         incremente = False
         try:
             db.execute(
@@ -195,7 +178,7 @@ class ArticleIn(BaseModel):
     prix_eu:                 float
     frais_livraison_boutique: Optional[float] = 0.0
     poids:                   float           = 0.5
-    qty:       int             = 1
+    qty:                     int             = 1
 
 
 class CommandeCreate(BaseModel):
@@ -208,7 +191,6 @@ class CommandeCreate(BaseModel):
     promo_code:             Optional[str]   = None
     promo_type:             Optional[str]   = None
     promo_valeur:           Optional[float] = None
-    # ✅ Code parrainage séparé du code promo
     code_parrainage:        Optional[str]   = None
     reduction_parrainage:   Optional[float] = None
     mode_paiement:          Optional[str]   = None
@@ -237,6 +219,21 @@ class KkiapayConfirmBody(BaseModel):
     transaction_id: Optional[str] = None
 
 
+# ── Fonctions utilitaires ─────────────────────────────────────
+
+def _sanitize_url(url: str) -> str:
+    # ✅ CORRECTION : cette fonction est un utilitaire, PAS une route HTTP
+    # Elle était incorrectement décorée avec @router.post("/") ce qui empêchait
+    # toute création de commande (creer_commande n'était jamais enregistrée comme route)
+    if not url:
+        return ""
+    url = url.strip()
+    lower = url.lower()
+    if lower.startswith("http://") or lower.startswith("https://"):
+        return url
+    return ""
+
+
 # ── Routes ────────────────────────────────────────────────────
 
 @router.post("/calculer")
@@ -244,7 +241,6 @@ def calculer(body: CalculRequest, db: Session = Depends(get_db)):
     cfg        = get_config(db)
     detail     = calc_article_sans_port_ni_commission(body.prix_eu, body.qty, body.pays, cfg)
     commission = get_commission(body.prix_eu * body.qty)
-    # ✅ Utiliser taux_conv retourné par calc (déjà correct pour GNF et FCFA)
     taux_conv  = detail["taux_conv"]
     comm_local = round(commission * taux_conv)
     port_fcfa  = get_port(db, body.pays)
@@ -259,18 +255,8 @@ def calculer(body: CalculRequest, db: Session = Depends(get_db)):
     }
 
 
+# ✅ CORRECTION PRINCIPALE : @router.post("/") est maintenant sur creer_commande
 @router.post("/", status_code=201)
-def _sanitize_url(url: str) -> str:
-    # Bloquer les URLs malveillantes - ne garder que http/https
-    if not url:
-        return ""
-    url = url.strip()
-    lower = url.lower()
-    if lower.startswith("http://") or lower.startswith("https://"):
-        return url
-    return ""
-
-
 def creer_commande(body: CommandeCreate, db: Session = Depends(get_db)):
     if not body.articles:
         raise HTTPException(400, "Panier vide")
@@ -286,7 +272,6 @@ def creer_commande(body: CommandeCreate, db: Session = Depends(get_db)):
     taux_conv             = 1.0
 
     for a in body.articles:
-        # ✅ Inclure frais livraison boutique dans le prix de base
         frais_b = float(getattr(a, 'frais_livraison_boutique', 0) or 0)
         prix_total_eu = a.prix_eu + frais_b
         detail = calc_article_sans_port_ni_commission(prix_total_eu, a.qty, body.client_pays, cfg)
@@ -310,7 +295,6 @@ def creer_commande(body: CommandeCreate, db: Session = Depends(get_db)):
         poids_total           += a.poids * a.qty
         taux_conv              = detail["taux_conv"]
 
-    # ✅ Commission calculée sur le total incluant les frais de livraison boutique
     commission_fcfa   = get_commission(total_eu)
     commission_locale = round(commission_fcfa * taux_conv)
     total_local       = total_local_sans_comm + commission_locale
@@ -318,7 +302,6 @@ def creer_commande(body: CommandeCreate, db: Session = Depends(get_db)):
     if body.promo_code:
         total_local = appliquer_promo(db, body.promo_code, total_local, taux_conv)
 
-    # ✅ Traitement code parrainage — créditer le parrain directement en DB
     if body.code_parrainage:
         try:
             code_p = body.code_parrainage.upper().strip()
@@ -327,7 +310,6 @@ def creer_commande(body: CommandeCreate, db: Session = Depends(get_db)):
                 {"c": code_p}
             ).mappings().first()
             if parrain and parrain["parrain_tel"] != body.client_tel:
-                # Anti auto-parrainage
                 deja = db.execute(
                     text("SELECT 1 FROM parrainage_utilisations WHERE code=:c AND filleul_tel=:t"),
                     {"c": code_p, "t": body.client_tel}
@@ -350,8 +332,6 @@ def creer_commande(body: CommandeCreate, db: Session = Depends(get_db)):
             print(f"[parrainage] Erreur: {e}")
             db.rollback()
 
-    # ✅ Priorité au montant frontend (taux live figé au moment de confirmer)
-    # Fallback sur calcul backend si le champ est absent (bot WhatsApp, ancien client)
     if body.total_local_client and body.total_local_client > 0:
         total_local = round(body.total_local_client)
     if body.monnaie_client:
@@ -386,7 +366,6 @@ def creer_commande(body: CommandeCreate, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(commande)
 
-    # ✅ Mettre à jour la ref de commande dans parrainage_utilisations
     if body.code_parrainage:
         try:
             db.execute(text(
@@ -474,8 +453,6 @@ def suivi(ref: str, db: Session = Depends(get_db)):
 def historique(tel: str, db: Session = Depends(get_db)):
     tel_clean = tel.replace(" ", "").replace("+", "").replace("-", "")
 
-    # ✅ CORRIGÉ — Recherche exacte d'abord, 8 derniers chiffres en fallback seulement
-    # Ancienne version : contains([-8:]) pouvait matcher deux clients différents
     cmds = db.query(Commande).filter(
         Commande.client_tel.contains(tel_clean)
     ).order_by(Commande.created_at.desc()).all()
@@ -527,7 +504,6 @@ def annuler_commande(body: AnnulationBody, db: Session = Depends(get_db)):
     note          = f"[ANNULATION CLIENT] Tel: {body.client_tel}"
     if body.motif:
         note += f" | Motif: {body.motif}"
-    # ✅ Tronquer pour éviter dépassement de colonne
     note_existante = (cmd.note_admin or "")[-500:]
     cmd.note_admin = (note_existante + " | " + note)[-1000:] if note_existante else note[:1000]
     db.commit()
