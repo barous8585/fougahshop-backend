@@ -19,6 +19,7 @@ from routes.avis       import router as avis_router
 from routes.whatsapp   import router as whatsapp_router
 from routes.parrainage import router as parrainage_router
 from routes.annonce    import router as annonce_router
+from routes.paiement   import router as paiement_router  # ✅ Ajouté
 
 # ── Imports fonctions startup ─────────────────────────────────
 from routes.promo      import ensure_tables as ensure_promo_tables
@@ -90,23 +91,25 @@ async def lifespan(app: FastAPI):
 
         ensure_tarifs_columns(db)
         print("✅ Colonnes config vérifiées")
+
         # ✅ Migration colonnes avis (Cloudinary)
+        from sqlalchemy import text
         for col_sql in [
             "ALTER TABLE avis ADD COLUMN IF NOT EXISTS client_tel VARCHAR",
             "ALTER TABLE avis ADD COLUMN IF NOT EXISTS taille_retour VARCHAR",
             "ALTER TABLE avis ADD COLUMN IF NOT EXISTS photo_url VARCHAR",
             "ALTER TABLE avis ADD COLUMN IF NOT EXISTS verifie BOOLEAN DEFAULT FALSE",
             "ALTER TABLE avis ADD COLUMN IF NOT EXISTS utile_count INTEGER DEFAULT 0",
+            "ALTER TABLE avis ADD COLUMN IF NOT EXISTS commande_ref VARCHAR DEFAULT NULL",
         ]:
             try:
                 db.execute(text(col_sql))
                 db.commit()
             except Exception:
                 db.rollback()
-        print("✅ Colonnes avis Cloudinary vérifiées")
+        print("✅ Colonnes avis vérifiées")
 
         # ── Table sessions WhatsApp ───────────────────────────
-        from sqlalchemy import text
         db.execute(text("""
             CREATE TABLE IF NOT EXISTS whatsapp_sessions (
                 tel        VARCHAR PRIMARY KEY,
@@ -141,7 +144,7 @@ async def lifespan(app: FastAPI):
     print("✅ Tâche nettoyage rate limits démarrée")
 
     task_taux = asyncio.create_task(auto_refresh_taux_gnf())
-    print("✅ Tâche auto-refresh taux GNF démarrée (toutes les minutes)")
+    print("✅ Tâche auto-refresh taux GNF démarrée")
 
     yield  # ← l'app tourne ici
 
@@ -166,8 +169,6 @@ app = FastAPI(
 )
 
 # ── CORS ──────────────────────────────────────────────────────
-# En production, seul fougahshop.com est autorisé
-# En développement, les localhost sont ajoutés
 _is_prod = os.environ.get("RENDER", "") == "true"
 
 ALLOWED_ORIGINS = [
@@ -189,7 +190,6 @@ app.add_middleware(
     allow_origins     = ALLOWED_ORIGINS,
     allow_methods     = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers     = ["Content-Type", "X-Admin-Token"],
-    # ✅ allow_credentials=True pour que les cookies de session fonctionnent
     allow_credentials = True,
 )
 
@@ -204,6 +204,7 @@ app.include_router(avis_router)
 app.include_router(whatsapp_router)
 app.include_router(parrainage_router)
 app.include_router(annonce_router)
+app.include_router(paiement_router)  # ✅ Ajouté
 
 # ── Frontend statique ─────────────────────────────────────────
 static_dir = os.path.join(os.path.dirname(__file__), "static")
