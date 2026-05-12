@@ -222,9 +222,6 @@ class KkiapayConfirmBody(BaseModel):
 # ── Fonctions utilitaires ─────────────────────────────────────
 
 def _sanitize_url(url: str) -> str:
-    # ✅ CORRECTION : cette fonction est un utilitaire, PAS une route HTTP
-    # Elle était incorrectement décorée avec @router.post("/") ce qui empêchait
-    # toute création de commande (creer_commande n'était jamais enregistrée comme route)
     if not url:
         return ""
     url = url.strip()
@@ -232,6 +229,11 @@ def _sanitize_url(url: str) -> str:
     if lower.startswith("http://") or lower.startswith("https://"):
         return url
     return ""
+
+
+def _normaliser_tel(tel: str) -> str:
+    """Retourne uniquement les chiffres du numéro de téléphone."""
+    return ''.join(filter(str.isdigit, tel or ""))
 
 
 # ── Routes ────────────────────────────────────────────────────
@@ -255,7 +257,6 @@ def calculer(body: CalculRequest, db: Session = Depends(get_db)):
     }
 
 
-# ✅ CORRECTION PRINCIPALE : @router.post("/") est maintenant sur creer_commande
 @router.post("/", status_code=201)
 def creer_commande(body: CommandeCreate, db: Session = Depends(get_db)):
     if not body.articles:
@@ -451,36 +452,88 @@ def suivi(ref: str, db: Session = Depends(get_db)):
 
 @router.get("/historique/{tel}")
 def historique(tel: str, db: Session = Depends(get_db)):
-    tel_clean = tel.replace(" ", "").replace("+", "").replace("-", "")
+    # ✅ CORRECTION : normaliser les deux côtés — chiffres uniquement
+    # Problème précédent : le client stockait "+224 627 19 64 19" (avec espaces)
+    # mais la recherche envoyait "+22462719 6419" (espaces supprimés différemment)
+    # Le LIKE ne matchait pas car les espaces étaient à des positions différentes.
+    # Solution : comparer uniquement les chiffres des deux côtés via REGEXP_REPLACE en SQL.
 
-    cmds = db.query(Commande).filter(
-        Commande.client_tel.contains(tel_clean)
-    ).order_by(Commande.created_at.desc()).all()
+    tel_chiffres = _normaliser_tel(tel)
 
-    if not cmds and len(tel_clean) >= 8:
-        cmds = db.query(Commande).filter(
-            Commande.client_tel.contains(tel_clean[-8:])
+    if len(tel_chiffres) < 8:
+        raise HTTPException(404, "Numéro trop court")
+
+    # On garde les 9 derniers chiffres pour éviter les problèmes d'indicatif
+    # ex: "22462719 6419" → on cherche les 9 derniers chiffres "627196419"
+    suffixe = tel_chiffres[-9:]
+
+    cmds = []
+
+    # ── Tentative 1 : REGEXP_REPLACE (PostgreSQL) ─────────────
+    # Supprime tout ce qui n'est pas un chiffre dans client_tel avant de comparer
+    try:
+        rows = db.execute(text("""
+            SELECT * FROM commandes
+            WHERE REGEXP_REPLACE(client_tel, '[^0-9]', '', 'g') LIKE :pattern
+            ORDER BY created_at DESC
+        """), {"pattern": f"%{suffixe}%"}).mappings().all()
+        cmds = list(rows)
+    except Exception as e:
+        print(f"[historique] REGEXP_REPLACE non supporté, fallback REPLACE: {e}")
+
+    # ── Tentative 2 : REPLACE triple (fallback) ───────────────
+    if not cmds:
+        try:
+            rows = db.execute(text("""
+                SELECT * FROM commandes
+                WHERE REPLACE(REPLACE(REPLACE(REPLACE(client_tel, ' ', ''), '+', ''), '-', ''), '.', '')
+                      LIKE :pattern
+                ORDER BY created_at DESC
+            """), {"pattern": f"%{suffixe}%"}).mappings().all()
+            cmds = list(rows)
+        except Exception as e:
+            print(f"[historique] REPLACE fallback échoué: {e}")
+
+    # ── Tentative 3 : contains brut (dernier recours) ─────────
+    if not cmds:
+        tel_clean = tel.replace(" ", "").replace("+", "").replace("-", "")
+        cmds_orm = db.query(Commande).filter(
+            Commande.client_tel.contains(tel_clean)
         ).order_by(Commande.created_at.desc()).all()
+        # Convertir en mappings-like pour uniformité
+        cmds = [
+            {col.name: getattr(c, col.name) for col in Commande.__table__.columns}
+            for c in cmds_orm
+        ]
 
     if not cmds:
         raise HTTPException(404, "Aucune commande trouvée")
 
-    return [
-        {
-            "ref":             c.ref,
-            "statut":          c.statut,
-            "nb_articles":     c.nb_articles,
-            "total_local":     c.total_local,
-            "monnaie":         c.monnaie,
-            "delai_livraison": c.delai_livraison,
-            "note_admin":      c.note_admin,
-            "client_nom":      c.client_nom,
-            "client_tel":      c.client_tel,
-            "created_at":      c.created_at,
-            "date_estimee":    calculer_date_estimee(c.created_at, c.delai_livraison or ""),
-        }
-        for c in cmds
-    ]
+    result = []
+    for c in cmds:
+        # Compatibilité dict (mappings SQL) et objet ORM
+        def g(key):
+            if isinstance(c, dict):
+                return c.get(key)
+            return getattr(c, key, None)
+
+        created = g("created_at")
+        delai   = g("delai_livraison") or ""
+        result.append({
+            "ref":             g("ref"),
+            "statut":          g("statut"),
+            "nb_articles":     g("nb_articles"),
+            "total_local":     g("total_local"),
+            "monnaie":         g("monnaie"),
+            "delai_livraison": delai,
+            "note_admin":      g("note_admin"),
+            "client_nom":      g("client_nom"),
+            "client_tel":      g("client_tel"),
+            "created_at":      created,
+            "date_estimee":    calculer_date_estimee(created, delai),
+        })
+
+    return result
 
 
 @router.post("/annuler")
@@ -490,9 +543,11 @@ def annuler_commande(body: AnnulationBody, db: Session = Depends(get_db)):
     if not cmd:
         raise HTTPException(404, "Commande introuvable")
 
-    tel_clean     = body.client_tel.replace(" ", "").replace("+", "").replace("-", "")
-    cmd_tel_clean = (cmd.client_tel or "").replace(" ", "").replace("+", "").replace("-", "")
-    if tel_clean[-8:] not in cmd_tel_clean:
+    # ✅ Utiliser la même normalisation pour la vérification du téléphone
+    tel_chiffres     = _normaliser_tel(body.client_tel)
+    cmd_tel_chiffres = _normaliser_tel(cmd.client_tel or "")
+
+    if len(tel_chiffres) < 8 or tel_chiffres[-8:] not in cmd_tel_chiffres:
         raise HTTPException(403, "Numéro de téléphone incorrect")
 
     STATUTS_ANNULABLES = ["en_attente_paiement", "paye"]
