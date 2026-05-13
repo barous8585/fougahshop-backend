@@ -8,15 +8,12 @@ from models import Config, Employe
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
-COOKIE_MAX_AGE = 7 * 24 * 3600   # 7 jours
-COOKIE_NAME    = "fg_admin_session"
-SESSION_TTL_DAYS = 7              # Expiration automatique
+COOKIE_MAX_AGE   = 7 * 24 * 3600
+COOKIE_NAME      = "fg_admin_session"
+SESSION_TTL_DAYS = 7
 
-
-# ── Migration — à appeler UNE SEULE FOIS au startup ──────────
 
 def ensure_sessions_table(db: Session):
-    """Crée la table admin_sessions. À appeler au startup dans main.py."""
     try:
         db.execute(text("""
             CREATE TABLE IF NOT EXISTS admin_sessions (
@@ -31,32 +28,19 @@ def ensure_sessions_table(db: Session):
 
 
 def purge_expired_sessions(db: Session):
-    """
-    ✅ Supprime les sessions expirées (> 7 jours).
-    À appeler au startup dans main.py.
-    """
+    # ✅ FIX : syntaxe PostgreSQL correcte — bindparams ne fonctionne pas dans INTERVAL
     try:
         db.execute(text(
-            "DELETE FROM admin_sessions "
-            "WHERE created_at < NOW() - INTERVAL ':days days'"
-        ).bindparams(days=SESSION_TTL_DAYS))
+            f"DELETE FROM admin_sessions "
+            f"WHERE created_at < NOW() - INTERVAL '{SESSION_TTL_DAYS} days'"
+        ))
         db.commit()
-    except Exception:
-        try:
-            # Fallback syntaxe alternative PostgreSQL
-            db.execute(text(
-                f"DELETE FROM admin_sessions "
-                f"WHERE created_at < NOW() - INTERVAL '{SESSION_TTL_DAYS} days'"
-            ))
-            db.commit()
-        except Exception:
-            db.rollback()
+    except Exception as e:
+        db.rollback()
+        print(f"[auth] purge_expired_sessions error: {e}")
 
-
-# ── CRUD sessions ─────────────────────────────────────────────
 
 def session_get(db: Session, token: str) -> str | None:
-    """Retourne le rôle associé au token, ou None si expiré/inexistant."""
     if not token:
         return None
     try:
@@ -101,8 +85,6 @@ def session_delete(db: Session, token: str):
         db.rollback()
 
 
-# ── Helpers ───────────────────────────────────────────────────
-
 def get_config(db: Session):
     cfg = db.query(Config).first()
     if not cfg:
@@ -137,10 +119,9 @@ def _get_token(request: Request) -> str:
     )
 
 
-# ── Routes ────────────────────────────────────────────────────
-
 @router.post("/login")
-def login(body: Dict[str, Any], response: Response, request: Request, db: Session = Depends(get_db)):
+def login(body: Dict[str, Any], response: Response, request: Request,
+          db: Session = Depends(get_db)):
     import time as _time
     password = str(body.get("password", "")).strip()
     if not password:
@@ -149,11 +130,9 @@ def login(body: Dict[str, Any], response: Response, request: Request, db: Sessio
     cfg  = get_config(db)
     role = None
 
-    # Vérifier patron
     if cfg.admin_pwd and password == cfg.admin_pwd:
         role = "patron"
     else:
-        # Vérifier employé
         emp = db.query(Employe).filter(
             Employe.pwd == password,
             Employe.actif == True
@@ -164,12 +143,10 @@ def login(body: Dict[str, Any], response: Response, request: Request, db: Sessio
                 role = "employe"
 
     if not role:
-        # ✅ Log la tentative échouée
         ip = (request.headers.get("CF-Connecting-IP")
               or request.headers.get("X-Forwarded-For", "").split(",")[0]
               or (request.client.host if request.client else "?"))
         print(f"🚨 Tentative login échouée — IP: {ip} — pwd: {'*'*len(password)}")
-        # ✅ Délai anti timing-attack (empêche de deviner si le mdp est proche)
         _time.sleep(0.5)
         raise HTTPException(401, "Mot de passe incorrect")
 
@@ -211,20 +188,13 @@ def reset_password(body: Dict[str, Any], db: Session = Depends(get_db)):
         raise HTTPException(403, "Code secret incorrect")
 
     cfg.admin_pwd = new_password
-
-    # Révoquer toutes les sessions patron — ✅ un seul commit
     try:
         db.execute(text("DELETE FROM admin_sessions WHERE role = 'patron'"))
     except Exception:
         pass
-
     db.commit()
     return {"ok": True, "message": "Mot de passe mis à jour"}
 
-
-# ── Dépendances FastAPI ───────────────────────────────────────
-# ✅ ensure_sessions_table() RETIRÉ d'ici — appelé au startup dans main.py
-# Chaque requête admin fait maintenant 1 seul appel DB au lieu de 2
 
 def require_auth(request: Request, db: Session = Depends(get_db)) -> str:
     token = _get_token(request)
