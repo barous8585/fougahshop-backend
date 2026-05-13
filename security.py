@@ -28,33 +28,45 @@ _blocked_ips:  dict = {}  # { ip: unblock_timestamp }
 # CONFIGURATION
 # ══════════════════════════════════════════════════════════════
 
-# Rate limiting général — fenêtre courte pour moins de RAM
-RATE_LIMIT_REQUESTS = 120        # max requêtes par fenêtre
-RATE_LIMIT_WINDOW   = 30         # ✅ 30s au lieu de 60s → 2× moins de RAM
+# Rate limiting général
+RATE_LIMIT_REQUESTS = 200        # max requêtes par fenêtre (augmenté — app SPA fait beaucoup de requêtes)
+RATE_LIMIT_WINDOW   = 60         # 60 secondes
 
-# Rate limiting strict (routes sensibles : paiement, commande)
-STRICT_RATE_REQUESTS = 20
-STRICT_RATE_WINDOW   = 30        # ✅ 30s
+# Rate limiting strict (routes sensibles : paiement, création commande)
+# ✅ CORRECTION : était 20/30s — trop restrictif pour une SPA
+# L'admin seul fait 5-10 requêtes au chargement + polling
+# Un client fait 3-5 requêtes par visite
+STRICT_RATE_REQUESTS = 60        # 60 requêtes (was 20 — trop bas)
+STRICT_RATE_WINDOW   = 60        # sur 60 secondes (was 30s — trop court)
 
-# Brute force login
-LOGIN_MAX_ATTEMPTS  = 5          # tentatives avant blocage
+# Brute force login — garder strict
+LOGIN_MAX_ATTEMPTS  = 5
 LOGIN_WINDOW        = 300        # 5 minutes
 LOGIN_BLOCK_SECONDS = 1800       # 30 minutes de blocage
 
-# Routes sensibles
+# Routes sensibles — RETIRER /api/commandes/ du strict
+# car /suivi/ et /historique/ sont des GET publics très fréquents
+# Garder strict seulement sur les routes d'écriture et d'auth
 STRICT_ROUTES = [
-    "/api/commandes/",
     "/api/auth/login",
     "/api/auth/logout",
     "/api/promos/verifier",
     "/api/parrainage/verifier",
 ]
 
+# Routes de création uniquement — limite plus stricte
+CREATE_ROUTES = [
+    "/api/commandes/annuler",
+]
+
+CREATE_RATE_REQUESTS = 10        # max 10 annulations / 60s par IP
+CREATE_RATE_WINDOW   = 60
+
 LOGIN_ROUTES = [
     "/api/auth/login",
 ]
 
-# IPs toujours autorisées (ton IP de dev)
+# IPs toujours autorisées (dev)
 WHITELIST = ["127.0.0.1", "::1"]
 
 # ══════════════════════════════════════════════════════════════
@@ -63,11 +75,9 @@ WHITELIST = ["127.0.0.1", "::1"]
 
 def get_client_ip(request: Request) -> str:
     """Récupère la vraie IP (derrière Cloudflare/Render proxy)."""
-    # Cloudflare envoie CF-Connecting-IP
     cf_ip = request.headers.get("CF-Connecting-IP")
     if cf_ip:
         return cf_ip.strip()
-    # Render envoie X-Forwarded-For
     forwarded = request.headers.get("X-Forwarded-For")
     if forwarded:
         return forwarded.split(",")[0].strip()
@@ -137,13 +147,29 @@ class SecurityMiddleware(BaseHTTPMiddleware):
                     headers={"Retry-After": str(LOGIN_BLOCK_SECONDS)},
                 )
 
-        # ── 5. Rate limiting strict (routes sensibles) ──
-        if any(path.startswith(r) for r in STRICT_ROUTES):
-            _request_log[f"strict:{ip}"] = clean_old_entries(
-                _request_log.get(f"strict:{ip}", []), STRICT_RATE_WINDOW
+        # ── 5. Rate limiting routes de création (annulation, etc.) ──
+        if any(path.startswith(r) for r in CREATE_ROUTES) and method == "POST":
+            key = f"create:{ip}"
+            _request_log[key] = clean_old_entries(
+                _request_log.get(key, []), CREATE_RATE_WINDOW
             )
-            _request_log[f"strict:{ip}"].append(time.time())
-            if len(_request_log[f"strict:{ip}"]) > STRICT_RATE_REQUESTS:
+            _request_log[key].append(time.time())
+            if len(_request_log[key]) > CREATE_RATE_REQUESTS:
+                print(f"⚠️  Rate limit création: {ip} sur {path}")
+                return JSONResponse(
+                    status_code=429,
+                    content={"detail": "Trop de requêtes. Ralentissez."},
+                    headers={"Retry-After": "60"},
+                )
+
+        # ── 6. Rate limiting strict (auth, promos, parrainage) ──
+        if any(path.startswith(r) for r in STRICT_ROUTES):
+            key = f"strict:{ip}"
+            _request_log[key] = clean_old_entries(
+                _request_log.get(key, []), STRICT_RATE_WINDOW
+            )
+            _request_log[key].append(time.time())
+            if len(_request_log[key]) > STRICT_RATE_REQUESTS:
                 print(f"⚠️  Rate limit strict: {ip} sur {path}")
                 return JSONResponse(
                     status_code=429,
@@ -151,10 +177,9 @@ class SecurityMiddleware(BaseHTTPMiddleware):
                     headers={"Retry-After": "60"},
                 )
 
-        # ── 6. Rate limiting général ──
+        # ── 7. Rate limiting général ──
         _request_log[ip] = clean_old_entries(_request_log[ip], RATE_LIMIT_WINDOW)
         _request_log[ip].append(time.time())
-        # ✅ Limiter la taille max pour éviter fuite mémoire
         if len(_request_log[ip]) > RATE_LIMIT_REQUESTS * 2:
             _request_log[ip] = _request_log[ip][-RATE_LIMIT_REQUESTS:]
         if len(_request_log[ip]) > RATE_LIMIT_REQUESTS:
@@ -165,7 +190,7 @@ class SecurityMiddleware(BaseHTTPMiddleware):
                 headers={"Retry-After": "60"},
             )
 
-        # ── 7. Traiter la requête ──
+        # ── 8. Traiter la requête ──
         response = await call_next(request)
         return self._add_security_headers(response)
 
@@ -177,7 +202,6 @@ class SecurityMiddleware(BaseHTTPMiddleware):
         response.headers["Referrer-Policy"]           = "strict-origin-when-cross-origin"
         response.headers["Permissions-Policy"]        = "geolocation=(), microphone=(), camera=()"
         response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
-        # CSP souple pour permettre Kkiapay et les CDN
         response.headers["Content-Security-Policy"] = (
             "default-src 'self' https:; "
             "script-src 'self' 'unsafe-inline' 'unsafe-eval' https:; "
@@ -194,15 +218,13 @@ class SecurityMiddleware(BaseHTTPMiddleware):
 # ══════════════════════════════════════════════════════════════
 
 async def cleanup_rate_limits():
-    """Nettoyer les logs toutes les heures."""
+    """Nettoyer les logs toutes les 15 minutes."""
     while True:
-        await asyncio.sleep(900)   # ✅ toutes les 15 min au lieu de 1h → libère RAM plus souvent
+        await asyncio.sleep(900)
         now = time.time()
-        # Nettoyer les IPs débloquées
         expired = [ip for ip, t in _blocked_ips.items() if now > t]
         for ip in expired:
             del _blocked_ips[ip]
-        # Nettoyer les logs anciens
         for key in list(_request_log.keys()):
             _request_log[key] = clean_old_entries(_request_log[key], RATE_LIMIT_WINDOW)
             if not _request_log[key]:
