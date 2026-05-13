@@ -5,7 +5,7 @@ from typing import Dict, Any
 import json
 import httpx
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime
 from database import get_db, SessionLocal
 from models import Config, PortKg, Employe
 from routes.auth import require_patron
@@ -33,7 +33,17 @@ DEFAULT_PORT = {
 
 ROLES_AUTORISES = ("employe", "logisticien")
 
-# ── Timestamp de dernière mise à jour du taux GNF ─────────────
+# ✅ Colonnes stat_ autorisées — mapping colonne → clé SQL
+# Utiliser un dict plutôt qu'un f-string pour éviter tout risque d'injection
+STAT_FIELDS_MAP = {
+    "stat_delai":  "stat_delai",
+    "stat_badge1": "stat_badge1",
+    "stat_badge2": "stat_badge2",
+    "stat_label1": "stat_label1",
+    "stat_label2": "stat_label2",
+    "stat_label3": "stat_label3",
+}
+
 _taux_gnf_last_update: datetime = datetime.min
 
 
@@ -71,10 +81,6 @@ def ensure_role_column(db):
 
 
 def ensure_tarifs_columns(db):
-    """
-    Migration automatique des colonnes optionnelles.
-    ✅ À appeler UNE SEULE FOIS au startup depuis main.py — pas à chaque requête.
-    """
     migrations = [
         "ALTER TABLE configs ADD COLUMN IF NOT EXISTS tarifs_unite TEXT DEFAULT NULL",
         "ALTER TABLE configs ADD COLUMN IF NOT EXISTS tarif_poids_kg FLOAT DEFAULT 12.0",
@@ -86,13 +92,9 @@ def ensure_tarifs_columns(db):
         "ALTER TABLE configs ADD COLUMN IF NOT EXISTS stat_label1 TEXT DEFAULT 'Authentique'",
         "ALTER TABLE configs ADD COLUMN IF NOT EXISTS stat_label2 TEXT DEFAULT 'Livraison'",
         "ALTER TABLE configs ADD COLUMN IF NOT EXISTS stat_label3 TEXT DEFAULT 'Frais cachés'",
-        # ✅ Nouveau : timestamp de dernière mise à jour du taux GNF
         "ALTER TABLE configs ADD COLUMN IF NOT EXISTS taux_gnf_updated_at TIMESTAMP DEFAULT NULL",
-        # ✅ Réduction filleul parrainage (FCFA) — configurable dans l'admin
         "ALTER TABLE configs ADD COLUMN IF NOT EXISTS reduction_parrainage FLOAT DEFAULT 1000.0",
-        # ✅ Gain parrain par filleul (FCFA) — configurable dans l'admin
         "ALTER TABLE configs ADD COLUMN IF NOT EXISTS gain_parrain FLOAT DEFAULT 500.0",
-        # ✅ Livraison locale (domicile) — configurable par pays
         "ALTER TABLE configs ADD COLUMN IF NOT EXISTS livraison_domicile TEXT DEFAULT NULL",
     ]
     for sql in migrations:
@@ -115,11 +117,10 @@ def ensure_tarifs_columns(db):
 
 
 # ══════════════════════════════════════════════════════════════
-# TAUX GNF — Mise à jour automatique depuis open.er-api.com
+# TAUX GNF
 # ══════════════════════════════════════════════════════════════
 
 async def fetch_taux_gnf_from_api() -> float | None:
-    """Récupère le taux EUR→GNF depuis open.er-api.com."""
     urls = [
         "https://open.er-api.com/v6/latest/EUR",
         "https://api.exchangerate-api.com/v4/latest/EUR",
@@ -129,9 +130,9 @@ async def fetch_taux_gnf_from_api() -> float | None:
             async with httpx.AsyncClient(timeout=10) as client:
                 resp = await client.get(url)
             if resp.status_code == 200:
-                data = resp.json()
+                data  = resp.json()
                 rates = data.get("rates") or data.get("conversion_rates") or {}
-                gnf = rates.get("GNF")
+                gnf   = rates.get("GNF")
                 if gnf and float(gnf) >= 1000:
                     print(f"[taux] EUR/GNF={gnf} depuis {url}")
                     return float(gnf)
@@ -141,10 +142,6 @@ async def fetch_taux_gnf_from_api() -> float | None:
 
 
 async def refresh_taux_gnf_en_base(db: Session) -> float | None:
-    """
-    Met à jour cfg.taux_gnf en base avec le taux live.
-    Retourne le nouveau taux ou None si l'API est inaccessible.
-    """
     global _taux_gnf_last_update
     gnf = await fetch_taux_gnf_from_api()
     if gnf:
@@ -165,10 +162,7 @@ async def refresh_taux_gnf_en_base(db: Session) -> float | None:
 
 
 async def auto_refresh_taux_gnf():
-    """
-    ✅ Tâche de fond — met à jour le taux GNF toutes les heures.
-    À lancer depuis main.py via asyncio.create_task(auto_refresh_taux_gnf())
-    """
+    """Tâche de fond — met à jour le taux GNF toutes les heures."""
     while True:
         try:
             db = SessionLocal()
@@ -180,14 +174,14 @@ async def auto_refresh_taux_gnf():
                 db.close()
             except Exception:
                 pass
-        # Attendre 1 heure avant la prochaine mise à jour
-        await asyncio.sleep(60)       # ✅ Toutes les minutes
+        # ✅ FIX : 3600 secondes (1 heure) — était 60s → 1440 appels/jour vers l'API externe !
+        await asyncio.sleep(3600)
 
 
 # ── Config publique ───────────────────────────────────────────
+
 @router.get("/public")
 def config_public(db: Session = Depends(get_db)):
-    # ✅ ensure_tarifs_columns() retiré d'ici — appelé au startup dans main.py
     cfg = get_config(db)
     ports = {
         p.pays: {
@@ -201,7 +195,7 @@ def config_public(db: Session = Depends(get_db)):
         row = db.execute(text(
             "SELECT tarifs_unite, tarif_poids_kg, operateurs_pays, numeros_paiement,"
             " stat_delai, stat_badge1, stat_badge2, stat_label1, stat_label2, stat_label3,"
-            " taux_gnf_updated_at"
+            " taux_gnf_updated_at, reduction_parrainage, gain_parrain, livraison_domicile"
             " FROM configs WHERE id = :id"
         ), {"id": cfg.id}).mappings().first() or {}
     except Exception:
@@ -227,31 +221,26 @@ def config_public(db: Session = Depends(get_db)):
         "label2": row.get("stat_label2") or "Livraison",
         "label3": row.get("stat_label3") or "Frais cachés",
     }
-
-    # ✅ Inclure le timestamp de mise à jour du taux GNF
     taux_gnf_updated_at = row.get("taux_gnf_updated_at")
 
     return {
-        "taux_change":           cfg.taux_change,
-        "commission":            cfg.commission,
-        "taux_gnf":              cfg.taux_gnf,
-        "taux_gnf_updated_at":   str(taux_gnf_updated_at) if taux_gnf_updated_at else None,
-        "wa_number":             cfg.wa_number,
-        "port_kg":               ports,
-        "tarifs_unite":          tarifs_unite,
-        "tarif_poids_kg":        tarif_poids_kg,
-        "operateurs_pays":       operateurs_pays,
-        "numeros_paiement":      numeros_paiement,
-        "stats_landing":         stats_landing,
-        # ✅ Paramètres parrainage configurables
-        "reduction_parrainage":  float(row.get("reduction_parrainage") or 1000),
-        "gain_parrain":          float(row.get("gain_parrain") or 500),
-        # ✅ Livraison locale configurable
-        "livraison_domicile":    json.loads(row.get("livraison_domicile") or "{}"),
+        "taux_change":          cfg.taux_change,
+        "commission":           cfg.commission,
+        "taux_gnf":             cfg.taux_gnf,
+        "taux_gnf_updated_at":  str(taux_gnf_updated_at) if taux_gnf_updated_at else None,
+        "wa_number":            cfg.wa_number,
+        "port_kg":              ports,
+        "tarifs_unite":         tarifs_unite,
+        "tarif_poids_kg":       tarif_poids_kg,
+        "operateurs_pays":      operateurs_pays,
+        "numeros_paiement":     numeros_paiement,
+        "stats_landing":        stats_landing,
+        "reduction_parrainage": float(row.get("reduction_parrainage") or 1000),
+        "gain_parrain":         float(row.get("gain_parrain") or 500),
+        "livraison_domicile":   parse_json(row.get("livraison_domicile")) or {},
     }
 
 
-# ── Endpoint manuel pour forcer le refresh du taux GNF ───────
 @router.post("/livraison-domicile")
 def save_livraison_domicile(
     body: Dict[str, Any],
@@ -293,17 +282,12 @@ async def refresh_taux_gnf(
     db: Session = Depends(get_db),
     role: str = Depends(require_patron)
 ):
-    """
-    ✅ Permet au patron de forcer une mise à jour immédiate du taux GNF
-    depuis le tableau de bord admin.
-    """
     gnf = await refresh_taux_gnf_en_base(db)
     if gnf:
         return {"ok": True, "taux_gnf": gnf, "message": f"Taux mis à jour : {gnf:.0f} GNF/€"}
     raise HTTPException(503, "API de taux indisponible — réessayez dans quelques secondes")
 
 
-# ── Mise à jour config globale ────────────────────────────────
 @router.put("/")
 def update_config(
     body: Dict[str, Any],
@@ -380,16 +364,13 @@ def update_config(
         except Exception:
             pass
 
-    # ✅ Stats landing — whitelist stricte, pas de f-string avec body[]
-    STAT_FIELDS = {
-        "stat_delai", "stat_badge1", "stat_badge2",
-        "stat_label1", "stat_label2", "stat_label3"
-    }
-    for field in STAT_FIELDS:
+    # ✅ FIX : stats landing sans f-string — utiliser un mapping de colonnes autorisées
+    for field, col in STAT_FIELDS_MAP.items():
         if field in body and body[field] is not None:
             try:
+                # col est une valeur de STAT_FIELDS_MAP, jamais saisie par l'utilisateur
                 db.execute(
-                    text(f"UPDATE configs SET {field} = :v WHERE id = :id"),
+                    text(f"UPDATE configs SET {col} = :v WHERE id = :id"),
                     {"v": str(body[field]).strip(), "id": cfg.id}
                 )
             except Exception:
