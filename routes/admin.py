@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.orm import Session
-from sqlalchemy import func
+from sqlalchemy import func, text
 from pydantic import BaseModel
 from typing import Optional
 import json, csv, io, re
@@ -48,10 +48,20 @@ STATUTS_PAR_ROLE = {
     "employe":     ["paye","achete"],
 }
 
+# ✅ FIX 1 : CAT_TARIF_UNITE défini ici — était utilisé mais jamais déclaré
+CAT_TARIF_UNITE = {
+    "smartphone":  "telephone",
+    "baskets":     "chaussures",
+    "bottes":      "chaussures",
+    "cosmetique":  "parfum",
+    "bijou":       "montre",
+    "montre":      "montre",
+    "parfum":      "parfum",
+    "chaussures":  "chaussures",
+}
+
 
 def ensure_archived_column(db: Session):
-    """✅ À appeler au startup — pas à chaque requête."""
-    from sqlalchemy import text
     try:
         db.execute(text("ALTER TABLE commandes ADD COLUMN IF NOT EXISTS archived BOOLEAN DEFAULT FALSE"))
         db.commit()
@@ -60,23 +70,14 @@ def ensure_archived_column(db: Session):
 
 
 def parse_cadeau(instructions: str) -> dict:
-    """
-    ✅ Extrait les infos cadeau depuis client_instructions.
-    Format : '🎁 CADEAU POUR: Mamadou | Tel:+224... | Payeur: ...'
-    Retourne un dict avec dest_nom, dest_tel, payeur_nom, payeur_tel
-    ou None si ce n'est pas une commande cadeau.
-    """
     if not instructions or "CADEAU POUR" not in instructions:
         return {}
     try:
         cadeau = {}
-        # Extraire nom destinataire
         m = re.search(r"CADEAU POUR:\s*([^|]+)", instructions)
         if m: cadeau["dest_nom"] = m.group(1).strip()
-        # Extraire tel destinataire
         m = re.search(r"Tel:([^\s|]+)", instructions)
         if m: cadeau["dest_tel"] = m.group(1).strip()
-        # Extraire payeur
         m = re.search(r"Payeur:\s*([^|]+)\s*\(([^)]+)\)", instructions)
         if m:
             cadeau["payeur_nom"] = m.group(1).strip()
@@ -90,10 +91,15 @@ def serialize_cmd(c):
     instructions = c.client_instructions or ""
     cadeau_info  = parse_cadeau(instructions)
 
-    # Nettoyer les instructions affichées (retirer le bloc cadeau technique)
     instructions_propres = re.sub(
         r"\s*\|?\s*🎁 CADEAU POUR:.*$", "", instructions, flags=re.DOTALL
     ).strip(" |")
+
+    # ✅ FIX 2 : json.loads protégé par try/catch
+    try:
+        articles = json.loads(c.articles) if c.articles else []
+    except Exception:
+        articles = []
 
     return {
         "id":                   c.id,
@@ -112,14 +118,13 @@ def serialize_cmd(c):
         "poids_estime":         c.poids_estime,
         "poids_reel":           c.poids_reel,
         "nb_articles":          c.nb_articles,
-        "articles":             json.loads(c.articles) if c.articles else [],
+        "articles":             articles,
         "note_admin":           c.note_admin,
         "delai_livraison":      c.delai_livraison,
         "paiement_ref":         c.paiement_ref,
         "suivi_num":            c.suivi_num,
         "motif_refus":          c.motif_refus,
         "created_at":           c.created_at,
-        # ✅ Champs cadeau dédiés — visibles clairement dans l'admin
         "is_cadeau":            bool(cadeau_info),
         "dest_nom":             cadeau_info.get("dest_nom"),
         "dest_tel":             cadeau_info.get("dest_tel"),
@@ -213,7 +218,7 @@ class StatutUpdate(BaseModel):
     delai_livraison: Optional[str]   = None
     suivi_num:       Optional[str]   = None
     motif_refus:     Optional[str]   = None
-    port_categorie:  Optional[str]   = None   # catégorie tarif unité choisie par l'admin
+    port_categorie:  Optional[str]   = None
 
 
 @router.patch("/commandes/{ref}/statut")
@@ -232,11 +237,10 @@ def update_statut(
         raise HTTPException(404, "Commande introuvable")
 
     cmd.statut = body.statut
-    port_local = 0  # ✅ Initialisé à 0 — mis à jour si poids_reel fourni
+    port_local = 0
 
     if body.note_admin:
         note_existante = (cmd.note_admin or "")[-1500:]
-        # ✅ Tronquer pour éviter dépassement de colonne
         cmd.note_admin = (note_existante + " | " + body.note_admin)[-2000:]
 
     if body.delai_livraison:
@@ -252,19 +256,17 @@ def update_statut(
         cmd.poids_reel = body.poids_reel
         cfg  = db.query(Config).first()
         from models import PortKg
-        from sqlalchemy import text as sqlt
         port = db.query(PortKg).filter(PortKg.pays == cmd.client_pays).first()
         port_kg = port.prix if port else 7000
 
-        # ✅ Calcul frais de port — catégorie choisie par l'admin OU détection automatique
         port_fcfa = 0
         try:
-            tarifs_row = db.execute(sqlt(
+            tarifs_row = db.execute(text(
                 "SELECT tarifs_unite FROM configs WHERE id = :id"
             ), {"id": cfg.id if cfg else 1}).mappings().first()
             tarifs_unite = json.loads(tarifs_row["tarifs_unite"]) if tarifs_row and tarifs_row.get("tarifs_unite") else []
 
-            # ✅ PRIORITÉ : catégorie choisie manuellement par l'admin dans la modal
+            # Priorité : catégorie choisie manuellement par l'admin
             if body.port_categorie and tarifs_unite:
                 def match_cat(nom, cat):
                     n = (nom or "").lower()
@@ -283,72 +285,68 @@ def update_statut(
                     port_fcfa = round(port_kg * body.poids_reel)
 
             else:
-                # Détection automatique depuis les articles de la commande
-                articles = json.loads(cmd.articles) if cmd.articles else []
-                categorie = (art.get("categorie") or "").lower().strip()
-                prix_eu   = float(art.get("prix_eu") or 0)
-                qty       = int(art.get("qty") or 1)
+                # ✅ FIX 3 : boucle for correcte sur les articles + CAT_TARIF_UNITE défini
+                try:
+                    articles = json.loads(cmd.articles) if cmd.articles else []
+                except Exception:
+                    articles = []
 
-                tarif_unite_trouve = None
+                for art in articles:
+                    categorie = (art.get("categorie") or "").lower().strip()
+                    prix_eu   = float(art.get("prix_eu") or 0)
+                    qty       = int(art.get("qty") or 1)
 
-                # 1. Chercher par catégorie (fiable)
-                nom_tarif = CAT_TARIF_UNITE.get(categorie)
+                    tarif_unite_trouve = None
 
-                # Cas spécial smartphone : iPhone (>800€) ou téléphone standard
-                if categorie == "smartphone":
-                    for tu in tarifs_unite:
-                        nom_tu = (tu.get("nom") or "").lower()
-                        note   = (tu.get("note") or "").replace(" ", "")
-                        if "iphone" in nom_tu or "haut de gamme" in nom_tu:
-                            # iPhone haut de gamme — vérifier seuil de prix
-                            if note.startswith(">"):
-                                try:
-                                    seuil = float(note.replace(">","").replace("€",""))
-                                    if prix_eu > seuil:
-                                        tarif_unite_trouve = tu
-                                        break
-                                except Exception:
-                                    pass
-                        elif "t" in nom_tu and "l" in nom_tu and "phone" in nom_tu:
-                            # Téléphone standard — fallback si pas iPhone
-                            if not tarif_unite_trouve:
-                                tarif_unite_trouve = tu
-                    # Si iPhone non trouvé, prendre le téléphone standard
-                    if not tarif_unite_trouve:
+                    # Mapping catégorie → mot-clé dans tarifs_unite
+                    nom_tarif = CAT_TARIF_UNITE.get(categorie)
+
+                    if categorie == "smartphone":
                         for tu in tarifs_unite:
                             nom_tu = (tu.get("nom") or "").lower()
-                            if "t" in nom_tu and "phone" in nom_tu:
+                            note   = (tu.get("note") or "").replace(" ", "")
+                            if "iphone" in nom_tu or "haut de gamme" in nom_tu:
+                                if note.startswith(">"):
+                                    try:
+                                        seuil = float(note.replace(">","").replace("€",""))
+                                        if prix_eu > seuil:
+                                            tarif_unite_trouve = tu
+                                            break
+                                    except Exception:
+                                        pass
+                            elif "phone" in nom_tu and "iphone" not in nom_tu:
+                                if not tarif_unite_trouve:
+                                    tarif_unite_trouve = tu
+                        if not tarif_unite_trouve:
+                            for tu in tarifs_unite:
+                                if "phone" in (tu.get("nom") or "").lower():
+                                    tarif_unite_trouve = tu
+                                    break
+
+                    elif nom_tarif and tarifs_unite:
+                        for tu in tarifs_unite:
+                            if nom_tarif in (tu.get("nom") or "").lower():
                                 tarif_unite_trouve = tu
                                 break
 
-                elif nom_tarif and tarifs_unite:
-                    for tu in tarifs_unite:
-                        nom_tu = (tu.get("nom") or "").lower()
-                        if nom_tarif in nom_tu:
-                            tarif_unite_trouve = tu
-                            break
+                    # Fallback : chercher par nom d'article
+                    if not tarif_unite_trouve and tarifs_unite:
+                        nom_art = (art.get("nom") or "").lower()
+                        for tu in tarifs_unite:
+                            nom_tu = (tu.get("nom") or "").lower()
+                            if nom_tu and nom_tu in nom_art:
+                                tarif_unite_trouve = tu
+                                break
 
-                # 2. Fallback : chercher par nom de l'article si catégorie non trouvée
-                if not tarif_unite_trouve and tarifs_unite:
-                    nom_art = (art.get("nom") or "").lower()
-                    for tu in tarifs_unite:
-                        nom_tu = (tu.get("nom") or "").lower()
-                        if nom_tu and nom_tu in nom_art:
-                            tarif_unite_trouve = tu
-                            break
-
-                if tarif_unite_trouve:
-                    # Tarif à l'unité en euros → convertir en FCFA
-                    taux_ch = cfg.taux_change if cfg else 660
-                    port_fcfa += round(float(tarif_unite_trouve.get("prix", 0)) * taux_ch * qty)
-                else:
-                    # Tarif au poids
-                    poids_art = float(art.get("poids") or 0.5) * qty
-                    port_fcfa += round(port_kg * poids_art)
+                    if tarif_unite_trouve:
+                        taux_ch = cfg.taux_change if cfg else 660
+                        port_fcfa += round(float(tarif_unite_trouve.get("prix", 0)) * taux_ch * qty)
+                    else:
+                        poids_art = float(art.get("poids") or 0.5) * qty
+                        port_fcfa += round(port_kg * poids_art)
 
         except Exception as e:
             print(f"[port] Erreur calcul tarif: {e}")
-            # Fallback : calcul au poids
             port_fcfa = round(port_kg * body.poids_reel)
 
         if port_fcfa == 0:
@@ -365,20 +363,17 @@ def update_statut(
 
     date_est = calculer_date_estimee(cmd.created_at, cmd.delai_livraison or "")
 
-    # ✅ WhatsApp — détecter mode cadeau pour contacter aussi le destinataire
     cadeau_info = parse_cadeau(cmd.client_instructions or "")
     STATUTS_WA  = {"paye","achete","expedie","arrive","paiement_refuse","annulee"}
 
     if body.statut in STATUTS_WA and cmd.client_tel:
-        # Récupérer infos livraison locale depuis la config
         livraison_info = {}
         try:
-            import json as _json
             livr_row = db.execute(text(
                 "SELECT livraison_domicile FROM configs WHERE id=1 LIMIT 1"
             )).fetchone()
             if livr_row and livr_row[0]:
-                livraison_info = _json.loads(livr_row[0])
+                livraison_info = json.loads(livr_row[0])
         except Exception:
             pass
 
@@ -393,14 +388,14 @@ def update_statut(
             livraison_info = livraison_info,
         )
         if wa_msg:
-            # Toujours envoyer au payeur (client_tel)
             envoyer_whatsapp(cmd.client_tel, wa_msg)
-            # ✅ Pour arrive et recupere — envoyer aussi au destinataire cadeau
             if cadeau_info.get("dest_tel") and body.statut in ("arrive", "recupere"):
-                msg_dest = f"📦 Bonjour {cadeau_info.get('dest_nom', '')} !\n\n" \
-                           f"Un colis vous est destiné — Réf: {cmd.ref}\n" \
-                           f"Statut : {STATUT_LABELS.get(body.statut, body.statut)}\n" \
-                           f"Veuillez contacter FougahShop pour le récupérer."
+                msg_dest = (
+                    f"📦 Bonjour {cadeau_info.get('dest_nom', '')} !\n\n"
+                    f"Un colis vous est destiné — Réf: {cmd.ref}\n"
+                    f"Statut : {STATUT_LABELS.get(body.statut, body.statut)}\n"
+                    f"Veuillez contacter FougahShop pour le récupérer."
+                )
                 envoyer_whatsapp(cadeau_info["dest_tel"], msg_dest)
 
     labels = {
@@ -424,7 +419,6 @@ def update_statut(
 
 
 # ── Archives ──────────────────────────────────────────────────
-# ✅ ensure_archived_column() appelé au startup — pas ici
 
 @router.post("/commandes/{ref}/archiver")
 def archiver_commande(ref: str, request: Request,
@@ -433,9 +427,8 @@ def archiver_commande(ref: str, request: Request,
     cmd = db.query(Commande).filter(Commande.ref == ref).first()
     if not cmd:
         raise HTTPException(404, "Commande introuvable")
-    from sqlalchemy import text as sqlt
     try:
-        db.execute(sqlt("UPDATE commandes SET archived = TRUE WHERE ref = :r"), {"r": ref})
+        db.execute(text("UPDATE commandes SET archived = TRUE WHERE ref = :r"), {"r": ref})
         db.commit()
     except Exception:
         db.rollback()
@@ -447,9 +440,8 @@ def archiver_commande(ref: str, request: Request,
 def desarchiver_commande(ref: str, request: Request,
                          db: Session = Depends(get_db),
                          role: str = Depends(require_auth)):
-    from sqlalchemy import text as sqlt
     try:
-        db.execute(sqlt("UPDATE commandes SET archived = FALSE WHERE ref = :r"), {"r": ref})
+        db.execute(text("UPDATE commandes SET archived = FALSE WHERE ref = :r"), {"r": ref})
         db.commit()
     except Exception:
         db.rollback()
@@ -460,9 +452,8 @@ def desarchiver_commande(ref: str, request: Request,
 @router.get("/commandes/archives")
 def liste_archives(request: Request, db: Session = Depends(get_db),
                    role: str = Depends(require_auth)):
-    from sqlalchemy import text as sqlt
     try:
-        rows = db.execute(sqlt(
+        rows = db.execute(text(
             "SELECT ref, client_nom, client_tel, client_pays, operateur, monnaie, "
             "total_local, total_euro, nb_articles, statut, created_at "
             "FROM commandes WHERE archived = TRUE ORDER BY created_at DESC"
@@ -485,12 +476,18 @@ def export_csv(request: Request, db: Session = Depends(get_db),
         "Détail articles","Cadeau","Destinataire","Tel destinataire"
     ])
     for c in cmds:
-        arts   = json.loads(c.articles) if c.articles else []
+        # ✅ FIX 4 : json.loads protégé — une commande corrompue ne fait plus planter le CSV
+        try:
+            arts = json.loads(c.articles) if c.articles else []
+        except Exception:
+            arts = []
         detail = " | ".join([
             f"{a['nom']} x{a.get('qty',1)} ({a.get('poids',0.5)}kg)"
             for a in arts
         ])
         cadeau = parse_cadeau(c.client_instructions or "")
+        # ✅ Note filtrée : retirer le contenu [PRIVE] de l'export
+        note_export = re.sub(r'\[PRIVE\].*', '', c.note_admin or '').strip(' |')
         w.writerow([
             c.ref,
             c.created_at.strftime("%d/%m/%Y %H:%M") if c.created_at else "",
@@ -500,8 +497,7 @@ def export_csv(request: Request, db: Session = Depends(get_db),
             c.nb_articles, STATUT_LABELS.get(c.statut, c.statut),
             c.delai_livraison or "",
             c.suivi_num or "",
-            c.note_admin or "", detail,
-            # ✅ Colonnes cadeau dans le CSV
+            note_export, detail,
             "Oui" if cadeau else "",
             cadeau.get("dest_nom", ""),
             cadeau.get("dest_tel", ""),
