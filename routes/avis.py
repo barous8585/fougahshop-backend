@@ -9,14 +9,11 @@ import json as _json
 
 router = APIRouter(tags=["avis"])
 
-# ══════════════════════════════════════════════════════════════
-# MIGRATION — colonnes manquantes
-# ══════════════════════════════════════════════════════════════
 
 def ensure_avis_columns(db: Session):
     """
     Ajoute toutes les colonnes manquantes de la table avis.
-    Appelée au startup depuis main.py ET à chaque POST /api/avis (sécurité).
+    ✅ Appelée UNIQUEMENT au startup depuis main.py — pas à chaque requête.
     """
     colonnes = [
         "ALTER TABLE avis ADD COLUMN IF NOT EXISTS client_tel    VARCHAR",
@@ -37,15 +34,13 @@ def ensure_avis_columns(db: Session):
             db.rollback()
 
 
-# ── Modèles Pydantic ──────────────────────────────────────────
-
 class AvisCreate(BaseModel):
     note:          int
     commentaire:   Optional[str]       = None
     client_tel:    Optional[str]       = None
     taille_retour: Optional[str]       = None
-    photo_url:     Optional[str]       = None   # compat 1 photo
-    photos_urls:   Optional[List[str]] = None   # jusqu'à 5 photos
+    photo_url:     Optional[str]       = None
+    photos_urls:   Optional[List[str]] = None
     client_nom:    Optional[str]       = None
     commande_ref:  Optional[str]       = None
 
@@ -53,8 +48,6 @@ class AvisCreate(BaseModel):
 class AvisReponse(BaseModel):
     reponse: Optional[str] = None
 
-
-# ── Helpers ───────────────────────────────────────────────────
 
 def _get_all_photos(body: AvisCreate) -> List[str]:
     if body.photos_urls:
@@ -80,8 +73,6 @@ def _parse_photos(row_dict: dict) -> List[str]:
     return []
 
 
-# ── Valider les données ───────────────────────────────────────
-
 def _valider_avis(body: AvisCreate):
     if not (1 <= body.note <= 5):
         raise HTTPException(400, "Note invalide (1-5)")
@@ -94,8 +85,6 @@ def _valider_avis(body: AvisCreate):
         if not url.startswith("https://"):
             raise HTTPException(400, "URL photo invalide")
 
-
-# ── Endpoints publics ─────────────────────────────────────────
 
 @router.get("/api/avis")
 def get_avis_public(db: Session = Depends(get_db)):
@@ -111,7 +100,6 @@ def get_avis_public(db: Session = Depends(get_db)):
             LIMIT 50
         """)).fetchall()
     except Exception:
-        # Si une colonne manque, retourner liste vide plutôt que crasher
         return []
 
     result = []
@@ -138,9 +126,8 @@ def get_avis_public(db: Session = Depends(get_db)):
 @router.post("/api/avis")
 def creer_avis(body: AvisCreate, db: Session = Depends(get_db)):
     _valider_avis(body)
-
-    # ✅ Migration à chaque appel — garantit que les colonnes existent
-    ensure_avis_columns(db)
+    # ✅ FIX : ensure_avis_columns retiré — inutile ici, déjà appelé au startup
+    # Faisait 9 ALTER TABLE à chaque soumission d'avis
 
     nom_client   = body.client_nom or "Client FougahShop"
     commande_ref = body.commande_ref or None
@@ -210,8 +197,6 @@ def marquer_utile(avis_id: int, db: Session = Depends(get_db)):
     db.commit()
     return {"ok": True}
 
-
-# ── Endpoints admin ───────────────────────────────────────────
 
 @router.get("/api/avis/admin")
 def get_avis_admin(db: Session = Depends(get_db), token: str = Depends(require_auth)):
