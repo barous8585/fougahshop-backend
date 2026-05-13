@@ -1,575 +1,218 @@
-from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.orm import Session
-from sqlalchemy import text
-from pydantic import BaseModel
-from typing import List, Optional
-from datetime import datetime
-import json
-from database import get_db
-from models import Commande, Config, PortKg
+"""
+security.py — Protections anti-hack pour FougahShop
+====================================================
+- Rate limiting par IP avec limites différenciées par type de route
+- Blocage brute force login
+- Headers de sécurité HTTP
+"""
 
-try:
-    from date_estimee import calculer_date_estimee
-except Exception:
-    def calculer_date_estimee(*a, **kw): return ""
+import time
+import asyncio
+from collections import defaultdict
+from fastapi import Request
+from fastapi.responses import JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
+import os
 
-router = APIRouter(prefix="/api/commandes", tags=["commandes"])
+# ══════════════════════════════════════════════════════════════
+# STOCKAGE EN MÉMOIRE
+# ══════════════════════════════════════════════════════════════
 
-try:
-    from routes.notifs import notifier_patron
-except Exception:
-    def notifier_patron(*a, **kw): pass
+_request_log: dict = defaultdict(list)
+_login_log:   dict = defaultdict(list)
+_blocked_ips: dict = {}  # { ip: unblock_timestamp }
 
-MONNAIES = {
-    "Burkina Faso":  {"symbole": "FCFA", "taux_base": 656},
-    "Guinée":        {"symbole": "GNF",  "taux_base": None},
-    "Cameroun":      {"symbole": "FCFA", "taux_base": 656},
-    "Bénin":         {"symbole": "FCFA", "taux_base": 656},
-    "Togo":          {"symbole": "FCFA", "taux_base": 656},
-    "Niger":         {"symbole": "FCFA", "taux_base": 656},
-    "Congo":         {"symbole": "FCFA", "taux_base": 656},
-    "Gabon":         {"symbole": "FCFA", "taux_base": 656},
-    "Sénégal":       {"symbole": "FCFA", "taux_base": 656},
-    "Mali":          {"symbole": "FCFA", "taux_base": 656},
-    "Côte d'Ivoire": {"symbole": "FCFA", "taux_base": 656},
-}
+# ══════════════════════════════════════════════════════════════
+# CONFIGURATION PAR TYPE DE ROUTE
+# ══════════════════════════════════════════════════════════════
 
-PALIERS_COMMISSION = [
-    {"max": 50,    "comm": 3500},
-    {"max": 100,   "comm": 5000},
-    {"max": 200,   "comm": 7000},
-    {"max": 500,   "comm": 12000},
-    {"max": 99999, "comm": 20000},
+# 1. Rate général — toutes routes confondues
+RATE_LIMIT_REQUESTS = 200
+RATE_LIMIT_WINDOW   = 60   # 200 req / 60s par IP
+
+# 2. Création de commande — POST /api/commandes/ uniquement
+#    Un client normal en crée 1-2 par session. 5 en 60s = très généreux.
+CREATE_COMMANDE_MAX    = 5
+CREATE_COMMANDE_WINDOW = 60
+
+# 3. Routes d'écriture sensibles (annulation, vérification promo/parrainage)
+WRITE_RATE_MAX    = 15
+WRITE_RATE_WINDOW = 60
+
+# 4. Historique — GET /api/commandes/historique/
+#    Appelé à la connexion + rafraîchissements. 30/60s suffisant.
+HISTORIQUE_MAX    = 30
+HISTORIQUE_WINDOW = 60
+
+# 5. Auth — brute force login
+LOGIN_MAX_ATTEMPTS  = 5
+LOGIN_WINDOW        = 300   # 5 minutes
+LOGIN_BLOCK_SECONDS = 1800  # 30 min de blocage
+
+# Routes par catégorie
+WRITE_ROUTES = [
+    "/api/commandes/annuler",
+    "/api/promos/verifier",
+    "/api/parrainage/verifier",
+    "/api/auth/logout",
 ]
 
+LOGIN_ROUTES = ["/api/auth/login"]
 
-def get_commission(total_euros: float) -> float:
-    for palier in PALIERS_COMMISSION:
-        if total_euros <= palier["max"]:
-            return palier["comm"]
-    return 20000
+WHITELIST = ["127.0.0.1", "::1"]
 
+# ══════════════════════════════════════════════════════════════
+# HELPERS
+# ══════════════════════════════════════════════════════════════
 
-def get_config(db):
-    cfg = db.query(Config).first()
-    if not cfg:
-        cfg = Config()
-        db.add(cfg)
-        db.commit()
-        db.refresh(cfg)
-    return cfg
-
-
-def get_port(db, pays):
-    p = db.query(PortKg).filter(PortKg.pays == pays).first()
-    return p.prix if p else 7000.0
+def get_client_ip(request: Request) -> str:
+    cf_ip = request.headers.get("CF-Connecting-IP")
+    if cf_ip:
+        return cf_ip.strip()
+    forwarded = request.headers.get("X-Forwarded-For")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
 
 
-def generate_ref(db) -> str:
-    year = datetime.now().year
-    prefix = f"CMD-{year}-"
-    result = db.execute(
-        text("""
-            SELECT COALESCE(MAX(CAST(SUBSTRING(ref FROM :pos) AS INTEGER)), 0) + 1
-            FROM commandes
-            WHERE ref LIKE :pattern
-        """),
-        {"pos": len(prefix) + 1, "pattern": f"{prefix}%"}
-    ).scalar()
-    return f"{prefix}{result:04d}"
+def clean_old(log: list, window: int) -> list:
+    now = time.time()
+    return [t for t in log if now - t < window]
 
 
-def calc_article_sans_port_ni_commission(prix_eu, qty, pays, cfg):
-    m         = MONNAIES.get(pays, {"symbole": "FCFA", "taux_base": 656})
-    taux_gnf  = cfg.taux_gnf   if (cfg.taux_gnf  and cfg.taux_gnf  >= 1000) else 9500
-    taux_fcfa = cfg.taux_change or 660
-
-    if m["symbole"] == "GNF":
-        taux_conv  = taux_gnf / 656
-        base_local = round(prix_eu * taux_gnf) * qty
-        base_fcfa  = round(prix_eu * taux_fcfa)
-    else:
-        taux_conv  = 1.0
-        base_fcfa  = round(prix_eu * taux_fcfa)
-        base_local = round(prix_eu * taux_fcfa) * qty
-
-    return {
-        "base_fcfa":   base_fcfa,
-        "total_local": base_local,
-        "monnaie":     m["symbole"],
-        "taux_conv":   taux_conv,
-    }
+def is_blocked(ip: str) -> bool:
+    if ip in _blocked_ips:
+        if time.time() < _blocked_ips[ip]:
+            return True
+        del _blocked_ips[ip]
+    return False
 
 
-def appliquer_promo(db, promo_code: str, total_local: float, taux_conv: float) -> float:
-    if not promo_code:
-        return total_local
-    try:
-        promo = db.execute(
-            text("SELECT * FROM promo_codes WHERE code=:code AND actif=TRUE LIMIT 1"),
-            {"code": promo_code.strip().upper()}
-        ).fetchone()
+def block_ip(ip: str, duration: int = LOGIN_BLOCK_SECONDS):
+    _blocked_ips[ip] = time.time() + duration
+    print(f"🚨 IP bloquée: {ip} pour {duration}s")
 
-        if not promo:
-            return total_local
 
-        expiry = getattr(promo, "expiry", None)
-        if expiry:
-            from datetime import date
-            exp_date = expiry if hasattr(expiry, "year") else None
-            if exp_date and exp_date < date.today():
-                return total_local
+def rate_check(key: str, max_req: int, window: int) -> bool:
+    """Retourne True si la limite est dépassée."""
+    _request_log[key] = clean_old(_request_log.get(key, []), window)
+    _request_log[key].append(time.time())
+    return len(_request_log[key]) > max_req
 
-        uses  = getattr(promo, "uses_count", 0)  or getattr(promo, "utilisations", 0) or 0
-        max_u = getattr(promo, "max_uses",   0)  or getattr(promo, "quota",        0) or 0
-        if max_u > 0 and uses >= max_u:
-            return total_local
 
-        type_promo = getattr(promo, "type", "fixe") or "fixe"
-        valeur     = getattr(promo, "valeur", None) or getattr(promo, "reduction_fcfa", 0) or 0
+# ══════════════════════════════════════════════════════════════
+# MIDDLEWARE
+# ══════════════════════════════════════════════════════════════
 
-        if type_promo == "livraison":
-            nouveau_total = total_local
-        elif type_promo == "pct":
-            reduction = round(total_local * float(valeur) / 100)
-            nouveau_total = max(0, total_local - reduction)
-        else:
-            reduction = round(float(valeur) * taux_conv)
-            nouveau_total = max(0, total_local - reduction)
+class SecurityMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        ip     = get_client_ip(request)
+        path   = request.url.path
+        method = request.method
 
-        incremente = False
-        try:
-            db.execute(
-                text("UPDATE promo_codes SET uses_count = COALESCE(uses_count,0) + 1 WHERE code=:code"),
-                {"code": promo_code.strip().upper()}
+        # OPTIONS → CORS preflight, toujours laisser passer
+        if method == "OPTIONS":
+            return await call_next(request)
+
+        # Whitelist dev
+        if ip in WHITELIST:
+            return self._sec(await call_next(request))
+
+        # IP bloquée
+        if is_blocked(ip):
+            remaining = int(_blocked_ips.get(ip, 0) - time.time())
+            return JSONResponse(
+                status_code=429,
+                content={"detail": f"Trop de tentatives. Réessayez dans {remaining//60} min."},
+                headers={"Retry-After": str(remaining)},
             )
-            db.flush()
-            incremente = True
-        except Exception:
-            pass
 
-        if not incremente:
-            try:
-                db.execute(
-                    text("UPDATE promo_codes SET utilisations = COALESCE(utilisations,0) + 1 WHERE code=:code"),
-                    {"code": promo_code.strip().upper()}
+        # ── Brute force login ──────────────────────────────────
+        if path == "/api/auth/login" and method == "POST":
+            _login_log[ip] = clean_old(_login_log[ip], LOGIN_WINDOW)
+            _login_log[ip].append(time.time())
+            if len(_login_log[ip]) > LOGIN_MAX_ATTEMPTS:
+                block_ip(ip)
+                print(f"🚨 Brute force login: {ip}")
+                return JSONResponse(
+                    status_code=429,
+                    content={"detail": "Trop de tentatives. Compte bloqué 30 min."},
+                    headers={"Retry-After": str(LOGIN_BLOCK_SECONDS)},
                 )
-                db.flush()
-            except Exception:
-                pass
 
-        return nouveau_total
+        # ── Création de commande ───────────────────────────────
+        # POST /api/commandes/ uniquement (pas /calculer, /suivi, /historique)
+        if path == "/api/commandes/" and method == "POST":
+            if rate_check(f"cmd_create:{ip}", CREATE_COMMANDE_MAX, CREATE_COMMANDE_WINDOW):
+                print(f"⚠️  Rate limit création commande: {ip}")
+                return JSONResponse(
+                    status_code=429,
+                    content={"detail": "Trop de commandes créées. Réessayez dans une minute."},
+                    headers={"Retry-After": "60"},
+                )
 
-    except Exception as e:
-        print(f"[promo] Erreur application code: {e}")
-        return total_local
+        # ── Routes d'écriture sensibles ────────────────────────
+        elif any(path.startswith(r) for r in WRITE_ROUTES) and method == "POST":
+            if rate_check(f"write:{ip}", WRITE_RATE_MAX, WRITE_RATE_WINDOW):
+                print(f"⚠️  Rate limit écriture: {ip} sur {path}")
+                return JSONResponse(
+                    status_code=429,
+                    content={"detail": "Trop de requêtes. Ralentissez."},
+                    headers={"Retry-After": "60"},
+                )
 
+        # ── Historique (énumération téléphones) ────────────────
+        elif path.startswith("/api/commandes/historique/"):
+            if rate_check(f"histo:{ip}", HISTORIQUE_MAX, HISTORIQUE_WINDOW):
+                print(f"⚠️  Rate limit historique: {ip}")
+                return JSONResponse(
+                    status_code=429,
+                    content={"detail": "Trop de requêtes. Réessayez dans une minute."},
+                    headers={"Retry-After": "60"},
+                )
 
-# ── Schemas ───────────────────────────────────────────────────
+        # ── Rate général ───────────────────────────────────────
+        if rate_check(ip, RATE_LIMIT_REQUESTS, RATE_LIMIT_WINDOW):
+            print(f"⚠️  Rate limit général: {ip}")
+            return JSONResponse(
+                status_code=429,
+                content={"detail": "Trop de requêtes. Réessayez dans une minute."},
+                headers={"Retry-After": "60"},
+            )
 
-class ArticleIn(BaseModel):
-    lien:                    str
-    nom:                     str
-    img:                     Optional[str]   = None
-    categorie:               Optional[str]   = None
-    taille:                  Optional[str]   = None
-    couleur:                 Optional[str]   = None
-    specs:                   Optional[str]   = None
-    prix_eu:                 float
-    frais_livraison_boutique: Optional[float] = 0.0
-    poids:                   float           = 0.5
-    qty:                     int             = 1
+        return self._sec(await call_next(request))
 
-
-class CommandeCreate(BaseModel):
-    client_nom:             str
-    client_tel:             str
-    client_pays:            str
-    client_adresse:         Optional[str]   = None
-    client_instructions:    Optional[str]   = None
-    operateur:              str
-    promo_code:             Optional[str]   = None
-    promo_type:             Optional[str]   = None
-    promo_valeur:           Optional[float] = None
-    code_parrainage:        Optional[str]   = None
-    reduction_parrainage:   Optional[float] = None
-    mode_paiement:          Optional[str]   = None
-    kkiapay_transaction_id: Optional[str]   = None
-    articles:               List[ArticleIn]
-    total_local_client:     Optional[float] = None
-    monnaie_client:         Optional[str]   = None
-    taux_utilise:           Optional[float] = None
-
-
-class CalculRequest(BaseModel):
-    prix_eu: float
-    poids:   float
-    pays:    str
-    qty:     int = 1
-
-
-class AnnulationBody(BaseModel):
-    ref:        str
-    client_tel: str
-    motif:      Optional[str] = None
-
-
-class KkiapayConfirmBody(BaseModel):
-    ref:            str
-    transaction_id: Optional[str] = None
-
-
-# ── Fonctions utilitaires ─────────────────────────────────────
-
-def _sanitize_url(url: str) -> str:
-    if not url:
-        return ""
-    url = url.strip()
-    lower = url.lower()
-    if lower.startswith("http://") or lower.startswith("https://"):
-        return url
-    return ""
-
-
-def _normaliser_tel(tel: str) -> str:
-    """Retourne uniquement les chiffres du numéro de téléphone."""
-    return ''.join(filter(str.isdigit, tel or ""))
-
-
-# ── Routes ────────────────────────────────────────────────────
-
-@router.post("/calculer")
-def calculer(body: CalculRequest, db: Session = Depends(get_db)):
-    cfg        = get_config(db)
-    detail     = calc_article_sans_port_ni_commission(body.prix_eu, body.qty, body.pays, cfg)
-    commission = get_commission(body.prix_eu * body.qty)
-    taux_conv  = detail["taux_conv"]
-    comm_local = round(commission * taux_conv)
-    port_fcfa  = get_port(db, body.pays)
-    port_local = round(port_fcfa * body.poids * taux_conv)
-    return {
-        "base_fcfa":       detail["base_fcfa"],
-        "commission":      commission,
-        "port_estime":     port_local,
-        "total_local":     detail["total_local"] + comm_local,
-        "total_avec_port": detail["total_local"] + comm_local + port_local,
-        "monnaie":         detail["monnaie"],
-    }
-
-
-@router.post("/", status_code=201)
-def creer_commande(body: CommandeCreate, db: Session = Depends(get_db)):
-    if not body.articles:
-        raise HTTPException(400, "Panier vide")
-
-    cfg       = get_config(db)
-    m         = MONNAIES.get(body.client_pays, {"symbole": "FCFA"})
-    port_info = db.query(PortKg).filter(PortKg.pays == body.client_pays).first()
-
-    articles_detail       = []
-    total_eu              = 0.0
-    total_local_sans_comm = 0.0
-    poids_total           = 0.0
-    taux_conv             = 1.0
-
-    for a in body.articles:
-        frais_b = float(getattr(a, 'frais_livraison_boutique', 0) or 0)
-        prix_total_eu = a.prix_eu + frais_b
-        detail = calc_article_sans_port_ni_commission(prix_total_eu, a.qty, body.client_pays, cfg)
-        articles_detail.append({
-            "lien":                     _sanitize_url(a.lien or ""),
-            "nom":                      a.nom,
-            "img":                      a.img,
-            "categorie":                a.categorie,
-            "taille":                   a.taille,
-            "couleur":                  a.couleur,
-            "specs":                    a.specs,
-            "prix_eu":                  a.prix_eu,
-            "frais_livraison_boutique": frais_b,
-            "poids":                    a.poids,
-            "qty":                      a.qty,
-            "total_local":              detail["total_local"],
-            "monnaie":                  detail["monnaie"],
-        })
-        total_eu              += prix_total_eu * a.qty
-        total_local_sans_comm += detail["total_local"]
-        poids_total           += a.poids * a.qty
-        taux_conv              = detail["taux_conv"]
-
-    commission_fcfa   = get_commission(total_eu)
-    commission_locale = round(commission_fcfa * taux_conv)
-    total_local       = total_local_sans_comm + commission_locale
-
-    if body.promo_code:
-        total_local = appliquer_promo(db, body.promo_code, total_local, taux_conv)
-
-    if body.code_parrainage:
-        try:
-            code_p = body.code_parrainage.upper().strip()
-            parrain = db.execute(
-                text("SELECT parrain_tel FROM parrainage_codes WHERE code=:c AND actif=TRUE"),
-                {"c": code_p}
-            ).mappings().first()
-            if parrain and parrain["parrain_tel"] != body.client_tel:
-                deja = db.execute(
-                    text("SELECT 1 FROM parrainage_utilisations WHERE code=:c AND filleul_tel=:t"),
-                    {"c": code_p, "t": body.client_tel}
-                ).fetchone()
-                if not deja:
-                    gain = float(body.reduction_parrainage or 1000) * 0.5
-                    db.execute(text(
-                        "INSERT INTO parrainage_utilisations "
-                        "(code, filleul_tel, filleul_nom, commande_ref, reduction_appliquee) "
-                        "VALUES (:c, :t, :n, :r, :red)"
-                    ), {"c": code_p, "t": body.client_tel, "n": body.client_nom,
-                        "r": "", "red": body.reduction_parrainage or 1000})
-                    db.execute(text(
-                        "UPDATE parrainage_codes "
-                        "SET nb_filleuls=nb_filleuls+1, credit_total=credit_total+:g "
-                        "WHERE code=:c"
-                    ), {"g": gain, "c": code_p})
-                    db.commit()
-        except Exception as e:
-            print(f"[parrainage] Erreur: {e}")
-            db.rollback()
-
-    if body.total_local_client and body.total_local_client > 0:
-        total_local = round(body.total_local_client)
-    if body.monnaie_client:
-        m = {"symbole": body.monnaie_client}
-
-    statut_initial = "paye" if body.mode_paiement == "kkiapay" else "en_attente_paiement"
-
-    note_auto = None
-    if body.mode_paiement == "kkiapay" and body.kkiapay_transaction_id:
-        note_auto = f"[KKIAPAY] Transaction: {body.kkiapay_transaction_id}"
-
-    commande = Commande(
-        ref              = generate_ref(db),
-        client_nom       = body.client_nom,
-        client_tel       = body.client_tel,
-        client_pays      = body.client_pays,
-        client_adresse   = body.client_adresse,
-        client_instructions = body.client_instructions,
-        operateur        = body.operateur,
-        monnaie          = m["symbole"],
-        total_euro       = round(total_eu, 2),
-        total_local      = round(total_local),
-        poids_estime     = round(poids_total, 2),
-        articles         = json.dumps(articles_detail, ensure_ascii=False),
-        nb_articles      = len(body.articles),
-        statut           = statut_initial,
-        delai_livraison  = port_info.delai if port_info else "—",
-        note_admin       = note_auto,
-        promo_code       = body.promo_code,
-    )
-    db.add(commande)
-    db.commit()
-    db.refresh(commande)
-
-    if body.code_parrainage:
-        try:
-            db.execute(text(
-                "UPDATE parrainage_utilisations SET commande_ref=:r "
-                "WHERE code=:c AND filleul_tel=:t AND commande_ref=''"
-            ), {"r": commande.ref, "c": body.code_parrainage.upper().strip(),
-                "t": body.client_tel})
-            db.commit()
-        except Exception:
-            pass
-
-    mode_label = "💳 Kkiapay ✅" if body.mode_paiement == "kkiapay" else "📱 Virement manuel"
-    notifier_patron(
-        db,
-        "🛍️ Nouvelle commande" + (" — PAYÉE ✅" if statut_initial == "paye" else ""),
-        f"{commande.client_nom} · {commande.ref} · "
-        f"{round(commande.total_local or 0):,} {commande.monnaie or 'FCFA'} · {mode_label}",
-        commande.ref
-    )
-    db.commit()
-
-    return {
-        "ref":         commande.ref,
-        "total_local": commande.total_local,
-        "total_euro":  commande.total_euro,
-        "monnaie":     commande.monnaie,
-        "nb_articles": commande.nb_articles,
-        "statut":      commande.statut,
-    }
-
-
-@router.post("/confirmer-kkiapay")
-def confirmer_kkiapay(body: KkiapayConfirmBody, db: Session = Depends(get_db)):
-    ref = body.ref.strip().upper()
-    cmd = db.query(Commande).filter(Commande.ref == ref).first()
-    if not cmd:
-        raise HTTPException(404, "Commande introuvable")
-    if cmd.statut == "paye":
-        return {"ok": True, "ref": cmd.ref, "statut": cmd.statut, "already_paid": True}
-    cmd.statut = "paye"
-    note = "[KKIAPAY] Paiement confirmé automatiquement"
-    if body.transaction_id:
-        note += f" — Transaction: {body.transaction_id}"
-    cmd.note_admin = (cmd.note_admin or "") + " | " + note if cmd.note_admin else note
-    db.commit()
-    try:
-        notifier_patron(
-            db, "✅ Paiement Kkiapay confirmé",
-            f"{cmd.ref} · {cmd.client_nom} · "
-            f"{round(cmd.total_local or 0):,} {cmd.monnaie or 'FCFA'}",
-            cmd.ref
+    def _sec(self, response):
+        response.headers["X-Content-Type-Options"]    = "nosniff"
+        response.headers["X-Frame-Options"]           = "DENY"
+        response.headers["X-XSS-Protection"]          = "1; mode=block"
+        response.headers["Referrer-Policy"]           = "strict-origin-when-cross-origin"
+        response.headers["Permissions-Policy"]        = "geolocation=(), microphone=(), camera=()"
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self' https:; "
+            "script-src 'self' 'unsafe-inline' 'unsafe-eval' https:; "
+            "style-src 'self' 'unsafe-inline' https:; "
+            "img-src 'self' data: https:; "
+            "connect-src 'self' https:; "
+            "frame-src https://kkiapay.me https://*.kkiapay.me;"
         )
-    except Exception:
-        pass
-    return {"ok": True, "ref": cmd.ref, "statut": "paye"}
+        return response
 
 
-@router.get("/suivi/{ref}")
-def suivi(ref: str, db: Session = Depends(get_db)):
-    cmd = db.query(Commande).filter(Commande.ref == ref.upper()).first()
-    if not cmd:
-        raise HTTPException(404, "Commande introuvable")
-    return {
-        "ref":             cmd.ref,
-        "statut":          cmd.statut,
-        "client_nom":      cmd.client_nom,
-        "client_tel":      cmd.client_tel,
-        "nb_articles":     cmd.nb_articles,
-        "total_local":     cmd.total_local,
-        "monnaie":         cmd.monnaie,
-        "poids_estime":    cmd.poids_estime,
-        "poids_reel":      cmd.poids_reel,
-        "delai_livraison": cmd.delai_livraison,
-        "articles":        json.loads(cmd.articles) if cmd.articles else [],
-        "note_admin":      cmd.note_admin,
-        "suivi_num":       getattr(cmd, "suivi_num", None),
-        "motif_refus":     getattr(cmd, "motif_refus", None),
-        "promo_code":      getattr(cmd, "promo_code", None),
-        "created_at":      cmd.created_at,
-        "date_estimee":    calculer_date_estimee(cmd.created_at, cmd.delai_livraison or ""),
-    }
+# ══════════════════════════════════════════════════════════════
+# NETTOYAGE PÉRIODIQUE
+# ══════════════════════════════════════════════════════════════
 
-
-@router.get("/historique/{tel}")
-def historique(tel: str, db: Session = Depends(get_db)):
-    # ✅ CORRECTION : normaliser les deux côtés — chiffres uniquement
-    # Problème précédent : le client stockait "+224 627 19 64 19" (avec espaces)
-    # mais la recherche envoyait "+22462719 6419" (espaces supprimés différemment)
-    # Le LIKE ne matchait pas car les espaces étaient à des positions différentes.
-    # Solution : comparer uniquement les chiffres des deux côtés via REGEXP_REPLACE en SQL.
-
-    tel_chiffres = _normaliser_tel(tel)
-
-    if len(tel_chiffres) < 8:
-        raise HTTPException(404, "Numéro trop court")
-
-    # On garde les 9 derniers chiffres pour éviter les problèmes d'indicatif
-    # ex: "22462719 6419" → on cherche les 9 derniers chiffres "627196419"
-    suffixe = tel_chiffres[-9:]
-
-    cmds = []
-
-    # ── Tentative 1 : REGEXP_REPLACE (PostgreSQL) ─────────────
-    # Supprime tout ce qui n'est pas un chiffre dans client_tel avant de comparer
-    try:
-        rows = db.execute(text("""
-            SELECT * FROM commandes
-            WHERE REGEXP_REPLACE(client_tel, '[^0-9]', '', 'g') LIKE :pattern
-            ORDER BY created_at DESC
-        """), {"pattern": f"%{suffixe}%"}).mappings().all()
-        cmds = list(rows)
-    except Exception as e:
-        print(f"[historique] REGEXP_REPLACE non supporté, fallback REPLACE: {e}")
-
-    # ── Tentative 2 : REPLACE triple (fallback) ───────────────
-    if not cmds:
-        try:
-            rows = db.execute(text("""
-                SELECT * FROM commandes
-                WHERE REPLACE(REPLACE(REPLACE(REPLACE(client_tel, ' ', ''), '+', ''), '-', ''), '.', '')
-                      LIKE :pattern
-                ORDER BY created_at DESC
-            """), {"pattern": f"%{suffixe}%"}).mappings().all()
-            cmds = list(rows)
-        except Exception as e:
-            print(f"[historique] REPLACE fallback échoué: {e}")
-
-    # ── Tentative 3 : contains brut (dernier recours) ─────────
-    if not cmds:
-        tel_clean = tel.replace(" ", "").replace("+", "").replace("-", "")
-        cmds_orm = db.query(Commande).filter(
-            Commande.client_tel.contains(tel_clean)
-        ).order_by(Commande.created_at.desc()).all()
-        # Convertir en mappings-like pour uniformité
-        cmds = [
-            {col.name: getattr(c, col.name) for col in Commande.__table__.columns}
-            for c in cmds_orm
-        ]
-
-    if not cmds:
-        raise HTTPException(404, "Aucune commande trouvée")
-
-    result = []
-    for c in cmds:
-        # Compatibilité dict (mappings SQL) et objet ORM
-        def g(key):
-            if isinstance(c, dict):
-                return c.get(key)
-            return getattr(c, key, None)
-
-        created = g("created_at")
-        delai   = g("delai_livraison") or ""
-        result.append({
-            "ref":             g("ref"),
-            "statut":          g("statut"),
-            "nb_articles":     g("nb_articles"),
-            "total_local":     g("total_local"),
-            "monnaie":         g("monnaie"),
-            "delai_livraison": delai,
-            "note_admin":      g("note_admin"),
-            "client_nom":      g("client_nom"),
-            "client_tel":      g("client_tel"),
-            "created_at":      created,
-            "date_estimee":    calculer_date_estimee(created, delai),
-        })
-
-    return result
-
-
-@router.post("/annuler")
-def annuler_commande(body: AnnulationBody, db: Session = Depends(get_db)):
-    ref = body.ref.strip().upper()
-    cmd = db.query(Commande).filter(Commande.ref == ref).first()
-    if not cmd:
-        raise HTTPException(404, "Commande introuvable")
-
-    # ✅ Utiliser la même normalisation pour la vérification du téléphone
-    tel_chiffres     = _normaliser_tel(body.client_tel)
-    cmd_tel_chiffres = _normaliser_tel(cmd.client_tel or "")
-
-    if len(tel_chiffres) < 8 or tel_chiffres[-8:] not in cmd_tel_chiffres:
-        raise HTTPException(403, "Numéro de téléphone incorrect")
-
-    STATUTS_ANNULABLES = ["en_attente_paiement", "paye"]
-    if cmd.statut not in STATUTS_ANNULABLES:
-        raise HTTPException(400, f"Annulation impossible — statut actuel : {cmd.statut}")
-
-    ancien_statut = cmd.statut
-    cmd.statut    = "annulee"
-    note          = f"[ANNULATION CLIENT] Tel: {body.client_tel}"
-    if body.motif:
-        note += f" | Motif: {body.motif}"
-    note_existante = (cmd.note_admin or "")[-500:]
-    cmd.note_admin = (note_existante + " | " + note)[-1000:] if note_existante else note[:1000]
-    db.commit()
-
-    try:
-        notifier_patron(
-            db, "❌ Demande d'annulation",
-            f"{cmd.ref} · {cmd.client_nom} · {cmd.client_pays} · Ancien statut: {ancien_statut}",
-            cmd.ref
-        )
-    except Exception:
-        pass
-
-    return {"ok": True, "ref": cmd.ref, "statut": "annulee"}
+async def cleanup_rate_limits():
+    while True:
+        await asyncio.sleep(900)  # toutes les 15 min
+        now = time.time()
+        expired = [ip for ip, t in _blocked_ips.items() if now > t]
+        for ip in expired:
+            del _blocked_ips[ip]
+        for key in list(_request_log.keys()):
+            _request_log[key] = clean_old(_request_log[key], RATE_LIMIT_WINDOW)
+            if not _request_log[key]:
+                del _request_log[key]
+        print(f"🧹 Rate limits nettoyés — {len(_blocked_ips)} IPs bloquées")
