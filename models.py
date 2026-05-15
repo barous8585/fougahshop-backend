@@ -4,7 +4,6 @@ from database import Base
 
 
 class Config(Base):
-    # ✅ CORRIGÉ — 'configs' (pluriel) aligné avec les requêtes SQL dans config.py
     __tablename__ = "configs"
 
     id           = Column(Integer, primary_key=True, default=1)
@@ -14,9 +13,10 @@ class Config(Base):
     wa_number    = Column(String,  default="33651727112")
     admin_pwd    = Column(String,  default="admin123")
     secret_reset = Column(String,  default="fougah2026")
-    # Colonnes étendues — ajoutées via migration SQL dans config.py au startup
-    # Déclarées ici pour que SQLAlchemy les connaisse après la première migration
-    # nullable=True + server_default pour éviter le crash si la colonne n'existe pas encore
+    # ── 2FA TOTP (Point 2) ──────────────────────────────────────
+    # Ajouté via migration ALTER TABLE dans auth.py au startup
+    totp_secret  = Column(String,  nullable=True)   # secret base32 pyotp
+    totp_enabled = Column(Boolean, default=False)   # True = 2FA active pour le patron
 
 
 class PortKg(Base):
@@ -63,7 +63,6 @@ class Commande(Base):
     note_admin          = Column(Text,    nullable=True)
     delai_livraison     = Column(String,  nullable=True)
     promo_code          = Column(String,  nullable=True)
-    # ✅ Déclarés ici — plus de getattr() fragile dans admin.py
     suivi_num           = Column(String,  nullable=True)
     motif_refus         = Column(Text,    nullable=True)
     archived            = Column(Boolean, default=False, nullable=True)
@@ -76,25 +75,16 @@ class PromoCode(Base):
 
     id               = Column(Integer, primary_key=True, autoincrement=True)
     code             = Column(String,  unique=True, index=True)
-
-    # ✅ CORRIGÉ — structure alignée avec promo.py (raw SQL)
-    # Anciens champs conservés pour rétro-compat
     influenceur      = Column(String,  nullable=True)
-    gain_influenceur = Column(Float,   default=0.0)   # gain par commande en FCFA
-
-    # Nouveaux champs (utilisés par promo.py)
-    type             = Column(String,  default="fixe")  # 'fixe' | 'pct'
-    valeur           = Column(Float,   default=0.0)     # montant FCFA ou %
-    reduction_fcfa   = Column(Float,   default=0.0)     # alias rétro-compat
-
-    client_tel       = Column(String,  nullable=True)   # NULL = tous les clients
-    max_uses         = Column(Integer, default=0)       # 0 = illimité
-    uses_count       = Column(Integer, default=0)       # ✅ nouveau compteur
-
-    # Anciens champs — conservés pour ne pas casser les données existantes
-    quota            = Column(Integer, default=0)       # alias de max_uses
-    utilisations     = Column(Integer, default=0)       # alias de uses_count
-
+    gain_influenceur = Column(Float,   default=0.0)
+    type             = Column(String,  default="fixe")
+    valeur           = Column(Float,   default=0.0)
+    reduction_fcfa   = Column(Float,   default=0.0)
+    client_tel       = Column(String,  nullable=True)
+    max_uses         = Column(Integer, default=0)
+    uses_count       = Column(Integer, default=0)
+    quota            = Column(Integer, default=0)
+    utilisations     = Column(Integer, default=0)
     note             = Column(String,  nullable=True)
     expiry           = Column(Date,    nullable=True)
     actif            = Column(Boolean, default=True)
@@ -113,7 +103,6 @@ class Avis(Base):
     reponse       = Column(Text,    nullable=True)
     visible       = Column(Boolean, default=True)
     created_at    = Column(DateTime, server_default=func.now())
-    # ✅ Nouveaux champs Cloudinary
     client_tel    = Column(String,  nullable=True)
     taille_retour = Column(String,  nullable=True)
     photo_url     = Column(String,  nullable=True)
