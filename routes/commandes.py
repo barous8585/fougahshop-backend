@@ -112,8 +112,11 @@ def appliquer_promo(db, promo_code: str, total_local: float, taux_conv: float) -
     if not promo_code:
         return total_local
     try:
+        # ── SELECT FOR UPDATE — verrou atomique anti race condition (Point 3) ──
+        # Deux requêtes simultanées avec le même code ne peuvent pas
+        # toutes les deux passer la vérification du quota en même temps.
         promo = db.execute(
-            text("SELECT * FROM promo_codes WHERE code=:code AND actif=TRUE LIMIT 1"),
+            text("SELECT * FROM promo_codes WHERE code=:code AND actif=TRUE LIMIT 1 FOR UPDATE"),
             {"code": promo_code.strip().upper()}
         ).fetchone()
 
@@ -144,6 +147,7 @@ def appliquer_promo(db, promo_code: str, total_local: float, taux_conv: float) -
             reduction = round(float(valeur) * taux_conv)
             nouveau_total = max(0, total_local - reduction)
 
+        # Incrémenter uses_count de façon atomique (le verrou est encore actif)
         incremente = False
         try:
             db.execute(
