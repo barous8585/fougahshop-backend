@@ -8,7 +8,7 @@ import asyncio
 from datetime import datetime
 from database import get_db, SessionLocal
 from models import Config, PortKg, Employe
-from routes.auth import require_patron, PWD_MIN_LENGTH
+from routes.auth import require_patron, PWD_MIN_LENGTH, hash_password, verify_password
 
 router = APIRouter(prefix="/api/config", tags=["config"])
 
@@ -307,7 +307,7 @@ def update_config(
                 400,
                 f"Mot de passe trop court (minimum {PWD_MIN_LENGTH} caractères)"
             )
-        cfg.admin_pwd = new_pwd
+        cfg.admin_pwd = hash_password(new_pwd)
 
     if "tarifs_unite" in body:
         tu = body["tarifs_unite"]
@@ -476,7 +476,7 @@ def create_employe(
     if emp_role not in ROLES_AUTORISES:
         emp_role = "employe"
 
-    e = Employe(nom=nom, pwd=pwd)
+    e = Employe(nom=nom, pwd=hash_password(pwd))
     db.add(e)
     db.commit()
     db.refresh(e)
