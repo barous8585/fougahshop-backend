@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 from pydantic import BaseModel
@@ -41,6 +41,13 @@ PALIERS_COMMISSION = [
     {"max": 500,   "comm": 12000},
     {"max": 99999, "comm": 20000},
 ]
+
+# ── Tolérance de validation du total client (Point 1) ─────────
+# On accepte un écart de ±5% entre le total calculé serveur et le total
+# envoyé par le client. Au-delà → on utilise silencieusement le total serveur.
+# Mettre à False pour rejeter complètement (HTTPException 400) si l'écart dépasse.
+TOTAL_VALIDATION_WARN_ONLY = True
+TOTAL_TOLERANCE_PCT        = 5  # %
 
 
 def get_commission(total_euros: float) -> float:
@@ -196,7 +203,7 @@ class CommandeCreate(BaseModel):
     mode_paiement:          Optional[str]   = None
     kkiapay_transaction_id: Optional[str]   = None
     articles:               List[ArticleIn]
-    total_local_client:     Optional[float] = None
+    total_local_client:     Optional[float] = None  # envoyé par le client, ignoré si hors tolérance
     monnaie_client:         Optional[str]   = None
     taux_utilise:           Optional[float] = None
 
@@ -232,8 +239,84 @@ def _sanitize_url(url: str) -> str:
 
 
 def _normaliser_tel(tel: str) -> str:
-    """Retourne uniquement les chiffres du numéro de téléphone."""
     return ''.join(filter(str.isdigit, tel or ""))
+
+
+# ── Point 1 : validation du total côté serveur ───────────────
+
+def _calculer_total_serveur(
+    articles: List[ArticleIn],
+    pays: str,
+    cfg,
+    promo_code: Optional[str],
+    db,
+) -> tuple[float, float, float, float, str]:
+    """
+    Recalcule entièrement le total à partir des données serveur.
+    Retourne (total_local, total_eu, poids_total, taux_conv, monnaie_symbole).
+    Le client n'a AUCUNE influence sur ce calcul.
+    """
+    m = MONNAIES.get(pays, {"symbole": "FCFA", "taux_base": 656})
+    total_local_sans_comm = 0.0
+    total_eu              = 0.0
+    poids_total           = 0.0
+    taux_conv             = 1.0
+
+    for a in articles:
+        frais_b       = float(getattr(a, 'frais_livraison_boutique', 0) or 0)
+        prix_total_eu = a.prix_eu + frais_b
+        detail        = calc_article_sans_port_ni_commission(prix_total_eu, a.qty, pays, cfg)
+        total_eu              += prix_total_eu * a.qty
+        total_local_sans_comm += detail["total_local"]
+        poids_total           += a.poids * a.qty
+        taux_conv              = detail["taux_conv"]
+
+    commission_fcfa   = get_commission(total_eu)
+    commission_locale = round(commission_fcfa * taux_conv)
+    total_local       = total_local_sans_comm + commission_locale
+
+    if promo_code:
+        total_local = appliquer_promo(db, promo_code, total_local, taux_conv)
+
+    return total_local, total_eu, poids_total, taux_conv, m["symbole"]
+
+
+def _valider_total(total_serveur: float, total_client: Optional[float]) -> float:
+    """
+    Compare le total calculé serveur avec celui envoyé par le client.
+    - Si total_client est absent ou nul → on utilise total_serveur (sans bruit).
+    - Si l'écart est dans la tolérance → on utilise total_serveur (le client avait raison).
+    - Si l'écart dépasse la tolérance :
+        * TOTAL_VALIDATION_WARN_ONLY=True  → log + utilise total_serveur silencieusement
+        * TOTAL_VALIDATION_WARN_ONLY=False → HTTPException 400
+    Retourne toujours le total à enregistrer en base.
+    """
+    if not total_client or total_client <= 0:
+        return total_serveur
+
+    ecart_pct = abs(total_serveur - total_client) / max(total_serveur, 1) * 100
+
+    if ecart_pct <= TOTAL_TOLERANCE_PCT:
+        # Dans la tolérance — on garde le total serveur (plus fiable)
+        return total_serveur
+
+    # Écart anormal
+    msg = (
+        f"[VALIDATION TOTAL] Écart détecté : "
+        f"serveur={total_serveur:.0f} / client={total_client:.0f} "
+        f"({ecart_pct:.1f}%) — total serveur utilisé."
+    )
+    print(msg)
+
+    if not TOTAL_VALIDATION_WARN_ONLY:
+        raise HTTPException(
+            400,
+            f"Montant incohérent (écart {ecart_pct:.0f}%). "
+            "Rechargez la page et réessayez."
+        )
+
+    # Mode warn-only : on enregistre le total serveur sans bloquer
+    return total_serveur
 
 
 # ── Routes ────────────────────────────────────────────────────
@@ -263,15 +346,22 @@ def creer_commande(body: CommandeCreate, db: Session = Depends(get_db)):
         raise HTTPException(400, "Panier vide")
 
     cfg       = get_config(db)
-    m         = MONNAIES.get(body.client_pays, {"symbole": "FCFA"})
     port_info = db.query(PortKg).filter(PortKg.pays == body.client_pays).first()
 
-    articles_detail       = []
-    total_eu              = 0.0
-    total_local_sans_comm = 0.0
-    poids_total           = 0.0
-    taux_conv             = 1.0
+    # ── Point 1 : calcul serveur autoritaire ─────────────────
+    total_local_serveur, total_eu, poids_total, taux_conv, monnaie_symbole = (
+        _calculer_total_serveur(body.articles, body.client_pays, cfg, body.promo_code, db)
+    )
 
+    # Validation + éventuelle correction silencieuse
+    total_local = _valider_total(total_local_serveur, body.total_local_client)
+
+    # Monnaie : on accepte la monnaie client UNIQUEMENT si elle correspond au pays
+    m_attendue = MONNAIES.get(body.client_pays, {"symbole": "FCFA"})["symbole"]
+    monnaie    = m_attendue  # toujours basé sur le pays, jamais sur le client
+
+    # Construire le détail articles pour la sauvegarde
+    articles_detail = []
     for a in body.articles:
         frais_b = float(getattr(a, 'frais_livraison_boutique', 0) or 0)
         prix_total_eu = a.prix_eu + frais_b
@@ -291,18 +381,8 @@ def creer_commande(body: CommandeCreate, db: Session = Depends(get_db)):
             "total_local":              detail["total_local"],
             "monnaie":                  detail["monnaie"],
         })
-        total_eu              += prix_total_eu * a.qty
-        total_local_sans_comm += detail["total_local"]
-        poids_total           += a.poids * a.qty
-        taux_conv              = detail["taux_conv"]
 
-    commission_fcfa   = get_commission(total_eu)
-    commission_locale = round(commission_fcfa * taux_conv)
-    total_local       = total_local_sans_comm + commission_locale
-
-    if body.promo_code:
-        total_local = appliquer_promo(db, body.promo_code, total_local, taux_conv)
-
+    # Parrainage (inchangé)
     if body.code_parrainage:
         try:
             code_p = body.code_parrainage.upper().strip()
@@ -333,11 +413,6 @@ def creer_commande(body: CommandeCreate, db: Session = Depends(get_db)):
             print(f"[parrainage] Erreur: {e}")
             db.rollback()
 
-    if body.total_local_client and body.total_local_client > 0:
-        total_local = round(body.total_local_client)
-    if body.monnaie_client:
-        m = {"symbole": body.monnaie_client}
-
     statut_initial = "paye" if body.mode_paiement == "kkiapay" else "en_attente_paiement"
 
     note_auto = None
@@ -352,7 +427,7 @@ def creer_commande(body: CommandeCreate, db: Session = Depends(get_db)):
         client_adresse   = body.client_adresse,
         client_instructions = body.client_instructions,
         operateur        = body.operateur,
-        monnaie          = m["symbole"],
+        monnaie          = monnaie,
         total_euro       = round(total_eu, 2),
         total_local      = round(total_local),
         poids_estime     = round(poids_total, 2),
@@ -452,25 +527,14 @@ def suivi(ref: str, db: Session = Depends(get_db)):
 
 @router.get("/historique/{tel}")
 def historique(tel: str, db: Session = Depends(get_db)):
-    # ✅ CORRECTION : normaliser les deux côtés — chiffres uniquement
-    # Problème précédent : le client stockait "+224 627 19 64 19" (avec espaces)
-    # mais la recherche envoyait "+22462719 6419" (espaces supprimés différemment)
-    # Le LIKE ne matchait pas car les espaces étaient à des positions différentes.
-    # Solution : comparer uniquement les chiffres des deux côtés via REGEXP_REPLACE en SQL.
-
     tel_chiffres = _normaliser_tel(tel)
 
     if len(tel_chiffres) < 8:
         raise HTTPException(404, "Numéro trop court")
 
-    # On garde les 9 derniers chiffres pour éviter les problèmes d'indicatif
-    # ex: "22462719 6419" → on cherche les 9 derniers chiffres "627196419"
     suffixe = tel_chiffres[-9:]
+    cmds    = []
 
-    cmds = []
-
-    # ── Tentative 1 : REGEXP_REPLACE (PostgreSQL) ─────────────
-    # Supprime tout ce qui n'est pas un chiffre dans client_tel avant de comparer
     try:
         rows = db.execute(text("""
             SELECT * FROM commandes
@@ -481,7 +545,6 @@ def historique(tel: str, db: Session = Depends(get_db)):
     except Exception as e:
         print(f"[historique] REGEXP_REPLACE non supporté, fallback REPLACE: {e}")
 
-    # ── Tentative 2 : REPLACE triple (fallback) ───────────────
     if not cmds:
         try:
             rows = db.execute(text("""
@@ -494,13 +557,11 @@ def historique(tel: str, db: Session = Depends(get_db)):
         except Exception as e:
             print(f"[historique] REPLACE fallback échoué: {e}")
 
-    # ── Tentative 3 : contains brut (dernier recours) ─────────
     if not cmds:
         tel_clean = tel.replace(" ", "").replace("+", "").replace("-", "")
         cmds_orm = db.query(Commande).filter(
             Commande.client_tel.contains(tel_clean)
         ).order_by(Commande.created_at.desc()).all()
-        # Convertir en mappings-like pour uniformité
         cmds = [
             {col.name: getattr(c, col.name) for col in Commande.__table__.columns}
             for c in cmds_orm
@@ -511,7 +572,6 @@ def historique(tel: str, db: Session = Depends(get_db)):
 
     result = []
     for c in cmds:
-        # Compatibilité dict (mappings SQL) et objet ORM
         def g(key):
             if isinstance(c, dict):
                 return c.get(key)
@@ -543,7 +603,6 @@ def annuler_commande(body: AnnulationBody, db: Session = Depends(get_db)):
     if not cmd:
         raise HTTPException(404, "Commande introuvable")
 
-    # ✅ Utiliser la même normalisation pour la vérification du téléphone
     tel_chiffres     = _normaliser_tel(body.client_tel)
     cmd_tel_chiffres = _normaliser_tel(cmd.client_tel or "")
 
