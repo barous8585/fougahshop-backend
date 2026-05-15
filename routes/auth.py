@@ -271,7 +271,7 @@ def reset_password(body: Dict[str, Any], db: Session = Depends(get_db)):
 
 @router.post("/totp/setup")
 def totp_setup(request: Request, db: Session = Depends(get_db),
-               role: str = Depends(lambda req=request, db=db: require_patron(req, db))):
+               role: str = Depends(require_patron)):
     """
     Génère un nouveau secret TOTP et retourne l'URI pour le QR code.
     Le secret N'EST PAS encore activé — il faut appeler /totp/confirm pour l'activer.
@@ -312,7 +312,7 @@ def totp_setup(request: Request, db: Session = Depends(get_db),
 @router.post("/totp/confirm")
 def totp_confirm(body: Dict[str, Any], request: Request,
                  db: Session = Depends(get_db),
-                 role: str = Depends(lambda req=request, db=db: require_patron(req, db))):
+                 role: str = Depends(require_patron)):
     """
     Confirme l'activation de la 2FA en vérifiant le premier code TOTP.
     Après confirmation, totp_enabled = True.
@@ -337,7 +337,7 @@ def totp_confirm(body: Dict[str, Any], request: Request,
 @router.post("/totp/disable")
 def totp_disable(body: Dict[str, Any], request: Request,
                  db: Session = Depends(get_db),
-                 role: str = Depends(lambda req=request, db=db: require_patron(req, db))):
+                 role: str = Depends(require_patron)):
     """
     Désactive la 2FA. Nécessite le mot de passe patron pour confirmer.
     """
@@ -355,7 +355,7 @@ def totp_disable(body: Dict[str, Any], request: Request,
 
 @router.get("/totp/status")
 def totp_status(request: Request, db: Session = Depends(get_db),
-                role: str = Depends(lambda req=request, db=db: require_patron(req, db))):
+                role: str = Depends(require_patron)):
     """Retourne l'état actuel de la 2FA."""
     cfg = get_config(db)
     return {
