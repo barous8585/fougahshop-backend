@@ -8,7 +8,7 @@ import asyncio
 from datetime import datetime
 from database import get_db, SessionLocal
 from models import Config, PortKg, Employe
-from routes.auth import require_patron
+from routes.auth import require_patron, PWD_MIN_LENGTH
 
 router = APIRouter(prefix="/api/config", tags=["config"])
 
@@ -33,8 +33,6 @@ DEFAULT_PORT = {
 
 ROLES_AUTORISES = ("employe", "logisticien")
 
-# ✅ Colonnes stat_ autorisées — mapping colonne → clé SQL
-# Utiliser un dict plutôt qu'un f-string pour éviter tout risque d'injection
 STAT_FIELDS_MAP = {
     "stat_delai":  "stat_delai",
     "stat_badge1": "stat_badge1",
@@ -174,7 +172,6 @@ async def auto_refresh_taux_gnf():
                 db.close()
             except Exception:
                 pass
-        # ✅ FIX : 3600 secondes (1 heure) — était 60s → 1440 appels/jour vers l'API externe !
         await asyncio.sleep(3600)
 
 
@@ -301,7 +298,16 @@ def update_config(
     if "commission"  in body: cfg.commission  = float(body["commission"])
     if "taux_gnf"    in body: cfg.taux_gnf    = float(body["taux_gnf"])
     if "wa_number"   in body: cfg.wa_number   = str(body["wa_number"])
-    if "admin_pwd"   in body: cfg.admin_pwd   = str(body["admin_pwd"])
+
+    # ── Point 2a : changement du mot de passe admin via PUT /config ──
+    if "admin_pwd" in body:
+        new_pwd = str(body["admin_pwd"]).strip()
+        if len(new_pwd) < PWD_MIN_LENGTH:
+            raise HTTPException(
+                400,
+                f"Mot de passe trop court (minimum {PWD_MIN_LENGTH} caractères)"
+            )
+        cfg.admin_pwd = new_pwd
 
     if "tarifs_unite" in body:
         tu = body["tarifs_unite"]
@@ -364,11 +370,9 @@ def update_config(
         except Exception:
             pass
 
-    # ✅ FIX : stats landing sans f-string — utiliser un mapping de colonnes autorisées
     for field, col in STAT_FIELDS_MAP.items():
         if field in body and body[field] is not None:
             try:
-                # col est une valeur de STAT_FIELDS_MAP, jamais saisie par l'utilisateur
                 db.execute(
                     text(f"UPDATE configs SET {col} = :v WHERE id = :id"),
                     {"v": str(body[field]).strip(), "id": cfg.id}
@@ -453,15 +457,25 @@ def create_employe(
     role: str = Depends(require_patron)
 ):
     ensure_role_column(db)
-    nom  = str(body.get("nom", "")).strip()
-    pwd  = str(body.get("pwd", ""))
-    role = str(body.get("role", "employe"))
-    if not nom or not pwd:
-        raise HTTPException(400, "Nom et mot de passe requis")
-    if len(pwd) < 4:
-        raise HTTPException(400, "Mot de passe trop court (min 4 caractères)")
-    if role not in ROLES_AUTORISES:
-        role = "employe"
+    nom      = str(body.get("nom", "")).strip()
+    pwd      = str(body.get("pwd", "")).strip()
+    emp_role = str(body.get("role", "employe"))
+
+    if not nom:
+        raise HTTPException(400, "Nom requis")
+    if not pwd:
+        raise HTTPException(400, "Mot de passe requis")
+
+    # ── Point 2a : validation min 8 chars (était 4) ──────────
+    if len(pwd) < PWD_MIN_LENGTH:
+        raise HTTPException(
+            400,
+            f"Mot de passe trop court (minimum {PWD_MIN_LENGTH} caractères)"
+        )
+
+    if emp_role not in ROLES_AUTORISES:
+        emp_role = "employe"
+
     e = Employe(nom=nom, pwd=pwd)
     db.add(e)
     db.commit()
@@ -469,12 +483,12 @@ def create_employe(
     try:
         db.execute(
             text("UPDATE employes SET role = :role WHERE id = :id"),
-            {"role": role, "id": e.id}
+            {"role": emp_role, "id": e.id}
         )
         db.commit()
     except Exception:
         db.rollback()
-    return {"id": e.id, "nom": e.nom, "role": role}
+    return {"id": e.id, "nom": e.nom, "role": emp_role}
 
 
 @router.delete("/employes/{emp_id}")
