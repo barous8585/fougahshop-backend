@@ -7,7 +7,7 @@ import json, csv, io, re
 from fastapi.responses import StreamingResponse
 from database import get_db
 from models import Commande, Config
-from routes.auth import require_auth, require_patron, PWD_MIN_LENGTH
+from routes.auth import require_auth, require_patron, PWD_MIN_LENGTH, hash_password
 
 try:
     from routes.notifs import notifier_client, notifier_patron
@@ -486,7 +486,7 @@ def creer_employe(body: EmployeCreate, request: Request,
         raise HTTPException(400, "Rôle invalide (employe ou logisticien)")
 
     from models import Employe
-    emp = Employe(nom=nom, pwd=pwd, role=body.role, actif=True)
+    emp = Employe(nom=nom, pwd=hash_password(pwd), role=body.role, actif=True)
     db.add(emp)
     db.commit()
     db.refresh(emp)
