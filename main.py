@@ -27,7 +27,8 @@ from routes.annonce    import ensure_annonces_table
 from routes.admin      import ensure_archived_column
 from routes.auth       import (
     ensure_sessions_table, purge_expired_sessions,
-    ensure_totp_columns,   # ✅ NOUVEAU — migration 2FA
+    ensure_totp_columns,
+    migrate_pwd_to_bcrypt,  # ✅ migration bcrypt au startup
 )
 from routes.notifs     import ensure_tokens_table, purge_old_tokens
 from routes.parrainage import ensure_parrainage_tables
@@ -98,6 +99,10 @@ async def lifespan(app: FastAPI):
         # ✅ NOUVEAU — colonnes 2FA (totp_secret, totp_enabled)
         ensure_totp_columns(db)
         print("✅ Colonnes 2FA vérifiées (totp_secret, totp_enabled)")
+
+        # ✅ Migration bcrypt — hashe tous les mots de passe encore en clair
+        migrate_pwd_to_bcrypt(db)
+        print("✅ Mots de passe vérifiés / migrés vers bcrypt")
 
         # ── Table sessions WhatsApp ───────────────────────────
         db.execute(text("""
