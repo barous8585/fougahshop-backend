@@ -3,7 +3,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
-from sqlalchemy import text   # ✅ CORRECTION : import en haut, avant tout usage
+from sqlalchemy import text
 import os, asyncio
 from security import SecurityMiddleware, cleanup_rate_limits
 from database import engine, Base, SessionLocal
@@ -25,10 +25,13 @@ from routes.annonce    import router as annonce_router
 from routes.promo      import ensure_tables as ensure_promo_tables
 from routes.annonce    import ensure_annonces_table
 from routes.admin      import ensure_archived_column
-from routes.auth       import ensure_sessions_table, purge_expired_sessions
+from routes.auth       import (
+    ensure_sessions_table, purge_expired_sessions,
+    ensure_totp_columns,   # ✅ NOUVEAU — migration 2FA
+)
 from routes.notifs     import ensure_tokens_table, purge_old_tokens
 from routes.parrainage import ensure_parrainage_tables
-from routes.avis       import ensure_avis_columns          # ✅ NOUVEAU
+from routes.avis       import ensure_avis_columns
 from routes.config     import (
     init_port, get_config, ensure_tarifs_columns,
     auto_refresh_taux_gnf, refresh_taux_gnf_en_base
@@ -89,9 +92,12 @@ async def lifespan(app: FastAPI):
         ensure_tarifs_columns(db)
         print("✅ Colonnes config vérifiées")
 
-        # ✅ CORRECTION : appel via fonction dédiée (text déjà importé en haut)
         ensure_avis_columns(db)
         print("✅ Colonnes avis vérifiées (photos_urls, client_tel, commande_ref...)")
+
+        # ✅ NOUVEAU — colonnes 2FA (totp_secret, totp_enabled)
+        ensure_totp_columns(db)
+        print("✅ Colonnes 2FA vérifiées (totp_secret, totp_enabled)")
 
         # ── Table sessions WhatsApp ───────────────────────────
         db.execute(text("""
@@ -128,7 +134,7 @@ async def lifespan(app: FastAPI):
     print("✅ Tâche nettoyage rate limits démarrée")
 
     task_taux = asyncio.create_task(auto_refresh_taux_gnf())
-    print("✅ Tâche auto-refresh taux GNF démarrée (toutes les minutes)")
+    print("✅ Tâche auto-refresh taux GNF démarrée (toutes les heures)")
 
     yield  # ← l'app tourne ici
 
