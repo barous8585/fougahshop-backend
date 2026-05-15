@@ -239,6 +239,23 @@ def check(request: Request, db: Session = Depends(get_db)):
     return {"authenticated": False}
 
 
+# ── Middlewares d'auth — définis ICI avant les endpoints qui en dépendent ──
+
+def require_auth(request: Request, db: Session = Depends(get_db)) -> str:
+    token = _get_token(request)
+    role  = session_get(db, token)
+    if not role:
+        raise HTTPException(401, "Non authentifié")
+    return role
+
+
+def require_patron(request: Request, db: Session = Depends(get_db)) -> str:
+    role = require_auth(request, db)
+    if role != "patron":
+        raise HTTPException(403, "Accès réservé au patron")
+    return role
+
+
 # ── Point 2a : reset mot de passe — min 8 chars ───────────────
 
 @router.post("/reset")
@@ -362,20 +379,3 @@ def totp_status(request: Request, db: Session = Depends(get_db),
         "totp_enabled":   bool(getattr(cfg, "totp_enabled", False)),
         "totp_configured": bool(getattr(cfg, "totp_secret", None)),
     }
-
-
-# ── Middlewares d'auth ────────────────────────────────────────
-
-def require_auth(request: Request, db: Session = Depends(get_db)) -> str:
-    token = _get_token(request)
-    role  = session_get(db, token)
-    if not role:
-        raise HTTPException(401, "Non authentifié")
-    return role
-
-
-def require_patron(request: Request, db: Session = Depends(get_db)) -> str:
-    role = require_auth(request, db)
-    if role != "patron":
-        raise HTTPException(403, "Accès réservé au patron")
-    return role
