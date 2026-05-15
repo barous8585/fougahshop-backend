@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Query
 from sqlalchemy.orm import Session
 from sqlalchemy import func, text
 from pydantic import BaseModel
@@ -7,7 +7,7 @@ import json, csv, io, re
 from fastapi.responses import StreamingResponse
 from database import get_db
 from models import Commande, Config
-from routes.auth import require_auth, require_patron
+from routes.auth import require_auth, require_patron, PWD_MIN_LENGTH
 
 try:
     from routes.notifs import notifier_client, notifier_patron
@@ -48,7 +48,6 @@ STATUTS_PAR_ROLE = {
     "employe":     ["paye","achete"],
 }
 
-# ✅ FIX 1 : CAT_TARIF_UNITE défini ici — était utilisé mais jamais déclaré
 CAT_TARIF_UNITE = {
     "smartphone":  "telephone",
     "baskets":     "chaussures",
@@ -59,6 +58,10 @@ CAT_TARIF_UNITE = {
     "parfum":      "parfum",
     "chaussures":  "chaussures",
 }
+
+# ── Point 3 : taille de page par défaut ──────────────────────
+DEFAULT_PAGE_SIZE = 30
+MAX_PAGE_SIZE     = 200  # garde-fou — jamais plus de 200 en un appel
 
 
 def ensure_archived_column(db: Session):
@@ -95,7 +98,6 @@ def serialize_cmd(c):
         r"\s*\|?\s*🎁 CADEAU POUR:.*$", "", instructions, flags=re.DOTALL
     ).strip(" |")
 
-    # ✅ FIX 2 : json.loads protégé par try/catch
     try:
         articles = json.loads(c.articles) if c.articles else []
     except Exception:
@@ -167,16 +169,34 @@ def stats(request: Request, db: Session = Depends(get_db),
     return base
 
 
+# ── Point 3 : /commandes avec pagination ─────────────────────
+
 @router.get("/commandes")
 def liste_commandes(
-    request: Request,
-    statut: Optional[str]     = None,
-    search: Optional[str]     = None,
+    request:    Request,
+    statut:     Optional[str] = None,
+    search:     Optional[str] = None,
     date_debut: Optional[str] = None,
-    date_fin: Optional[str]   = None,
-    db: Session = Depends(get_db),
-    role: str   = Depends(require_auth),
+    date_fin:   Optional[str] = None,
+    # Pagination — page commence à 1, limit = nombre de résultats par page
+    # page=0 ou limit=0 → comportement legacy : retourne TOUT (pour loadFinances/renderCharts)
+    page:       int = Query(default=1,  ge=0),
+    limit:      int = Query(default=DEFAULT_PAGE_SIZE, ge=0, le=MAX_PAGE_SIZE),
+    db:         Session = Depends(get_db),
+    role:       str     = Depends(require_auth),
 ):
+    """
+    Retourne les commandes avec pagination.
+
+    Réponse paginée (page >= 1 et limit > 0) :
+        { "total": int, "page": int, "limit": int, "pages": int, "commandes": [...] }
+
+    Réponse legacy (page=0 OU limit=0) :
+        [ ...liste complète... ]
+    Le mode legacy est conservé pour loadFinances() et renderCharts() dans index.html
+    qui ont besoin de toutes les commandes pour faire les calculs côté client.
+    À terme, ces calculs devraient migrer vers un endpoint /stats/finances dédié.
+    """
     q = db.query(Commande)
     statuts_autorises = STATUTS_PAR_ROLE.get(role, ["paye", "achete"])
 
@@ -199,7 +219,26 @@ def liste_commandes(
     if date_fin:
         q = q.filter(Commande.created_at <= date_fin + " 23:59:59")
 
-    cmds   = q.order_by(Commande.created_at.desc()).all()
+    q = q.order_by(Commande.created_at.desc())
+
+    # ── Mode legacy : pas de pagination (page=0 ou limit=0) ──
+    if page == 0 or limit == 0:
+        cmds   = q.all()
+        result = []
+        for c in cmds:
+            d = serialize_cmd(c)
+            if role in ("employe", "logisticien"):
+                d.pop("total_local", None)
+                d.pop("total_euro",  None)
+                d.pop("monnaie",     None)
+            result.append(d)
+        return result
+
+    # ── Mode paginé ───────────────────────────────────────────
+    total_count = q.count()
+    offset      = (page - 1) * limit
+    cmds        = q.offset(offset).limit(limit).all()
+
     result = []
     for c in cmds:
         d = serialize_cmd(c)
@@ -208,7 +247,14 @@ def liste_commandes(
             d.pop("total_euro",  None)
             d.pop("monnaie",     None)
         result.append(d)
-    return result
+
+    return {
+        "total":      total_count,
+        "page":       page,
+        "limit":      limit,
+        "pages":      max(1, -(-total_count // limit)),  # ceil division
+        "commandes":  result,
+    }
 
 
 class StatutUpdate(BaseModel):
@@ -266,7 +312,6 @@ def update_statut(
             ), {"id": cfg.id if cfg else 1}).mappings().first()
             tarifs_unite = json.loads(tarifs_row["tarifs_unite"]) if tarifs_row and tarifs_row.get("tarifs_unite") else []
 
-            # Priorité : catégorie choisie manuellement par l'admin
             if body.port_categorie and tarifs_unite:
                 def match_cat(nom, cat):
                     n = (nom or "").lower()
@@ -285,7 +330,6 @@ def update_statut(
                     port_fcfa = round(port_kg * body.poids_reel)
 
             else:
-                # ✅ FIX 3 : boucle for correcte sur les articles + CAT_TARIF_UNITE défini
                 try:
                     articles = json.loads(cmd.articles) if cmd.articles else []
                 except Exception:
@@ -297,8 +341,6 @@ def update_statut(
                     qty       = int(art.get("qty") or 1)
 
                     tarif_unite_trouve = None
-
-                    # Mapping catégorie → mot-clé dans tarifs_unite
                     nom_tarif = CAT_TARIF_UNITE.get(categorie)
 
                     if categorie == "smartphone":
@@ -329,7 +371,6 @@ def update_statut(
                                 tarif_unite_trouve = tu
                                 break
 
-                    # Fallback : chercher par nom d'article
                     if not tarif_unite_trouve and tarifs_unite:
                         nom_art = (art.get("nom") or "").lower()
                         for tu in tarifs_unite:
@@ -418,6 +459,40 @@ def update_statut(
     return {"ref": cmd.ref, "statut": cmd.statut, "date_estimee": date_est}
 
 
+# ── Gestion employés (Point 2a : validation pwd min 8 chars) ─
+
+class EmployeCreate(BaseModel):
+    nom:  str
+    pwd:  str
+    role: Optional[str] = "employe"
+
+
+@router.post("/employes")
+def creer_employe(body: EmployeCreate, request: Request,
+                  db: Session = Depends(get_db),
+                  role: str = Depends(require_patron)):
+    """Point 2a : création employé avec validation mot de passe min 8 chars."""
+    nom = (body.nom or "").strip()
+    pwd = (body.pwd or "").strip()
+
+    if not nom:
+        raise HTTPException(400, "Nom requis")
+    if not pwd or len(pwd) < PWD_MIN_LENGTH:
+        raise HTTPException(
+            400,
+            f"Mot de passe trop court (minimum {PWD_MIN_LENGTH} caractères)"
+        )
+    if body.role not in ("employe", "logisticien"):
+        raise HTTPException(400, "Rôle invalide (employe ou logisticien)")
+
+    from models import Employe
+    emp = Employe(nom=nom, pwd=pwd, role=body.role, actif=True)
+    db.add(emp)
+    db.commit()
+    db.refresh(emp)
+    return {"id": emp.id, "nom": emp.nom, "role": emp.role}
+
+
 # ── Archives ──────────────────────────────────────────────────
 
 @router.post("/commandes/{ref}/archiver")
@@ -476,7 +551,6 @@ def export_csv(request: Request, db: Session = Depends(get_db),
         "Détail articles","Cadeau","Destinataire","Tel destinataire"
     ])
     for c in cmds:
-        # ✅ FIX 4 : json.loads protégé — une commande corrompue ne fait plus planter le CSV
         try:
             arts = json.loads(c.articles) if c.articles else []
         except Exception:
@@ -486,7 +560,6 @@ def export_csv(request: Request, db: Session = Depends(get_db),
             for a in arts
         ])
         cadeau = parse_cadeau(c.client_instructions or "")
-        # ✅ Note filtrée : retirer le contenu [PRIVE] de l'export
         note_export = re.sub(r'\[PRIVE\].*', '', c.note_admin or '').strip(' |')
         w.writerow([
             c.ref,
