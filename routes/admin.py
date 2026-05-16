@@ -169,6 +169,268 @@ def stats(request: Request, db: Session = Depends(get_db),
     return base
 
 
+# ── Point 5 : finances calculées en SQL côté serveur ─────────
+# Remplace loadFinances() et renderCharts() qui chargeaient
+# toutes les commandes en RAM côté client.
+
+@router.get("/stats/finances")
+def stats_finances(request: Request, db: Session = Depends(get_db),
+                   role: str = Depends(require_patron)):
+    """
+    Calcule en SQL les données financières nécessaires au tableau de bord patron.
+    Retourne :
+      - kpis_mois      : commissions, volume €, nb commandes du mois courant
+      - comm_6mois     : commissions par mois sur 6 mois glissants
+      - top_pays       : top 5 pays par commission ce mois
+      - senc           : résumé encaissé / à venir
+      - donut_statuts  : répartition des commandes par statut (pour le donut)
+      - volume_6mois   : volume € par mois sur 6 mois (pour les barres)
+    """
+    from datetime import datetime, date
+    now         = datetime.now()
+    mois_courant = now.strftime("%Y-%m")
+
+    STATUTS_PAYES = ("paye", "achete", "expedie", "arrive", "recupere")
+    taux_gnf = float(db.execute(text("SELECT taux_gnf FROM configs WHERE id=1")).scalar() or 9500)
+
+    # ── Paliers commission (identiques au frontend) ────────────
+    def comm_palier(total_eu):
+        if total_eu <= 50:   return 3500
+        if total_eu <= 100:  return 5000
+        if total_eu <= 200:  return 7000
+        if total_eu <= 500:  return 12000
+        return 20000
+
+    def comm_to_fcfa(comm, monnaie):
+        return round(comm * 656 / taux_gnf) if monnaie == "GNF" else comm
+
+    # ── Charger seulement les colonnes nécessaires ─────────────
+    rows = db.execute(text("""
+        SELECT statut, monnaie, total_euro, total_local,
+               TO_CHAR(created_at, 'YYYY-MM') AS mois,
+               client_pays
+        FROM commandes
+        WHERE statut = ANY(:statuts)
+        ORDER BY created_at DESC
+    """), {"statuts": list(STATUTS_PAYES)}).mappings().all()
+
+    # ── KPIs mois courant ──────────────────────────────────────
+    comm_mois = 0
+    volume_mois = 0.0
+    nb_mois = 0
+    comm_encaissee = 0
+    comm_attente = 0
+    total_encaisse_fcfa = 0
+
+    # ── 6 mois glissants ──────────────────────────────────────
+    mois_labels = []
+    for i in range(5, -1, -1):
+        d = date(now.year, now.month, 1)
+        # Reculer i mois
+        m = now.month - i
+        y = now.year
+        while m <= 0:
+            m += 12
+            y -= 1
+        mois_labels.append({
+            "key":   f"{y}-{str(m).zfill(2)}",
+            "label": date(y, m, 1).strftime("%b").capitalize()
+        })
+
+    comm_par_mois  = {m["key"]: 0 for m in mois_labels}
+    volume_par_mois = {m["key"]: 0.0 for m in mois_labels}
+    par_pays = {}
+
+    for r in rows:
+        total_eu  = float(r["total_euro"] or 0)
+        total_loc = float(r["total_local"] or 0)
+        monnaie   = r["monnaie"] or "FCFA"
+        mois      = r["mois"] or ""
+        statut    = r["statut"]
+        pays      = r["client_pays"] or "Inconnu"
+
+        comm = comm_palier(total_eu)
+        comm_fcfa = comm_to_fcfa(comm, monnaie)
+
+        # 6 mois glissants
+        if mois in comm_par_mois:
+            comm_par_mois[mois] += comm_fcfa
+        if mois in volume_par_mois:
+            volume_par_mois[mois] += total_eu
+
+        # Mois courant
+        if mois == mois_courant:
+            comm_mois += comm_fcfa
+            volume_mois += total_eu
+            nb_mois += 1
+            tl_fcfa = round(total_loc * 656 / taux_gnf) if monnaie == "GNF" else total_loc
+            total_encaisse_fcfa += tl_fcfa
+            if statut == "recupere":
+                comm_encaissee += comm_fcfa
+            else:
+                comm_attente += comm_fcfa
+            # Top pays
+            if pays not in par_pays:
+                par_pays[pays] = {"nb": 0, "comm": 0}
+            par_pays[pays]["nb"]   += 1
+            par_pays[pays]["comm"] += comm_fcfa
+
+    top_pays = sorted(par_pays.items(), key=lambda x: x[1]["comm"], reverse=True)[:5]
+
+    # ── Donut statuts (toutes commandes) ──────────────────────
+    donut = db.execute(text("""
+        SELECT statut, COUNT(*) as nb
+        FROM commandes
+        WHERE statut IN ('paye','achete','expedie','arrive','recupere')
+        GROUP BY statut
+    """)).mappings().all()
+
+    return {
+        "kpis_mois": {
+            "comm_fcfa":       comm_mois,
+            "volume_eu":       round(volume_mois, 2),
+            "nb":              nb_mois,
+            "comm_encaissee":  comm_encaissee,
+            "comm_attente":    comm_attente,
+            "total_encaisse":  total_encaisse_fcfa,
+        },
+        "comm_6mois": [
+            {"key": m["key"], "label": m["label"], "comm": comm_par_mois[m["key"]]}
+            for m in mois_labels
+        ],
+        "volume_6mois": [
+            {"key": m["key"], "label": m["label"], "volume": round(volume_par_mois[m["key"]], 2)}
+            for m in mois_labels
+        ],
+        "top_pays": [
+            {"pays": p, "nb": d["nb"], "comm": d["comm"]}
+            for p, d in top_pays
+        ],
+        "donut_statuts": {r["statut"]: r["nb"] for r in donut},
+    }
+
+
+# ── Point 5 : endpoint finances dédié — remplace loadFinances() + renderCharts() ──
+
+@router.get("/stats/finances")
+def stats_finances(request: Request, db: Session = Depends(get_db),
+                   role: str = Depends(require_patron)):
+    """
+    Calcule côté serveur toutes les données financières dont le frontend a besoin.
+    Remplace les appels /commandes?limit=0 dans loadFinances() et renderCharts().
+    """
+    from datetime import datetime, date
+    import calendar
+
+    now          = datetime.utcnow()
+    mois_courant = now.strftime("%Y-%m")
+    statuts_payes = ["paye","achete","expedie","arrive","recupere"]
+
+    try:
+        cfg = db.query(Config).first()
+        taux_gnf = (cfg.taux_gnf if cfg else None) or 9500
+    except Exception:
+        taux_gnf = 9500
+
+    def comm_en_fcfa(total_eu, monnaie):
+        comm = get_commission_palier(float(total_eu or 0))
+        if monnaie == "GNF":
+            comm = round(comm * (taux_gnf / 656))
+        return comm
+
+    def to_fcfa(comm, monnaie):
+        if monnaie == "GNF":
+            return round(comm * 656 / taux_gnf)
+        return comm
+
+    # ── Toutes les commandes payées (pour les graphiques 6 mois) ──
+    rows = db.execute(text("""
+        SELECT ref, statut, monnaie, total_euro, total_local,
+               TO_CHAR(created_at, 'YYYY-MM') AS mois,
+               TO_CHAR(created_at, 'YYYY-MM-DD') AS jour,
+               client_pays
+        FROM commandes
+        WHERE statut = ANY(:statuts)
+        ORDER BY created_at DESC
+    """), {"statuts": statuts_payes}).mappings().all()
+
+    # ── KPIs mois courant ─────────────────────────────────────
+    cmds_mois = [r for r in rows if r["mois"] == mois_courant]
+    comm_mois_fcfa  = 0
+    volume_eu       = 0.0
+    comm_encaissee  = 0
+    comm_attente    = 0
+    total_enc_fcfa  = 0
+
+    for r in cmds_mois:
+        monnaie  = r["monnaie"] or "FCFA"
+        comm     = comm_en_fcfa(r["total_euro"], monnaie)
+        comm_f   = to_fcfa(comm, monnaie)
+        comm_mois_fcfa += comm_f
+        volume_eu      += float(r["total_euro"] or 0)
+        tl = float(r["total_local"] or 0)
+        total_enc_fcfa += round(tl * 656 / taux_gnf) if monnaie == "GNF" else tl
+        if r["statut"] == "recupere":
+            comm_encaissee += comm_f
+        else:
+            comm_attente   += comm_f
+
+    # ── Commissions sur 6 mois ────────────────────────────────
+    mois_6 = []
+    for i in range(5, -1, -1):
+        m = now.month - i
+        y = now.year
+        while m <= 0:
+            m += 12
+            y -= 1
+        key   = f"{y}-{m:02d}"
+        label = date(y, m, 1).strftime("%b")
+        mois_6.append({"key": key, "label": label, "comm": 0, "volume": 0.0})
+
+    mois_map = {m["key"]: m for m in mois_6}
+    for r in rows:
+        k = r["mois"]
+        if k in mois_map:
+            monnaie = r["monnaie"] or "FCFA"
+            comm_f  = to_fcfa(comm_en_fcfa(r["total_euro"], monnaie), monnaie)
+            mois_map[k]["comm"]   += comm_f
+            mois_map[k]["volume"] += float(r["total_euro"] or 0)
+
+    # ── Top 5 pays mois courant ───────────────────────────────
+    par_pays = {}
+    for r in cmds_mois:
+        p = r["client_pays"] or "Inconnu"
+        if p not in par_pays:
+            par_pays[p] = {"nb": 0, "comm": 0}
+        monnaie = r["monnaie"] or "FCFA"
+        par_pays[p]["nb"]   += 1
+        par_pays[p]["comm"] += to_fcfa(comm_en_fcfa(r["total_euro"], monnaie), monnaie)
+
+    top_pays = sorted(par_pays.items(), key=lambda x: x[1]["comm"], reverse=True)[:5]
+
+    return {
+        # KPIs mois
+        "comm_mois_fcfa":   comm_mois_fcfa,
+        "volume_eu":        round(volume_eu, 2),
+        "nb_mois":          len(cmds_mois),
+        "comm_encaissee":   comm_encaissee,
+        "comm_attente":     comm_attente,
+        "total_enc_fcfa":   round(total_enc_fcfa),
+        # Graphique 6 mois
+        "mois_6": [
+            {"key": m["key"], "label": m["label"],
+             "comm": m["comm"], "volume": round(m["volume"], 2)}
+            for m in mois_6
+        ],
+        # Top pays
+        "top_pays": [
+            {"pays": p, "nb": d["nb"], "comm": d["comm"]}
+            for p, d in top_pays
+        ],
+        "taux_gnf": taux_gnf,
+    }
+
+
 # ── Point 3 : /commandes avec pagination ─────────────────────
 
 @router.get("/commandes")
@@ -541,43 +803,61 @@ def liste_archives(request: Request, db: Session = Depends(get_db),
 @router.get("/export/csv")
 def export_csv(request: Request, db: Session = Depends(get_db),
                role: str = Depends(require_patron)):
-    cmds   = db.query(Commande).order_by(Commande.created_at.desc()).all()
-    output = io.StringIO()
-    w      = csv.writer(output)
-    w.writerow([
-        "Référence","Date","Client","Téléphone","Pays","Adresse",
-        "Opérateur","Monnaie","Total €","Total local","Poids estimé",
-        "Poids réel","Nb articles","Statut","Délai","N° Suivi","Notes",
-        "Détail articles","Cadeau","Destinataire","Tel destinataire"
-    ])
-    for c in cmds:
-        try:
-            arts = json.loads(c.articles) if c.articles else []
-        except Exception:
-            arts = []
-        detail = " | ".join([
-            f"{a['nom']} x{a.get('qty',1)} ({a.get('poids',0.5)}kg)"
-            for a in arts
-        ])
-        cadeau = parse_cadeau(c.client_instructions or "")
-        note_export = re.sub(r'\[PRIVE\].*', '', c.note_admin or '').strip(' |')
+    """
+    Point 4 : Export CSV en streaming par chunks de 200 commandes.
+    Ne charge plus toutes les commandes en RAM d'un coup.
+    """
+    CHUNK = 200
+
+    def generate():
+        output = io.StringIO()
+        w = csv.writer(output)
         w.writerow([
-            c.ref,
-            c.created_at.strftime("%d/%m/%Y %H:%M") if c.created_at else "",
-            c.client_nom, c.client_tel, c.client_pays, c.client_adresse or "",
-            c.operateur, c.monnaie, c.total_euro, c.total_local,
-            c.poids_estime or "", c.poids_reel or "",
-            c.nb_articles, STATUT_LABELS.get(c.statut, c.statut),
-            c.delai_livraison or "",
-            c.suivi_num or "",
-            note_export, detail,
-            "Oui" if cadeau else "",
-            cadeau.get("dest_nom", ""),
-            cadeau.get("dest_tel", ""),
+            "Référence","Date","Client","Téléphone","Pays","Adresse",
+            "Opérateur","Monnaie","Total €","Total local","Poids estimé",
+            "Poids réel","Nb articles","Statut","Délai","N° Suivi","Notes",
+            "Détail articles","Cadeau","Destinataire","Tel destinataire"
         ])
-    output.seek(0)
+        yield output.getvalue()
+
+        offset = 0
+        while True:
+            cmds = db.query(Commande)\
+                     .order_by(Commande.created_at.desc())\
+                     .offset(offset).limit(CHUNK).all()
+            if not cmds:
+                break
+            for c in cmds:
+                output = io.StringIO()
+                w = csv.writer(output)
+                try:
+                    arts = json.loads(c.articles) if c.articles else []
+                except Exception:
+                    arts = []
+                detail = " | ".join([
+                    f"{a.get('nom','?')} x{a.get('qty',1)} ({a.get('poids',0.5)}kg)"
+                    for a in arts
+                ])
+                cadeau = parse_cadeau(c.client_instructions or "")
+                note_export = re.sub(r'\[PRIVE\].*', '', c.note_admin or '').strip(' |')
+                w.writerow([
+                    c.ref,
+                    c.created_at.strftime("%d/%m/%Y %H:%M") if c.created_at else "",
+                    c.client_nom, c.client_tel, c.client_pays, c.client_adresse or "",
+                    c.operateur, c.monnaie, c.total_euro, c.total_local,
+                    c.poids_estime or "", c.poids_reel or "",
+                    c.nb_articles, STATUT_LABELS.get(c.statut, c.statut),
+                    c.delai_livraison or "", c.suivi_num or "",
+                    note_export, detail,
+                    "Oui" if cadeau else "",
+                    cadeau.get("dest_nom", ""),
+                    cadeau.get("dest_tel", ""),
+                ])
+                yield output.getvalue()
+            offset += CHUNK
+
     return StreamingResponse(
-        iter([output.getvalue()]),
-        media_type="text/csv",
+        generate(),
+        media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": "attachment; filename=commandes_fougahshop.csv"}
     )
