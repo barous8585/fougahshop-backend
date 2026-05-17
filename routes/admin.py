@@ -59,9 +59,8 @@ CAT_TARIF_UNITE = {
     "chaussures":  "chaussures",
 }
 
-# ── Point 3 : taille de page par défaut ──────────────────────
 DEFAULT_PAGE_SIZE = 30
-MAX_PAGE_SIZE     = 200  # garde-fou — jamais plus de 200 en un appel
+MAX_PAGE_SIZE     = 200
 
 
 def ensure_archived_column(db: Session):
@@ -169,17 +168,10 @@ def stats(request: Request, db: Session = Depends(get_db),
     return base
 
 
-# ── Point 5 : endpoint finances dédié — remplace loadFinances() + renderCharts() ──
-
 @router.get("/stats/finances")
 def stats_finances(request: Request, db: Session = Depends(get_db),
                    role: str = Depends(require_patron)):
-    """
-    Calcule côté serveur toutes les données financières dont le frontend a besoin.
-    Remplace les appels /commandes?limit=0 dans loadFinances() et renderCharts().
-    """
     from datetime import datetime, date
-    import calendar
 
     now          = datetime.utcnow()
     mois_courant = now.strftime("%Y-%m")
@@ -202,7 +194,6 @@ def stats_finances(request: Request, db: Session = Depends(get_db),
             return round(comm * 656 / taux_gnf)
         return comm
 
-    # ── Toutes les commandes payées (pour les graphiques 6 mois) ──
     rows = db.execute(text("""
         SELECT ref, statut, monnaie, total_euro, total_local,
                TO_CHAR(created_at, 'YYYY-MM') AS mois,
@@ -213,7 +204,6 @@ def stats_finances(request: Request, db: Session = Depends(get_db),
         ORDER BY created_at DESC
     """), {"statuts": statuts_payes}).mappings().all()
 
-    # ── KPIs mois courant ─────────────────────────────────────
     cmds_mois = [r for r in rows if r["mois"] == mois_courant]
     comm_mois_fcfa  = 0
     volume_eu       = 0.0
@@ -234,7 +224,6 @@ def stats_finances(request: Request, db: Session = Depends(get_db),
         else:
             comm_attente   += comm_f
 
-    # ── Commissions sur 6 mois ────────────────────────────────
     mois_6 = []
     for i in range(5, -1, -1):
         m = now.month - i
@@ -255,7 +244,6 @@ def stats_finances(request: Request, db: Session = Depends(get_db),
             mois_map[k]["comm"]   += comm_f
             mois_map[k]["volume"] += float(r["total_euro"] or 0)
 
-    # ── Top 5 pays mois courant ───────────────────────────────
     par_pays = {}
     for r in cmds_mois:
         p = r["client_pays"] or "Inconnu"
@@ -268,20 +256,17 @@ def stats_finances(request: Request, db: Session = Depends(get_db),
     top_pays = sorted(par_pays.items(), key=lambda x: x[1]["comm"], reverse=True)[:5]
 
     return {
-        # KPIs mois
         "comm_mois_fcfa":   comm_mois_fcfa,
         "volume_eu":        round(volume_eu, 2),
         "nb_mois":          len(cmds_mois),
         "comm_encaissee":   comm_encaissee,
         "comm_attente":     comm_attente,
         "total_enc_fcfa":   round(total_enc_fcfa),
-        # Graphique 6 mois
         "mois_6": [
             {"key": m["key"], "label": m["label"],
              "comm": m["comm"], "volume": round(m["volume"], 2)}
             for m in mois_6
         ],
-        # Top pays
         "top_pays": [
             {"pays": p, "nb": d["nb"], "comm": d["comm"]}
             for p, d in top_pays
@@ -290,8 +275,6 @@ def stats_finances(request: Request, db: Session = Depends(get_db),
     }
 
 
-# ── Point 3 : /commandes avec pagination ─────────────────────
-
 @router.get("/commandes")
 def liste_commandes(
     request:    Request,
@@ -299,25 +282,14 @@ def liste_commandes(
     search:     Optional[str] = None,
     date_debut: Optional[str] = None,
     date_fin:   Optional[str] = None,
-    # Pagination — page commence à 1, limit = nombre de résultats par page
-    # page=0 ou limit=0 → comportement legacy : retourne TOUT (pour loadFinances/renderCharts)
+    # ✅ Fix filtres pays et opérateur — envoyés par le frontend
+    pays:       Optional[str] = None,
+    operateur:  Optional[str] = None,
     page:       int = Query(default=1,  ge=0),
     limit:      int = Query(default=DEFAULT_PAGE_SIZE, ge=0, le=MAX_PAGE_SIZE),
     db:         Session = Depends(get_db),
     role:       str     = Depends(require_auth),
 ):
-    """
-    Retourne les commandes avec pagination.
-
-    Réponse paginée (page >= 1 et limit > 0) :
-        { "total": int, "page": int, "limit": int, "pages": int, "commandes": [...] }
-
-    Réponse legacy (page=0 OU limit=0) :
-        [ ...liste complète... ]
-    Le mode legacy est conservé pour loadFinances() et renderCharts() dans index.html
-    qui ont besoin de toutes les commandes pour faire les calculs côté client.
-    À terme, ces calculs devraient migrer vers un endpoint /stats/finances dédié.
-    """
     q = db.query(Commande)
     statuts_autorises = STATUTS_PAR_ROLE.get(role, ["paye", "achete"])
 
@@ -339,6 +311,11 @@ def liste_commandes(
         q = q.filter(Commande.created_at >= date_debut)
     if date_fin:
         q = q.filter(Commande.created_at <= date_fin + " 23:59:59")
+    # ✅ Fix filtres côté serveur — couvrent toutes les pages, pas juste les 30 premiers
+    if pays:
+        q = q.filter(Commande.client_pays == pays)
+    if operateur:
+        q = q.filter(Commande.operateur == operateur)
 
     q = q.order_by(Commande.created_at.desc())
 
@@ -373,7 +350,7 @@ def liste_commandes(
         "total":      total_count,
         "page":       page,
         "limit":      limit,
-        "pages":      max(1, -(-total_count // limit)),  # ceil division
+        "pages":      max(1, -(-total_count // limit)),
         "commandes":  result,
     }
 
@@ -577,7 +554,6 @@ def update_statut(
             notifier_patron(db, f"📦 Logistique — {STATUT_LABELS.get(body.statut, body.statut)}",
                 f"{cmd.ref} · {cmd.client_nom} · {cmd.client_pays}", cmd.ref)
 
-    # ── OneDrive : mise à jour du statut ─────────────────────
     try:
         from routes.onedrive import mettre_a_jour_statut
         import asyncio
@@ -602,7 +578,6 @@ class EmployeCreate(BaseModel):
 def creer_employe(body: EmployeCreate, request: Request,
                   db: Session = Depends(get_db),
                   role: str = Depends(require_patron)):
-    """Point 2a : création employé avec validation mot de passe min 8 chars."""
     nom = (body.nom or "").strip()
     pwd = (body.pwd or "").strip()
 
@@ -623,8 +598,6 @@ def creer_employe(body: EmployeCreate, request: Request,
     db.refresh(emp)
     return {"id": emp.id, "nom": emp.nom, "role": emp.role}
 
-
-# ── Archives ──────────────────────────────────────────────────
 
 @router.post("/commandes/{ref}/archiver")
 def archiver_commande(ref: str, request: Request,
@@ -672,10 +645,6 @@ def liste_archives(request: Request, db: Session = Depends(get_db),
 @router.get("/export/csv")
 def export_csv(request: Request, db: Session = Depends(get_db),
                role: str = Depends(require_patron)):
-    """
-    Point 4 : Export CSV en streaming par chunks de 200 commandes.
-    Ne charge plus toutes les commandes en RAM d'un coup.
-    """
     CHUNK = 200
 
     def generate():
