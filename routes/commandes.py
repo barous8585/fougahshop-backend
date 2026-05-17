@@ -467,6 +467,27 @@ def creer_commande(body: CommandeCreate, db: Session = Depends(get_db)):
     )
     db.commit()
 
+    # ── OneDrive : ajout automatique de la ligne dans Excel ───
+    try:
+        from routes.onedrive import ajouter_commande_excel
+        import asyncio
+        asyncio.create_task(ajouter_commande_excel({
+            "ref":         commande.ref,
+            "client_nom":  commande.client_nom,
+            "client_tel":  commande.client_tel,
+            "client_pays": commande.client_pays,
+            "total_euro":  commande.total_euro,
+            "monnaie":     commande.monnaie,
+            "statut":      commande.statut,
+            "articles":    commande.articles,
+            "note_admin":  commande.note_admin,
+            "promo_code":  commande.promo_code,
+            "created_at":  commande.created_at,
+            "taux_gnf":    cfg.taux_gnf or 9500,
+        }))
+    except Exception as e:
+        print(f"[OneDrive] Erreur sync commande: {e}")
+
     return {
         "ref":         commande.ref,
         "total_local": commande.total_local,
