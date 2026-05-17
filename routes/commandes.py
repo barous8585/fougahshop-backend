@@ -42,10 +42,6 @@ PALIERS_COMMISSION = [
     {"max": 99999, "comm": 20000},
 ]
 
-# ── Tolérance de validation du total client (Point 1) ─────────
-# On accepte un écart de ±5% entre le total calculé serveur et le total
-# envoyé par le client. Au-delà → on utilise silencieusement le total serveur.
-# Mettre à False pour rejeter complètement (HTTPException 400) si l'écart dépasse.
 TOTAL_VALIDATION_WARN_ONLY = True
 TOTAL_TOLERANCE_PCT        = 5  # %
 
@@ -112,9 +108,6 @@ def appliquer_promo(db, promo_code: str, total_local: float, taux_conv: float) -
     if not promo_code:
         return total_local
     try:
-        # ── SELECT FOR UPDATE — verrou atomique anti race condition (Point 3) ──
-        # Deux requêtes simultanées avec le même code ne peuvent pas
-        # toutes les deux passer la vérification du quota en même temps.
         promo = db.execute(
             text("SELECT * FROM promo_codes WHERE code=:code AND actif=TRUE LIMIT 1 FOR UPDATE"),
             {"code": promo_code.strip().upper()}
@@ -147,7 +140,6 @@ def appliquer_promo(db, promo_code: str, total_local: float, taux_conv: float) -
             reduction = round(float(valeur) * taux_conv)
             nouveau_total = max(0, total_local - reduction)
 
-        # Incrémenter uses_count de façon atomique (le verrou est encore actif)
         incremente = False
         try:
             db.execute(
@@ -207,7 +199,7 @@ class CommandeCreate(BaseModel):
     mode_paiement:          Optional[str]   = None
     kkiapay_transaction_id: Optional[str]   = None
     articles:               List[ArticleIn]
-    total_local_client:     Optional[float] = None  # envoyé par le client, ignoré si hors tolérance
+    total_local_client:     Optional[float] = None
     monnaie_client:         Optional[str]   = None
     taux_utilise:           Optional[float] = None
 
@@ -230,6 +222,24 @@ class KkiapayConfirmBody(BaseModel):
     transaction_id: Optional[str] = None
 
 
+class PanierWA(BaseModel):
+    lien:      str
+    prix:      float
+    livraison: Optional[float] = 0.0
+
+
+class CommandeWACreate(BaseModel):
+    client_nom:     str
+    client_tel:     str
+    client_pays:    str
+    client_adresse: str
+    paniers:        List[PanierWA]
+    total_eur:      float
+    total_local:    float
+    devise:         str
+    taux:           float
+
+
 # ── Fonctions utilitaires ─────────────────────────────────────
 
 def _sanitize_url(url: str) -> str:
@@ -246,8 +256,6 @@ def _normaliser_tel(tel: str) -> str:
     return ''.join(filter(str.isdigit, tel or ""))
 
 
-# ── Point 1 : validation du total côté serveur ───────────────
-
 def _calculer_total_serveur(
     articles: List[ArticleIn],
     pays: str,
@@ -255,11 +263,6 @@ def _calculer_total_serveur(
     promo_code: Optional[str],
     db,
 ) -> tuple[float, float, float, float, str]:
-    """
-    Recalcule entièrement le total à partir des données serveur.
-    Retourne (total_local, total_eu, poids_total, taux_conv, monnaie_symbole).
-    Le client n'a AUCUNE influence sur ce calcul.
-    """
     m = MONNAIES.get(pays, {"symbole": "FCFA", "taux_base": 656})
     total_local_sans_comm = 0.0
     total_eu              = 0.0
@@ -286,25 +289,14 @@ def _calculer_total_serveur(
 
 
 def _valider_total(total_serveur: float, total_client: Optional[float]) -> float:
-    """
-    Compare le total calculé serveur avec celui envoyé par le client.
-    - Si total_client est absent ou nul → on utilise total_serveur (sans bruit).
-    - Si l'écart est dans la tolérance → on utilise total_serveur (le client avait raison).
-    - Si l'écart dépasse la tolérance :
-        * TOTAL_VALIDATION_WARN_ONLY=True  → log + utilise total_serveur silencieusement
-        * TOTAL_VALIDATION_WARN_ONLY=False → HTTPException 400
-    Retourne toujours le total à enregistrer en base.
-    """
     if not total_client or total_client <= 0:
         return total_serveur
 
     ecart_pct = abs(total_serveur - total_client) / max(total_serveur, 1) * 100
 
     if ecart_pct <= TOTAL_TOLERANCE_PCT:
-        # Dans la tolérance — on garde le total serveur (plus fiable)
         return total_serveur
 
-    # Écart anormal
     msg = (
         f"[VALIDATION TOTAL] Écart détecté : "
         f"serveur={total_serveur:.0f} / client={total_client:.0f} "
@@ -319,7 +311,6 @@ def _valider_total(total_serveur: float, total_client: Optional[float]) -> float
             "Rechargez la page et réessayez."
         )
 
-    # Mode warn-only : on enregistre le total serveur sans bloquer
     return total_serveur
 
 
@@ -352,19 +343,15 @@ def creer_commande(body: CommandeCreate, db: Session = Depends(get_db)):
     cfg       = get_config(db)
     port_info = db.query(PortKg).filter(PortKg.pays == body.client_pays).first()
 
-    # ── Point 1 : calcul serveur autoritaire ─────────────────
     total_local_serveur, total_eu, poids_total, taux_conv, monnaie_symbole = (
         _calculer_total_serveur(body.articles, body.client_pays, cfg, body.promo_code, db)
     )
 
-    # Validation + éventuelle correction silencieuse
     total_local = _valider_total(total_local_serveur, body.total_local_client)
 
-    # Monnaie : on accepte la monnaie client UNIQUEMENT si elle correspond au pays
     m_attendue = MONNAIES.get(body.client_pays, {"symbole": "FCFA"})["symbole"]
-    monnaie    = m_attendue  # toujours basé sur le pays, jamais sur le client
+    monnaie    = m_attendue
 
-    # Construire le détail articles pour la sauvegarde
     articles_detail = []
     for a in body.articles:
         frais_b = float(getattr(a, 'frais_livraison_boutique', 0) or 0)
@@ -386,7 +373,6 @@ def creer_commande(body: CommandeCreate, db: Session = Depends(get_db)):
             "monnaie":                  detail["monnaie"],
         })
 
-    # Parrainage (inchangé)
     if body.code_parrainage:
         try:
             code_p = body.code_parrainage.upper().strip()
@@ -467,7 +453,6 @@ def creer_commande(body: CommandeCreate, db: Session = Depends(get_db)):
     )
     db.commit()
 
-    # ── OneDrive : ajout automatique de la ligne dans Excel ───
     try:
         from routes.onedrive import ajouter_commande_excel
         import asyncio
@@ -659,26 +644,6 @@ def annuler_commande(body: AnnulationBody, db: Session = Depends(get_db)):
     return {"ok": True, "ref": cmd.ref, "statut": "annulee"}
 
 
-# ── Commande WhatsApp (nouveau flux simplifié) ────────────────
-
-class PanierWA(BaseModel):
-    lien:      str
-    prix:      float
-    livraison: Optional[float] = 0.0
-
-
-class CommandeWACreate(BaseModel):
-    client_nom:     str
-    client_tel:     str
-    client_pays:    str
-    client_adresse: str
-    paniers:        List[PanierWA]
-    total_eur:      float
-    total_local:    float
-    devise:         str
-    taux:           float
-
-
 @router.post("/whatsapp", status_code=201)
 def creer_commande_whatsapp(body: CommandeWACreate, db: Session = Depends(get_db)):
     if not body.paniers:
@@ -686,23 +651,26 @@ def creer_commande_whatsapp(body: CommandeWACreate, db: Session = Depends(get_db
 
     cfg = get_config(db)
 
-    # Recalcul serveur du total pour sécurité
     m      = MONNAIES.get(body.client_pays, {"symbole": "FCFA", "taux_base": 656})
     is_gnf = m["symbole"] == "GNF"
     taux   = (cfg.taux_gnf or 9500) if is_gnf else (cfg.taux_change or 656)
 
-    total_eur     = sum(p.prix + (p.livraison or 0) for p in body.paniers)
     prix_articles = sum(p.prix for p in body.paniers)
+    total_eur     = sum(p.prix + (p.livraison or 0) for p in body.paniers)
     taux_conv     = taux / 656 if is_gnf else 1.0
 
+    # ✅ BUG 2 FIX — arrondi séparé par panier, cohérent avec le frontend
+    total_converti = sum(
+        round(p.prix * taux) + round((p.livraison or 0) * taux)
+        for p in body.paniers
+    )
     commission_fcfa   = get_commission(prix_articles)
     commission_locale = round(commission_fcfa * taux_conv)
-    total_local_serveur = round(total_eur * taux) + commission_locale
+    total_local_serveur = total_converti + commission_locale
 
-    # Validation ±5% — utilise toujours le total serveur
+    # Validation ±5%
     total_local = _valider_total(total_local_serveur, body.total_local)
 
-    # Construire articles JSON pour stockage et affichage dans l'admin
     articles_detail = []
     for i, p in enumerate(body.paniers):
         articles_detail.append({
@@ -710,7 +678,7 @@ def creer_commande_whatsapp(body: CommandeWACreate, db: Session = Depends(get_db
             "nom":                      f"Panier {i + 1}",
             "prix_eu":                  p.prix,
             "frais_livraison_boutique": p.livraison or 0,
-            "poids":                    0.5,  # estimé, sera pesé à réception
+            "poids":                    0.5,
             "qty":                      1,
             "monnaie":                  m["symbole"],
         })
@@ -730,7 +698,8 @@ def creer_commande_whatsapp(body: CommandeWACreate, db: Session = Depends(get_db
         poids_estime    = round(len(body.paniers) * 0.5, 2),
         articles        = json.dumps(articles_detail, ensure_ascii=False),
         nb_articles     = len(body.paniers),
-        statut          = "en_attente",
+        # ✅ BUG 1 FIX — statut cohérent avec le frontend (badge CSS existe)
+        statut          = "en_attente_paiement",
         delai_livraison = port_info.delai if port_info else "—",
         note_admin      = f"[WhatsApp] {len(body.paniers)} panier(s) — en attente de confirmation",
     )
@@ -748,7 +717,6 @@ def creer_commande_whatsapp(body: CommandeWACreate, db: Session = Depends(get_db
     )
     db.commit()
 
-    # OneDrive sync
     try:
         from routes.onedrive import ajouter_commande_excel
         import asyncio
