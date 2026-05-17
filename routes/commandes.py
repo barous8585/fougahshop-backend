@@ -634,7 +634,7 @@ def annuler_commande(body: AnnulationBody, db: Session = Depends(get_db)):
     if len(tel_chiffres) < 8 or tel_chiffres[-8:] not in cmd_tel_chiffres:
         raise HTTPException(403, "Numéro de téléphone incorrect")
 
-    STATUTS_ANNULABLES = ["en_attente_paiement", "paye"]
+    STATUTS_ANNULABLES = ["en_attente_paiement", "paye", "en_attente"]
     if cmd.statut not in STATUTS_ANNULABLES:
         raise HTTPException(400, f"Annulation impossible — statut actuel : {cmd.statut}")
 
@@ -657,3 +657,122 @@ def annuler_commande(body: AnnulationBody, db: Session = Depends(get_db)):
         pass
 
     return {"ok": True, "ref": cmd.ref, "statut": "annulee"}
+
+
+# ── Commande WhatsApp (nouveau flux simplifié) ────────────────
+
+class PanierWA(BaseModel):
+    lien:      str
+    prix:      float
+    livraison: Optional[float] = 0.0
+
+
+class CommandeWACreate(BaseModel):
+    client_nom:     str
+    client_tel:     str
+    client_pays:    str
+    client_adresse: str
+    paniers:        List[PanierWA]
+    total_eur:      float
+    total_local:    float
+    devise:         str
+    taux:           float
+
+
+@router.post("/whatsapp", status_code=201)
+def creer_commande_whatsapp(body: CommandeWACreate, db: Session = Depends(get_db)):
+    if not body.paniers:
+        raise HTTPException(400, "Aucun panier fourni")
+
+    cfg = get_config(db)
+
+    # Recalcul serveur du total pour sécurité
+    m      = MONNAIES.get(body.client_pays, {"symbole": "FCFA", "taux_base": 656})
+    is_gnf = m["symbole"] == "GNF"
+    taux   = (cfg.taux_gnf or 9500) if is_gnf else (cfg.taux_change or 656)
+
+    total_eur     = sum(p.prix + (p.livraison or 0) for p in body.paniers)
+    prix_articles = sum(p.prix for p in body.paniers)
+    taux_conv     = taux / 656 if is_gnf else 1.0
+
+    commission_fcfa   = get_commission(prix_articles)
+    commission_locale = round(commission_fcfa * taux_conv)
+    total_local_serveur = round(total_eur * taux) + commission_locale
+
+    # Validation ±5% — utilise toujours le total serveur
+    total_local = _valider_total(total_local_serveur, body.total_local)
+
+    # Construire articles JSON pour stockage et affichage dans l'admin
+    articles_detail = []
+    for i, p in enumerate(body.paniers):
+        articles_detail.append({
+            "lien":                     _sanitize_url(p.lien),
+            "nom":                      f"Panier {i + 1}",
+            "prix_eu":                  p.prix,
+            "frais_livraison_boutique": p.livraison or 0,
+            "poids":                    0.5,  # estimé, sera pesé à réception
+            "qty":                      1,
+            "monnaie":                  m["symbole"],
+        })
+
+    port_info = db.query(PortKg).filter(PortKg.pays == body.client_pays).first()
+
+    commande = Commande(
+        ref             = generate_ref(db),
+        client_nom      = body.client_nom,
+        client_tel      = body.client_tel,
+        client_pays     = body.client_pays,
+        client_adresse  = body.client_adresse,
+        operateur       = "WhatsApp",
+        monnaie         = m["symbole"],
+        total_euro      = round(total_eur, 2),
+        total_local     = round(total_local),
+        poids_estime    = round(len(body.paniers) * 0.5, 2),
+        articles        = json.dumps(articles_detail, ensure_ascii=False),
+        nb_articles     = len(body.paniers),
+        statut          = "en_attente",
+        delai_livraison = port_info.delai if port_info else "—",
+        note_admin      = f"[WhatsApp] {len(body.paniers)} panier(s) — en attente de confirmation",
+    )
+    db.add(commande)
+    db.commit()
+    db.refresh(commande)
+
+    notifier_patron(
+        db,
+        "📲 Nouvelle commande WhatsApp",
+        f"{commande.client_nom} · {commande.ref} · "
+        f"{round(commande.total_local or 0):,} {commande.monnaie} · "
+        f"{len(body.paniers)} panier(s)",
+        commande.ref
+    )
+    db.commit()
+
+    # OneDrive sync
+    try:
+        from routes.onedrive import ajouter_commande_excel
+        import asyncio
+        asyncio.create_task(ajouter_commande_excel({
+            "ref":         commande.ref,
+            "client_nom":  commande.client_nom,
+            "client_tel":  commande.client_tel,
+            "client_pays": commande.client_pays,
+            "total_euro":  commande.total_euro,
+            "monnaie":     commande.monnaie,
+            "statut":      commande.statut,
+            "articles":    commande.articles,
+            "note_admin":  commande.note_admin,
+            "promo_code":  None,
+            "created_at":  commande.created_at,
+            "taux_gnf":    cfg.taux_gnf or 9500,
+        }))
+    except Exception as e:
+        print(f"[OneDrive] Erreur sync commande WA: {e}")
+
+    return {
+        "ref":         commande.ref,
+        "total_local": commande.total_local,
+        "total_euro":  commande.total_euro,
+        "monnaie":     commande.monnaie,
+        "statut":      commande.statut,
+    }
