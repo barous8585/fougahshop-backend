@@ -169,147 +169,6 @@ def stats(request: Request, db: Session = Depends(get_db),
     return base
 
 
-# ── Point 5 : finances calculées en SQL côté serveur ─────────
-# Remplace loadFinances() et renderCharts() qui chargeaient
-# toutes les commandes en RAM côté client.
-
-@router.get("/stats/finances")
-def stats_finances(request: Request, db: Session = Depends(get_db),
-                   role: str = Depends(require_patron)):
-    """
-    Calcule en SQL les données financières nécessaires au tableau de bord patron.
-    Retourne :
-      - kpis_mois      : commissions, volume €, nb commandes du mois courant
-      - comm_6mois     : commissions par mois sur 6 mois glissants
-      - top_pays       : top 5 pays par commission ce mois
-      - senc           : résumé encaissé / à venir
-      - donut_statuts  : répartition des commandes par statut (pour le donut)
-      - volume_6mois   : volume € par mois sur 6 mois (pour les barres)
-    """
-    from datetime import datetime, date
-    now         = datetime.now()
-    mois_courant = now.strftime("%Y-%m")
-
-    STATUTS_PAYES = ("paye", "achete", "expedie", "arrive", "recupere")
-    taux_gnf = float(db.execute(text("SELECT taux_gnf FROM configs WHERE id=1")).scalar() or 9500)
-
-    # ── Paliers commission (identiques au frontend) ────────────
-    def comm_palier(total_eu):
-        if total_eu <= 50:   return 3500
-        if total_eu <= 100:  return 5000
-        if total_eu <= 200:  return 7000
-        if total_eu <= 500:  return 12000
-        return 20000
-
-    def comm_to_fcfa(comm, monnaie):
-        return round(comm * 656 / taux_gnf) if monnaie == "GNF" else comm
-
-    # ── Charger seulement les colonnes nécessaires ─────────────
-    rows = db.execute(text("""
-        SELECT statut, monnaie, total_euro, total_local,
-               TO_CHAR(created_at, 'YYYY-MM') AS mois,
-               client_pays
-        FROM commandes
-        WHERE statut = ANY(:statuts)
-        ORDER BY created_at DESC
-    """), {"statuts": list(STATUTS_PAYES)}).mappings().all()
-
-    # ── KPIs mois courant ──────────────────────────────────────
-    comm_mois = 0
-    volume_mois = 0.0
-    nb_mois = 0
-    comm_encaissee = 0
-    comm_attente = 0
-    total_encaisse_fcfa = 0
-
-    # ── 6 mois glissants ──────────────────────────────────────
-    mois_labels = []
-    for i in range(5, -1, -1):
-        d = date(now.year, now.month, 1)
-        # Reculer i mois
-        m = now.month - i
-        y = now.year
-        while m <= 0:
-            m += 12
-            y -= 1
-        mois_labels.append({
-            "key":   f"{y}-{str(m).zfill(2)}",
-            "label": date(y, m, 1).strftime("%b").capitalize()
-        })
-
-    comm_par_mois  = {m["key"]: 0 for m in mois_labels}
-    volume_par_mois = {m["key"]: 0.0 for m in mois_labels}
-    par_pays = {}
-
-    for r in rows:
-        total_eu  = float(r["total_euro"] or 0)
-        total_loc = float(r["total_local"] or 0)
-        monnaie   = r["monnaie"] or "FCFA"
-        mois      = r["mois"] or ""
-        statut    = r["statut"]
-        pays      = r["client_pays"] or "Inconnu"
-
-        comm = comm_palier(total_eu)
-        comm_fcfa = comm_to_fcfa(comm, monnaie)
-
-        # 6 mois glissants
-        if mois in comm_par_mois:
-            comm_par_mois[mois] += comm_fcfa
-        if mois in volume_par_mois:
-            volume_par_mois[mois] += total_eu
-
-        # Mois courant
-        if mois == mois_courant:
-            comm_mois += comm_fcfa
-            volume_mois += total_eu
-            nb_mois += 1
-            tl_fcfa = round(total_loc * 656 / taux_gnf) if monnaie == "GNF" else total_loc
-            total_encaisse_fcfa += tl_fcfa
-            if statut == "recupere":
-                comm_encaissee += comm_fcfa
-            else:
-                comm_attente += comm_fcfa
-            # Top pays
-            if pays not in par_pays:
-                par_pays[pays] = {"nb": 0, "comm": 0}
-            par_pays[pays]["nb"]   += 1
-            par_pays[pays]["comm"] += comm_fcfa
-
-    top_pays = sorted(par_pays.items(), key=lambda x: x[1]["comm"], reverse=True)[:5]
-
-    # ── Donut statuts (toutes commandes) ──────────────────────
-    donut = db.execute(text("""
-        SELECT statut, COUNT(*) as nb
-        FROM commandes
-        WHERE statut IN ('paye','achete','expedie','arrive','recupere')
-        GROUP BY statut
-    """)).mappings().all()
-
-    return {
-        "kpis_mois": {
-            "comm_fcfa":       comm_mois,
-            "volume_eu":       round(volume_mois, 2),
-            "nb":              nb_mois,
-            "comm_encaissee":  comm_encaissee,
-            "comm_attente":    comm_attente,
-            "total_encaisse":  total_encaisse_fcfa,
-        },
-        "comm_6mois": [
-            {"key": m["key"], "label": m["label"], "comm": comm_par_mois[m["key"]]}
-            for m in mois_labels
-        ],
-        "volume_6mois": [
-            {"key": m["key"], "label": m["label"], "volume": round(volume_par_mois[m["key"]], 2)}
-            for m in mois_labels
-        ],
-        "top_pays": [
-            {"pays": p, "nb": d["nb"], "comm": d["comm"]}
-            for p, d in top_pays
-        ],
-        "donut_statuts": {r["statut"]: r["nb"] for r in donut},
-    }
-
-
 # ── Point 5 : endpoint finances dédié — remplace loadFinances() + renderCharts() ──
 
 @router.get("/stats/finances")
@@ -718,10 +577,20 @@ def update_statut(
             notifier_patron(db, f"📦 Logistique — {STATUT_LABELS.get(body.statut, body.statut)}",
                 f"{cmd.ref} · {cmd.client_nom} · {cmd.client_pays}", cmd.ref)
 
+    # ── OneDrive : mise à jour du statut ─────────────────────
+    try:
+        from routes.onedrive import mettre_a_jour_statut
+        import asyncio
+        asyncio.create_task(mettre_a_jour_statut(
+            ref=ref,
+            nouveau_statut=body.statut,
+            frais_port=port_local if port_local else None
+        ))
+    except Exception as e:
+        print(f"[OneDrive] Erreur sync statut: {e}")
+
     return {"ref": cmd.ref, "statut": cmd.statut, "date_estimee": date_est}
 
-
-# ── Gestion employés (Point 2a : validation pwd min 8 chars) ─
 
 class EmployeCreate(BaseModel):
     nom:  str
