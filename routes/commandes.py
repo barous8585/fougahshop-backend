@@ -512,11 +512,19 @@ def confirmer_kkiapay(body: KkiapayConfirmBody, db: Session = Depends(get_db)):
     return {"ok": True, "ref": cmd.ref, "statut": "paye"}
 
 
+# ── MODIFIÉ : le numéro de téléphone est maintenant obligatoire ──
 @router.get("/suivi/{ref}")
-def suivi(ref: str, db: Session = Depends(get_db)):
+def suivi(ref: str, tel: str = Query(...), db: Session = Depends(get_db)):
     cmd = db.query(Commande).filter(Commande.ref == ref.upper()).first()
     if not cmd:
         raise HTTPException(404, "Commande introuvable")
+
+    # Vérification que le numéro correspond à la commande (8 derniers chiffres)
+    tel_saisi = _normaliser_tel(tel)
+    tel_cmd   = _normaliser_tel(cmd.client_tel or "")
+    if len(tel_saisi) < 8 or tel_saisi[-8:] not in tel_cmd:
+        raise HTTPException(403, "Numéro de téléphone incorrect")
+
     return {
         "ref":             cmd.ref,
         "statut":          cmd.statut,
@@ -662,7 +670,6 @@ def creer_commande_whatsapp(body: CommandeWACreate, db: Session = Depends(get_db
     total_eur     = sum(p.prix + (p.livraison or 0) for p in body.paniers)
     taux_conv     = taux / 656 if is_gnf else 1.0
 
-    # ✅ BUG 2 FIX — arrondi séparé par panier, cohérent avec le frontend
     total_converti = sum(
         round(p.prix * taux) + round((p.livraison or 0) * taux)
         for p in body.paniers
@@ -671,25 +678,20 @@ def creer_commande_whatsapp(body: CommandeWACreate, db: Session = Depends(get_db
     commission_locale = round(commission_fcfa * taux_conv)
     total_brut_serveur  = total_converti + commission_locale
 
-    # ── Réduction promo — via appliquer_promo (vérifie quota, expiry, incrémente une seule fois)
     reduction_serveur = 0
     promo_code_valide = None
     if body.promo_code:
         try:
             code_upper = body.promo_code.strip().upper()
-            # appliquer_promo vérifie expiry + quota + incrémente uses_count atomiquement
             total_apres_promo = appliquer_promo(db, code_upper, total_brut_serveur, taux_conv)
             if total_apres_promo != total_brut_serveur:
-                # La réduction a bien été appliquée
                 promo_code_valide = code_upper
                 reduction_serveur = total_brut_serveur - total_apres_promo
             else:
-                # Code invalide, expiré ou quota épuisé — pas de réduction
                 promo_code_valide = None
         except Exception as e:
             print(f"[WA] Erreur application promo: {e}")
 
-    # ── Réduction parrainage ──────────────────────────────────
     parrain_code_valide = None
     if body.code_parrainage and not promo_code_valide:
         try:
@@ -708,8 +710,6 @@ def creer_commande_whatsapp(body: CommandeWACreate, db: Session = Depends(get_db
             print(f"[WA] Erreur vérif parrainage: {e}")
 
     total_local_serveur = max(0, total_brut_serveur - reduction_serveur)
-
-    # Validation ±5%
     total_local = _valider_total(total_local_serveur, body.total_local)
 
     articles_detail = []
@@ -739,7 +739,6 @@ def creer_commande_whatsapp(body: CommandeWACreate, db: Session = Depends(get_db
         poids_estime    = round(len(body.paniers) * 0.5, 2),
         articles        = json.dumps(articles_detail, ensure_ascii=False),
         nb_articles     = len(body.paniers),
-        # ✅ BUG 1 FIX — statut cohérent avec le frontend (badge CSS existe)
         statut          = "en_attente_paiement",
         delai_livraison = port_info.delai if port_info else "—",
         note_admin      = f"[WhatsApp] {len(body.paniers)} panier(s) — en attente de confirmation",
@@ -749,9 +748,6 @@ def creer_commande_whatsapp(body: CommandeWACreate, db: Session = Depends(get_db
     db.commit()
     db.refresh(commande)
 
-    # ✅ Pas besoin d'appeler utiliser_code ici — appliquer_promo a déjà incrémenté uses_count
-
-    # ── Enregistrer utilisation parrainage ────────────────────
     if parrain_code_valide:
         try:
             cfg_red = db.execute(
