@@ -15,13 +15,62 @@ TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN  = os.environ.get("TWILIO_AUTH_TOKEN")
 TWILIO_WA_NUMBER   = "whatsapp:+14155238886"
 
-# ── Config ────────────────────────────────────────────────────
 FOUGAH_API = "https://fougahshop-backend.onrender.com"
 
+# ── Paliers commission (source unique — import depuis commandes) ──
+try:
+    from routes.commandes import get_commission
+except Exception:
+    def get_commission(total_eu: float) -> int:
+        if total_eu <= 50:   return 3500
+        if total_eu <= 100:  return 5000
+        if total_eu <= 200:  return 7000
+        if total_eu <= 500:  return 12000
+        return 20000
+
+# ── Tous les pays supportés ───────────────────────────────────
+PAYS_MAP = {
+    # Guinée
+    "1": "Guinée", "guinée": "Guinée", "guinee": "Guinée", "guinea": "Guinée",
+    # Bénin
+    "2": "Bénin", "bénin": "Bénin", "benin": "Bénin",
+    # Sénégal
+    "3": "Sénégal", "sénégal": "Sénégal", "senegal": "Sénégal",
+    # Togo
+    "4": "Togo", "togo": "Togo",
+    # Mali
+    "5": "Mali", "mali": "Mali",
+    # Burkina Faso
+    "6": "Burkina Faso", "burkina": "Burkina Faso", "burkina faso": "Burkina Faso",
+    # Cameroun
+    "7": "Cameroun", "cameroun": "Cameroun", "cameroon": "Cameroun",
+    # Côte d'Ivoire
+    "8": "Côte d'Ivoire", "côte d'ivoire": "Côte d'Ivoire", "cote d'ivoire": "Côte d'Ivoire", "ci": "Côte d'Ivoire",
+    # Niger
+    "9": "Niger", "niger": "Niger",
+    # Congo
+    "10": "Congo", "congo": "Congo",
+    # Gabon
+    "11": "Gabon", "gabon": "Gabon",
+}
+
+PAYS_MENU = (
+    "1 - 🇬🇳 Guinée\n"
+    "2 - 🇧🇯 Bénin\n"
+    "3 - 🇸🇳 Sénégal\n"
+    "4 - 🇹🇬 Togo\n"
+    "5 - 🇲🇱 Mali\n"
+    "6 - 🇧🇫 Burkina Faso\n"
+    "7 - 🇨🇲 Cameroun\n"
+    "8 - 🇨🇮 Côte d'Ivoire\n"
+    "9 - 🇳🇪 Niger\n"
+    "10 - 🇨🇬 Congo\n"
+    "11 - 🇬🇦 Gabon"
+)
+
+
 # ══════════════════════════════════════════════════════════════
-# SESSIONS EN BASE (résiste aux redémarrages Render)
-# Table créée au startup dans main.py :
-#   whatsapp_sessions(tel VARCHAR PK, data TEXT, updated_at TIMESTAMP)
+# SESSIONS EN BASE
 # ══════════════════════════════════════════════════════════════
 
 def get_session(tel: str, db: Session) -> dict:
@@ -68,26 +117,18 @@ def twiml_response(msg: str) -> PlainTextResponse:
     return PlainTextResponse(xml, media_type="application/xml")
 
 
-def get_commission(total_eu: float) -> int:
-    """Commission progressive — identique à l'app FougahShop."""
-    if total_eu <= 50:   return 3500
-    if total_eu <= 100:  return 5000
-    if total_eu <= 200:  return 7000
-    if total_eu <= 500:  return 12000
-    return 20000
-
-
-def calculer_total(prix_eu: float, pays: str, cfg: dict) -> str:
+def calculer_total(prix_eu: float, pays: str, cfg: dict) -> tuple[str, int]:
+    """Retourne (total_affiche, total_local_int)"""
     commission = get_commission(prix_eu)
-    if "Guinée" in pays or "Guinee" in pays:
+    if "Guinée" in pays:
         taux = cfg.get("taux_gnf", 9500)
-        commission_gnf = round(commission * taux / 656)
-        total = round((prix_eu * taux) + commission_gnf)
-        return f"{total:,} GNF".replace(",", " ")
+        commission_locale = round(commission * taux / 656)
+        total = round((prix_eu * taux) + commission_locale)
+        return f"{total:,} GNF".replace(",", " "), total
     else:
         taux = cfg.get("taux_change", 660)
         total = round((prix_eu * taux) + commission)
-        return f"{total:,} FCFA".replace(",", " ")
+        return f"{total:,} FCFA".replace(",", " "), total
 
 
 async def obtenir_config_fougah() -> dict:
@@ -97,6 +138,46 @@ async def obtenir_config_fougah() -> dict:
             return resp.json()
     except Exception:
         return {"taux_change": 660, "commission": 3500, "taux_gnf": 9500}
+
+
+def get_operateurs_menu(pays: str, cfg: dict) -> tuple[str, dict]:
+    """Retourne (menu texte, map choix→operateur)"""
+    # Essayer depuis la config admin
+    ops_cfg = cfg.get("operateurs_pays", {}) or {}
+    ops_pays = ops_cfg.get(pays, [])
+
+    if ops_pays:
+        menu = "\n".join([f"{i+1} - {op}" for i, op in enumerate(ops_pays)])
+        op_map = {str(i+1): op for i, op in enumerate(ops_pays)}
+        for op in ops_pays:
+            op_map[op.lower()] = op
+        return menu, op_map
+
+    # Fallback par défaut
+    defaults = {
+        "Guinée":        ["Orange Money"],
+        "Bénin":         ["MTN MoMo", "Moov Money"],
+        "Sénégal":       ["Orange Money", "Wave"],
+        "Togo":          ["Flooz", "TMoney"],
+        "Mali":          ["Orange Money", "Mobicash"],
+        "Burkina Faso":  ["Orange Money", "Mobicash"],
+        "Cameroun":      ["MTN MoMo", "Orange Money"],
+        "Côte d'Ivoire": ["Orange Money", "MTN MoMo", "Wave"],
+        "Niger":         ["Airtel Money"],
+        "Congo":         ["Airtel Money", "MTN MoMo"],
+        "Gabon":         ["Airtel Money"],
+    }
+    ops = defaults.get(pays, ["Mobile Money"])
+    menu = "\n".join([f"{i+1} - {op}" for i, op in enumerate(ops)])
+    op_map = {str(i+1): op for i, op in enumerate(ops)}
+    for op in ops:
+        op_map[op.lower()] = op
+    return menu, op_map
+
+
+def get_numero_paiement(operateur: str, cfg: dict) -> str:
+    nums = cfg.get("numeros_paiement", {}) or {}
+    return nums.get(operateur, "")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -143,18 +224,14 @@ async def whatsapp_webhook(
         url_match = re.search(r'https?://[^\s]+', msg)
         if url_match:
             url = url_match.group(0)
-            session["url"] = url
+            session["url"]   = url
             session["etape"] = "prix_manuel"
-
-            # Identifier le site
             site = next(
                 (s for s in ["Zara","Nike","Amazon","H&M","ASOS","Zalando","Shein","Adidas"]
-                 if s.lower() in url.lower()),
-                ""
+                 if s.lower() in url.lower()), ""
             )
             site_txt = f"*{site}*" if site else "le site"
             save_session(tel, session, db)
-
             return twiml_response(
                 f"✅ Lien {site_txt} reçu !\n\n"
                 f"Quel est le *prix de l'article* affiché sur {site_txt} ?\n\n"
@@ -172,7 +249,7 @@ async def whatsapp_webhook(
 
     # ── ÉTAPE : prix ──────────────────────────────────────────
     elif session["etape"] == "prix_manuel":
-        prix_str = msg.replace(',', '.').strip()
+        prix_str   = msg.replace(',', '.').strip()
         prix_match = re.search(r'[\d]+\.?\d*', prix_str)
         if prix_match:
             try:
@@ -183,16 +260,13 @@ async def whatsapp_webhook(
                         "Exemple : *89.99* ou *150*"
                     )
                 session["total_eu"] = prix
-                session["panier"] = [{"nom": "Article", "prix": f"{prix} €", "qty": 1}]
-                session["etape"] = "choix_pays"
+                session["panier"]   = [{"nom": "Article", "prix": f"{prix} €", "qty": 1}]
+                session["etape"]    = "choix_pays"
                 save_session(tel, session, db)
-
                 return twiml_response(
                     f"✅ *{prix:.2f} €* noté.\n\n"
                     f"🌍 *Dans quel pays êtes-vous ?*\n\n"
-                    f"1 - 🇬🇳 Guinée Conakry\n"
-                    f"2 - 🇧🇯 Bénin\n"
-                    f"3 - 🇸🇳 Sénégal"
+                    f"{PAYS_MENU}"
                 )
             except Exception:
                 pass
@@ -204,86 +278,65 @@ async def whatsapp_webhook(
 
     # ── ÉTAPE : choix pays ────────────────────────────────────
     elif session["etape"] == "choix_pays":
-        pays_map = {
-            "1": "Guinée", "guinée": "Guinée", "guinee": "Guinée", "guinea": "Guinée",
-            "2": "Bénin",  "bénin": "Bénin",   "benin": "Bénin",
-            "3": "Sénégal","sénégal": "Sénégal","senegal": "Sénégal",
-        }
-        pays = pays_map.get(msg_low) or pays_map.get(msg.strip().lower())
+        pays = PAYS_MAP.get(msg_low) or PAYS_MAP.get(msg.strip().lower())
         if pays:
             session["pays"]  = pays
             session["etape"] = "confirmation"
-
-            cfg          = await obtenir_config_fougah()
-            total_eu     = session.get("total_eu", 0)
-            total_local  = calculer_total(total_eu, pays, cfg)
-            session["total_local"] = total_local
+            cfg              = await obtenir_config_fougah()
+            total_eu         = session.get("total_eu", 0)
+            total_aff, total_int = calculer_total(total_eu, pays, cfg)
+            session["total_local"]     = total_aff
+            session["total_local_int"] = total_int
             save_session(tel, session, db)
-
             return twiml_response(
                 f"💰 *Récapitulatif :*\n\n"
-                f"• Article : {session['panier'][0]['nom']}\n"
                 f"• Prix Europe : {total_eu:.2f} €\n"
-                f"• *Total à payer : {total_local}*\n"
+                f"• *Total estimé : {total_aff}*\n"
                 f"_(commission incluse · port calculé après pesée)_\n\n"
                 f"📱 *Votre prénom et numéro Mobile Money ?*\n"
                 f"Ex: Aminata · +224 620 000 000"
             )
         else:
             return twiml_response(
-                "❌ Répondez par un chiffre :\n"
-                "1 - 🇬🇳 Guinée\n"
-                "2 - 🇧🇯 Bénin\n"
-                "3 - 🇸🇳 Sénégal"
+                f"❌ Répondez par un chiffre ou le nom du pays :\n\n{PAYS_MENU}"
             )
 
     # ── ÉTAPE : infos client ──────────────────────────────────
     elif session["etape"] == "confirmation":
         session["nom"]   = msg
         session["etape"] = "operateur"
-        pays = session.get("pays", "")
-
-        if "Guinée" in pays:
-            ops = "1 - 🟠 Orange Money"
-        elif "Bénin" in pays:
-            ops = "1 - 🟡 MTN MoMo\n2 - 🔵 Moov Money"
-        else:
-            ops = "1 - 🟠 Orange Money"
-
+        pays             = session.get("pays", "")
+        cfg              = await obtenir_config_fougah()
+        menu_ops, _      = get_operateurs_menu(pays, cfg)
         save_session(tel, session, db)
         return twiml_response(
             f"✅ Noté !\n\n"
-            f"📱 *Quel opérateur Mobile Money ?*\n\n{ops}"
+            f"📱 *Quel opérateur Mobile Money ?*\n\n{menu_ops}"
         )
 
     # ── ÉTAPE : opérateur ─────────────────────────────────────
     elif session["etape"] == "operateur":
-        pays = session.get("pays", "")
-        if "Guinée" in pays:
-            op_map = {"1": "Orange Money", "orange": "Orange Money"}
-        elif "Bénin" in pays:
-            op_map = {"1": "MTN MoMo", "2": "Moov Money",
-                      "mtn": "MTN MoMo", "moov": "Moov Money"}
-        else:
-            op_map = {"1": "Orange Money", "orange": "Orange Money"}
+        pays          = session.get("pays", "")
+        cfg           = await obtenir_config_fougah()
+        _, op_map     = get_operateurs_menu(pays, cfg)
+        operateur     = op_map.get(msg_low) or op_map.get(msg.strip().lower())
 
-        operateur = op_map.get(msg_low) or op_map.get(msg.strip().lower(), "Orange Money")
+        if not operateur:
+            # Prendre le premier opérateur par défaut
+            operateur = list(op_map.values())[0] if op_map else "Mobile Money"
+
         session["operateur"] = operateur
         session["etape"]     = "valider"
 
-        numeros = {
-            "Orange Money": "+224 620 762 815",
-            "MTN MoMo":     "+229 01 52 26 01 00",
-            "Moov Money":   "+229 01 68 93 55 56",
-        }
-        num   = numeros.get(operateur, "")
+        num   = get_numero_paiement(operateur, cfg)
         total = session.get("total_local", "—")
         save_session(tel, session, db)
 
+        num_txt = f"\nAu numéro : *{num}*" if num else "\n_(Numéro communiqué par WhatsApp)_"
         return twiml_response(
             f"📲 *Instructions de paiement :*\n\n"
-            f"Envoyez *{total}* via {operateur}\n"
-            f"Au numéro : *{num}*\n\n"
+            f"Envoyez *{total}* via {operateur}"
+            f"{num_txt}\n\n"
             f"Après paiement, tapez *PAYÉ* et envoyez la capture de votre transaction."
         )
 
@@ -295,9 +348,11 @@ async def whatsapp_webhook(
                     "client_nom":   session.get("nom", "Client WhatsApp"),
                     "client_tel":   tel,
                     "client_pays":  session.get("pays", ""),
-                    "operateur":    session.get("operateur", "Orange Money"),
+                    "operateur":    session.get("operateur", "Mobile Money"),
                     "client_adresse": "",
                     "client_instructions": f"Commande via WhatsApp | URL: {session.get('url','')}",
+                    # ✅ Fix — statut paye puisque le client confirme le paiement
+                    "mode_paiement": "whatsapp_confirme",
                     "articles": [{
                         "lien":    session.get("url", ""),
                         "nom":     "Commande WhatsApp",
@@ -316,18 +371,32 @@ async def whatsapp_webhook(
                     result = resp.json()
                     ref    = result.get("ref", "—")
 
+                # ✅ Fix — notifier l'admin via l'API statut
+                if ref and ref != "—":
+                    try:
+                        async with httpx.AsyncClient(timeout=10) as client:
+                            await client.patch(
+                                f"{FOUGAH_API}/api/commandes/{ref}/statut-bot",
+                                json={"statut": "en_attente_paiement",
+                                      "note_admin": f"[BOT WA] Client a confirmé le paiement via {session.get('operateur','?')}"},
+                                headers={"Content-Type": "application/json"}
+                            )
+                    except Exception:
+                        pass
+
                 reset_session(tel, db)
                 return twiml_response(
-                    f"🎉 *Commande confirmée !*\n\n"
+                    f"🎉 *Commande enregistrée !*\n\n"
                     f"Référence : *{ref}*\n\n"
-                    f"✅ Nous traitons votre commande dès vérification du paiement.\n"
-                    f"📦 Suivez-la sur fougahshop.com → Suivi → *{ref}*"
+                    f"✅ Notre équipe vérifie votre paiement et traite votre commande.\n"
+                    f"📦 Suivez-la sur fougahshop.com → Suivi → *{ref}*\n\n"
+                    f"Merci de votre confiance 🙏"
                 )
             except Exception:
                 reset_session(tel, db)
                 return twiml_response(
                     "⚠️ Commande reçue mais erreur système.\n"
-                    "Contactez-nous directement sur WhatsApp — nous traitons votre demande."
+                    "Contactez-nous directement — nous traitons votre demande."
                 )
         else:
             return twiml_response(
