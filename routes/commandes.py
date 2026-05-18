@@ -671,25 +671,23 @@ def creer_commande_whatsapp(body: CommandeWACreate, db: Session = Depends(get_db
     commission_locale = round(commission_fcfa * taux_conv)
     total_brut_serveur  = total_converti + commission_locale
 
-    # ── Réduction promo ───────────────────────────────────────
+    # ── Réduction promo — via appliquer_promo (vérifie quota, expiry, incrémente une seule fois)
     reduction_serveur = 0
     promo_code_valide = None
     if body.promo_code:
         try:
-            from routes.promo import verifier_code_get
-            promo_info = verifier_code_get(body.promo_code.strip().upper(), db)
-            if promo_info.get("valide"):
-                promo_code_valide = body.promo_code.strip().upper()
-                type_p  = promo_info.get("type", "fixe")
-                valeur_p = float(promo_info.get("valeur") or 0)
-                if type_p == "pct":
-                    reduction_serveur = round(total_brut_serveur * valeur_p / 100)
-                elif type_p == "fixe":
-                    reduction_fcfa = valeur_p
-                    reduction_serveur = round(reduction_fcfa * taux_conv)
-                # livraison → pas de réduction sur le montant
+            code_upper = body.promo_code.strip().upper()
+            # appliquer_promo vérifie expiry + quota + incrémente uses_count atomiquement
+            total_apres_promo = appliquer_promo(db, code_upper, total_brut_serveur, taux_conv)
+            if total_apres_promo != total_brut_serveur:
+                # La réduction a bien été appliquée
+                promo_code_valide = code_upper
+                reduction_serveur = total_brut_serveur - total_apres_promo
+            else:
+                # Code invalide, expiré ou quota épuisé — pas de réduction
+                promo_code_valide = None
         except Exception as e:
-            print(f"[WA] Erreur vérif promo: {e}")
+            print(f"[WA] Erreur application promo: {e}")
 
     # ── Réduction parrainage ──────────────────────────────────
     parrain_code_valide = None
@@ -751,13 +749,7 @@ def creer_commande_whatsapp(body: CommandeWACreate, db: Session = Depends(get_db
     db.commit()
     db.refresh(commande)
 
-    # ── Enregistrer utilisation promo ────────────────────────
-    if promo_code_valide:
-        try:
-            from routes.promo import utiliser_code as utiliser_promo
-            utiliser_promo(promo_code_valide, db)
-        except Exception as e:
-            print(f"[WA] Erreur enregistrement promo: {e}")
+    # ✅ Pas besoin d'appeler utiliser_code ici — appliquer_promo a déjà incrémenté uses_count
 
     # ── Enregistrer utilisation parrainage ────────────────────
     if parrain_code_valide:
