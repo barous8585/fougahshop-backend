@@ -677,7 +677,6 @@ def creer_commande_whatsapp(body: CommandeWACreate, db: Session = Depends(get_db
     if body.promo_code:
         try:
             from routes.promo import verifier_code_get
-            from database import SessionLocal
             promo_info = verifier_code_get(body.promo_code.strip().upper(), db)
             if promo_info.get("valide"):
                 promo_code_valide = body.promo_code.strip().upper()
