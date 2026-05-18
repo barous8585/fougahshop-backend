@@ -229,15 +229,18 @@ class PanierWA(BaseModel):
 
 
 class CommandeWACreate(BaseModel):
-    client_nom:     str
-    client_tel:     str
-    client_pays:    str
-    client_adresse: str
-    paniers:        List[PanierWA]
-    total_eur:      float
-    total_local:    float
-    devise:         str
-    taux:           float
+    client_nom:          str
+    client_tel:          str
+    client_pays:         str
+    client_adresse:      str
+    paniers:             List[PanierWA]
+    total_eur:           float
+    total_local:         float
+    devise:              str
+    taux:                float
+    promo_code:          Optional[str]   = None
+    code_parrainage:     Optional[str]   = None
+    reduction_appliquee: Optional[float] = None
 
 
 # ── Fonctions utilitaires ─────────────────────────────────────
@@ -666,7 +669,48 @@ def creer_commande_whatsapp(body: CommandeWACreate, db: Session = Depends(get_db
     )
     commission_fcfa   = get_commission(prix_articles)
     commission_locale = round(commission_fcfa * taux_conv)
-    total_local_serveur = total_converti + commission_locale
+    total_brut_serveur  = total_converti + commission_locale
+
+    # ── Réduction promo ───────────────────────────────────────
+    reduction_serveur = 0
+    promo_code_valide = None
+    if body.promo_code:
+        try:
+            from routes.promo import verifier_code_get
+            from database import SessionLocal
+            promo_info = verifier_code_get(body.promo_code.strip().upper(), db)
+            if promo_info.get("valide"):
+                promo_code_valide = body.promo_code.strip().upper()
+                type_p  = promo_info.get("type", "fixe")
+                valeur_p = float(promo_info.get("valeur") or 0)
+                if type_p == "pct":
+                    reduction_serveur = round(total_brut_serveur * valeur_p / 100)
+                elif type_p == "fixe":
+                    reduction_fcfa = valeur_p
+                    reduction_serveur = round(reduction_fcfa * taux_conv)
+                # livraison → pas de réduction sur le montant
+        except Exception as e:
+            print(f"[WA] Erreur vérif promo: {e}")
+
+    # ── Réduction parrainage ──────────────────────────────────
+    parrain_code_valide = None
+    if body.code_parrainage and not promo_code_valide:
+        try:
+            parrain_row = db.execute(
+                text("SELECT parrain_tel FROM parrainage_codes WHERE code=:c AND actif=TRUE"),
+                {"c": body.code_parrainage.strip().upper()}
+            ).mappings().first()
+            if parrain_row and parrain_row["parrain_tel"] != body.client_tel:
+                parrain_code_valide = body.code_parrainage.strip().upper()
+                cfg_red = db.execute(
+                    text("SELECT reduction_parrainage FROM configs WHERE id=1 LIMIT 1")
+                ).fetchone()
+                red_fcfa = float(cfg_red[0]) if cfg_red and cfg_red[0] else 1000.0
+                reduction_serveur = round(red_fcfa * taux_conv)
+        except Exception as e:
+            print(f"[WA] Erreur vérif parrainage: {e}")
+
+    total_local_serveur = max(0, total_brut_serveur - reduction_serveur)
 
     # Validation ±5%
     total_local = _valider_total(total_local_serveur, body.total_local)
@@ -702,10 +746,45 @@ def creer_commande_whatsapp(body: CommandeWACreate, db: Session = Depends(get_db
         statut          = "en_attente_paiement",
         delai_livraison = port_info.delai if port_info else "—",
         note_admin      = f"[WhatsApp] {len(body.paniers)} panier(s) — en attente de confirmation",
+        promo_code      = promo_code_valide or parrain_code_valide,
     )
     db.add(commande)
     db.commit()
     db.refresh(commande)
+
+    # ── Enregistrer utilisation promo ────────────────────────
+    if promo_code_valide:
+        try:
+            from routes.promo import utiliser_code as utiliser_promo
+            utiliser_promo(promo_code_valide, db)
+        except Exception as e:
+            print(f"[WA] Erreur enregistrement promo: {e}")
+
+    # ── Enregistrer utilisation parrainage ────────────────────
+    if parrain_code_valide:
+        try:
+            cfg_red = db.execute(
+                text("SELECT reduction_parrainage, gain_parrain FROM configs WHERE id=1 LIMIT 1")
+            ).fetchone()
+            red_fcfa = float(cfg_red[0]) if cfg_red and cfg_red[0] else 1000.0
+            gain_p   = float(cfg_red[1]) if cfg_red and cfg_red[1] else round(red_fcfa * 0.5)
+            sql_check = "SELECT 1 FROM parrainage_utilisations u JOIN parrainage_codes p ON p.code = u.code WHERE p.code = :c AND u.filleul_tel = :t"
+            deja = db.execute(text(sql_check), {"c": parrain_code_valide, "t": body.client_tel}).fetchone()
+            if not deja:
+                db.execute(text(
+                    "INSERT INTO parrainage_utilisations "
+                    "(code, filleul_tel, filleul_nom, commande_ref, reduction_appliquee) "
+                    "VALUES (:c, :t, :n, :r, :red)"
+                ), {"c": parrain_code_valide, "t": body.client_tel,
+                    "n": body.client_nom, "r": commande.ref, "red": red_fcfa})
+                db.execute(text(
+                    "UPDATE parrainage_codes "
+                    "SET nb_filleuls=nb_filleuls+1, credit_total=credit_total+:g WHERE code=:c"
+                ), {"g": gain_p, "c": parrain_code_valide})
+                db.commit()
+        except Exception as e:
+            print(f"[WA] Erreur enregistrement parrainage: {e}")
+            db.rollback()
 
     notifier_patron(
         db,
