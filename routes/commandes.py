@@ -168,6 +168,98 @@ def appliquer_promo(db, promo_code: str, total_local: float, taux_conv: float) -
         return total_local
 
 
+# ✅ NOUVEAU — Lit le gain parrain depuis la config BDD
+def _get_gain_parrain(db, reduction_fcfa: float) -> float:
+    try:
+        cfg_row = db.execute(
+            text("SELECT gain_parrain FROM configs WHERE id=1 LIMIT 1")
+        ).fetchone()
+        if cfg_row and cfg_row[0]:
+            return float(cfg_row[0])
+    except Exception:
+        pass
+    return round(reduction_fcfa * 0.5)
+
+
+# ✅ NOUVEAU — Enregistre le parrainage côté serveur de façon atomique
+def _enregistrer_parrainage(
+    db,
+    code: str,
+    filleul_tel: str,
+    filleul_nom: str,
+    commande_ref: str,
+    reduction_fcfa: float,
+) -> bool:
+    """
+    Enregistre l'utilisation d'un code parrainage.
+    Retourne True si enregistré, False si déjà utilisé ou invalide.
+    Toutes les vérifications et écritures sont faites ici côté serveur.
+    """
+    code = code.upper().strip()
+    try:
+        # Vérifier que le code existe et est actif
+        parrain = db.execute(
+            text("SELECT parrain_tel FROM parrainage_codes WHERE code=:c AND actif=TRUE"),
+            {"c": code}
+        ).mappings().first()
+        if not parrain:
+            print(f"[parrainage] Code {code} invalide ou inactif")
+            return False
+
+        # Anti auto-parrainage
+        def norm(t): return ''.join(filter(str.isdigit, t or ""))
+        if norm(filleul_tel) == norm(parrain["parrain_tel"]):
+            print(f"[parrainage] Auto-parrainage bloqué pour {filleul_tel}")
+            return False
+
+        # Anti double utilisation
+        deja = db.execute(
+            text("""
+                SELECT 1 FROM parrainage_utilisations u
+                JOIN parrainage_codes p ON p.code = u.code
+                WHERE p.code = :c
+                AND REPLACE(REPLACE(REPLACE(u.filleul_tel, ' ', ''), '-', ''), '+', '')
+                  = REPLACE(REPLACE(REPLACE(:t, ' ', ''), '-', ''), '+', '')
+            """),
+            {"c": code, "t": filleul_tel}
+        ).fetchone()
+        if deja:
+            print(f"[parrainage] Déjà utilisé par {filleul_tel} pour code {code}")
+            return False
+
+        # Lire le gain parrain depuis la config
+        gain = _get_gain_parrain(db, reduction_fcfa)
+
+        # ✅ INSERT avec commande_ref directement — pas de patch en deux temps
+        db.execute(
+            text("""
+                INSERT INTO parrainage_utilisations
+                    (code, filleul_tel, filleul_nom, commande_ref, reduction_appliquee)
+                VALUES (:c, :t, :n, :r, :red)
+            """),
+            {"c": code, "t": filleul_tel, "n": filleul_nom,
+             "r": commande_ref, "red": reduction_fcfa}
+        )
+
+        # Créditer le parrain
+        db.execute(
+            text("""
+                UPDATE parrainage_codes
+                SET nb_filleuls = nb_filleuls + 1,
+                    credit_total = credit_total + :g
+                WHERE code = :c
+            """),
+            {"g": gain, "c": code}
+        )
+        db.flush()
+        print(f"[parrainage] ✅ Code {code} utilisé par {filleul_tel} — gain parrain: {gain} FCFA")
+        return True
+
+    except Exception as e:
+        print(f"[parrainage] Erreur _enregistrer_parrainage: {e}")
+        return False
+
+
 # ── Schemas ───────────────────────────────────────────────────
 
 class ArticleIn(BaseModel):
@@ -376,36 +468,6 @@ def creer_commande(body: CommandeCreate, db: Session = Depends(get_db)):
             "monnaie":                  detail["monnaie"],
         })
 
-    if body.code_parrainage:
-        try:
-            code_p = body.code_parrainage.upper().strip()
-            parrain = db.execute(
-                text("SELECT parrain_tel FROM parrainage_codes WHERE code=:c AND actif=TRUE"),
-                {"c": code_p}
-            ).mappings().first()
-            if parrain and parrain["parrain_tel"] != body.client_tel:
-                deja = db.execute(
-                    text("SELECT 1 FROM parrainage_utilisations WHERE code=:c AND filleul_tel=:t"),
-                    {"c": code_p, "t": body.client_tel}
-                ).fetchone()
-                if not deja:
-                    gain = float(body.reduction_parrainage or 1000) * 0.5
-                    db.execute(text(
-                        "INSERT INTO parrainage_utilisations "
-                        "(code, filleul_tel, filleul_nom, commande_ref, reduction_appliquee) "
-                        "VALUES (:c, :t, :n, :r, :red)"
-                    ), {"c": code_p, "t": body.client_tel, "n": body.client_nom,
-                        "r": "", "red": body.reduction_parrainage or 1000})
-                    db.execute(text(
-                        "UPDATE parrainage_codes "
-                        "SET nb_filleuls=nb_filleuls+1, credit_total=credit_total+:g "
-                        "WHERE code=:c"
-                    ), {"g": gain, "c": code_p})
-                    db.commit()
-        except Exception as e:
-            print(f"[parrainage] Erreur: {e}")
-            db.rollback()
-
     statut_initial = "paye" if body.mode_paiement == "kkiapay" else "en_attente_paiement"
 
     note_auto = None
@@ -413,38 +475,44 @@ def creer_commande(body: CommandeCreate, db: Session = Depends(get_db)):
         note_auto = f"[KKIAPAY] Transaction: {body.kkiapay_transaction_id}"
 
     commande = Commande(
-        ref              = generate_ref(db),
-        client_nom       = body.client_nom,
-        client_tel       = body.client_tel,
-        client_pays      = body.client_pays,
-        client_adresse   = body.client_adresse,
+        ref                 = generate_ref(db),
+        client_nom          = body.client_nom,
+        client_tel          = body.client_tel,
+        client_pays         = body.client_pays,
+        client_adresse      = body.client_adresse,
         client_instructions = body.client_instructions,
-        operateur        = body.operateur,
-        monnaie          = monnaie,
-        total_euro       = round(total_eu, 2),
-        total_local      = round(total_local),
-        poids_estime     = round(poids_total, 2),
-        articles         = json.dumps(articles_detail, ensure_ascii=False),
-        nb_articles      = len(body.articles),
-        statut           = statut_initial,
-        delai_livraison  = port_info.delai if port_info else "—",
-        note_admin       = note_auto,
-        promo_code       = body.promo_code,
+        operateur           = body.operateur,
+        monnaie             = monnaie,
+        total_euro          = round(total_eu, 2),
+        total_local         = round(total_local),
+        poids_estime        = round(poids_total, 2),
+        articles            = json.dumps(articles_detail, ensure_ascii=False),
+        nb_articles         = len(body.articles),
+        statut              = statut_initial,
+        delai_livraison     = port_info.delai if port_info else "—",
+        note_admin          = note_auto,
+        promo_code          = body.promo_code,
     )
     db.add(commande)
     db.commit()
     db.refresh(commande)
 
-    if body.code_parrainage:
+    # ✅ CORRIGÉ — Parrainage enregistré côté serveur, une seule fois, avec la ref réelle
+    # Plus de double appel frontend + backend, plus de patch en deux temps
+    if body.code_parrainage and body.code_parrainage.strip():
         try:
-            db.execute(text(
-                "UPDATE parrainage_utilisations SET commande_ref=:r "
-                "WHERE code=:c AND filleul_tel=:t AND commande_ref=''"
-            ), {"r": commande.ref, "c": body.code_parrainage.upper().strip(),
-                "t": body.client_tel})
+            _enregistrer_parrainage(
+                db           = db,
+                code         = body.code_parrainage,
+                filleul_tel  = body.client_tel,
+                filleul_nom  = body.client_nom,
+                commande_ref = commande.ref,          # ✅ ref réelle directement
+                reduction_fcfa = float(body.reduction_parrainage or 1000),
+            )
             db.commit()
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[parrainage] Erreur enregistrement: {e}")
+            db.rollback()
 
     mode_label = "💳 Kkiapay ✅" if body.mode_paiement == "kkiapay" else "📱 Virement manuel"
     notifier_patron(
@@ -512,14 +580,12 @@ def confirmer_kkiapay(body: KkiapayConfirmBody, db: Session = Depends(get_db)):
     return {"ok": True, "ref": cmd.ref, "statut": "paye"}
 
 
-# ── MODIFIÉ : le numéro de téléphone est maintenant obligatoire ──
 @router.get("/suivi/{ref}")
 def suivi(ref: str, tel: str = Query(...), db: Session = Depends(get_db)):
     cmd = db.query(Commande).filter(Commande.ref == ref.upper()).first()
     if not cmd:
         raise HTTPException(404, "Commande introuvable")
 
-    # Vérification que le numéro correspond à la commande (8 derniers chiffres)
     tel_saisi = _normaliser_tel(tel)
     tel_cmd   = _normaliser_tel(cmd.client_tel or "")
     if len(tel_saisi) < 8 or tel_saisi[-8:] not in tel_cmd:
@@ -693,6 +759,7 @@ def creer_commande_whatsapp(body: CommandeWACreate, db: Session = Depends(get_db
             print(f"[WA] Erreur application promo: {e}")
 
     parrain_code_valide = None
+    reduction_parrain_fcfa = 1000.0
     if body.code_parrainage and not promo_code_valide:
         try:
             parrain_row = db.execute(
@@ -704,8 +771,8 @@ def creer_commande_whatsapp(body: CommandeWACreate, db: Session = Depends(get_db
                 cfg_red = db.execute(
                     text("SELECT reduction_parrainage FROM configs WHERE id=1 LIMIT 1")
                 ).fetchone()
-                red_fcfa = float(cfg_red[0]) if cfg_red and cfg_red[0] else 1000.0
-                reduction_serveur = round(red_fcfa * taux_conv)
+                reduction_parrain_fcfa = float(cfg_red[0]) if cfg_red and cfg_red[0] else 1000.0
+                reduction_serveur = round(reduction_parrain_fcfa * taux_conv)
         except Exception as e:
             print(f"[WA] Erreur vérif parrainage: {e}")
 
@@ -748,27 +815,18 @@ def creer_commande_whatsapp(body: CommandeWACreate, db: Session = Depends(get_db
     db.commit()
     db.refresh(commande)
 
+    # ✅ CORRIGÉ — Parrainage WA via la même fonction centralisée
     if parrain_code_valide:
         try:
-            cfg_red = db.execute(
-                text("SELECT reduction_parrainage, gain_parrain FROM configs WHERE id=1 LIMIT 1")
-            ).fetchone()
-            red_fcfa = float(cfg_red[0]) if cfg_red and cfg_red[0] else 1000.0
-            gain_p   = float(cfg_red[1]) if cfg_red and cfg_red[1] else round(red_fcfa * 0.5)
-            sql_check = "SELECT 1 FROM parrainage_utilisations u JOIN parrainage_codes p ON p.code = u.code WHERE p.code = :c AND u.filleul_tel = :t"
-            deja = db.execute(text(sql_check), {"c": parrain_code_valide, "t": body.client_tel}).fetchone()
-            if not deja:
-                db.execute(text(
-                    "INSERT INTO parrainage_utilisations "
-                    "(code, filleul_tel, filleul_nom, commande_ref, reduction_appliquee) "
-                    "VALUES (:c, :t, :n, :r, :red)"
-                ), {"c": parrain_code_valide, "t": body.client_tel,
-                    "n": body.client_nom, "r": commande.ref, "red": red_fcfa})
-                db.execute(text(
-                    "UPDATE parrainage_codes "
-                    "SET nb_filleuls=nb_filleuls+1, credit_total=credit_total+:g WHERE code=:c"
-                ), {"g": gain_p, "c": parrain_code_valide})
-                db.commit()
+            _enregistrer_parrainage(
+                db             = db,
+                code           = parrain_code_valide,
+                filleul_tel    = body.client_tel,
+                filleul_nom    = body.client_nom,
+                commande_ref   = commande.ref,
+                reduction_fcfa = reduction_parrain_fcfa,
+            )
+            db.commit()
         except Exception as e:
             print(f"[WA] Erreur enregistrement parrainage: {e}")
             db.rollback()
@@ -796,7 +854,7 @@ def creer_commande_whatsapp(body: CommandeWACreate, db: Session = Depends(get_db
             "statut":      commande.statut,
             "articles":    commande.articles,
             "note_admin":  commande.note_admin,
-            "promo_code":  None,
+            "promo_code":  commande.promo_code,
             "created_at":  commande.created_at,
             "taux_gnf":    cfg.taux_gnf or 9500,
         }))
