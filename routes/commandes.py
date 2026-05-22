@@ -781,6 +781,12 @@ def creer_commande_whatsapp(body: CommandeWACreate, db: Session = Depends(get_db
 
     articles_detail = []
     for i, p in enumerate(body.paniers):
+        # ✅ CORRIGÉ — calculer total_local pour que la page suivi affiche le bon prix
+        prix_total_eu = p.prix + (p.livraison or 0)
+        if is_gnf:
+            total_local_art = round(p.prix * taux)
+        else:
+            total_local_art = round(p.prix * taux)
         articles_detail.append({
             "lien":                     _sanitize_url(p.lien),
             "nom":                      f"Panier {i + 1}",
@@ -789,6 +795,7 @@ def creer_commande_whatsapp(body: CommandeWACreate, db: Session = Depends(get_db
             "poids":                    0.5,
             "qty":                      1,
             "monnaie":                  m["symbole"],
+            "total_local":              total_local_art,
         })
 
     port_info = db.query(PortKg).filter(PortKg.pays == body.client_pays).first()
