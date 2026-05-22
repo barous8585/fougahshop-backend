@@ -10,7 +10,7 @@ router = APIRouter(prefix="/api/promos", tags=["promos"])
 
 
 # ══════════════════════════════════════════════════════════════
-# TABLE — migration (appeler UNE SEULE FOIS au startup dans main.py)
+# TABLE — migration
 # ══════════════════════════════════════════════════════════════
 
 def ensure_tables(db: Session):
@@ -69,9 +69,37 @@ def ensure_tables(db: Session):
         except Exception:
             pass
         db.commit()
+
+        # ✅ AJOUT — Resync uses_count depuis les vraies commandes au startup
+        _resync_uses_count(db)
+        print("[promo] ✅ uses_count resynchronisé depuis les commandes réelles")
+
     except Exception as e:
         db.rollback()
         print(f"[promo] ensure_tables error: {e}")
+
+
+# ✅ AJOUT — Resynchronise uses_count depuis les vraies commandes
+def _resync_uses_count(db: Session):
+    """
+    Recalcule uses_count de chaque code promo depuis la table commandes.
+    Exclut les commandes annulées et refusées.
+    """
+    try:
+        db.execute(text("""
+            UPDATE promo_codes p
+            SET uses_count = (
+                SELECT COUNT(*)
+                FROM commandes c
+                WHERE c.promo_code = p.code
+                  AND c.statut NOT IN ('annulee', 'paiement_refuse')
+            )
+            WHERE p.code IS NOT NULL
+        """))
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        print(f"[promo] _resync_uses_count error: {e}")
 
 
 def is_expired(expiry) -> bool:
@@ -99,7 +127,6 @@ def check_quota(p) -> bool:
 
 @router.get("/verifier/{code}")
 def verifier_code_get(code: str, db: Session = Depends(get_db)):
-    """Vérification publique d'un code promo. Pas d'ensure_tables ici — fait au startup."""
     code = code.strip().upper()
     row = db.execute(
         text("SELECT * FROM promo_codes WHERE code=:code AND actif=TRUE LIMIT 1"),
@@ -139,16 +166,21 @@ def verifier_code_post(body: Dict[str, Any], db: Session = Depends(get_db)):
     return verifier_code_get(code, db)
 
 
-# ✅ NOUVEAU — Endpoint public pour la page influenceur
 @router.get("/influenceur/{code}")
 def get_stats_influenceur(code: str, db: Session = Depends(get_db)):
     """
-    Stats publiques pour un influenceur — pas d'authentification requise.
-    Accessible uniquement pour les codes avec un champ influenceur renseigné.
+    Stats temps réel pour un influenceur.
+    ✅ CORRIGÉ :
+      - Plus de LIMIT 50 : toutes les commandes comptées
+      - uses_count recalculé depuis la table commandes (pas promo_codes.uses_count)
+      - gain_total basé sur commandes confirmées uniquement
+      - nb_en_attente et nb_annulees retournés pour le frontend
+      - Resync automatique si écart détecté
     """
+    code = code.strip().upper()
     row = db.execute(
         text("SELECT * FROM promo_codes WHERE code=:code AND actif=TRUE LIMIT 1"),
-        {"code": code.strip().upper()}
+        {"code": code}
     ).mappings().first()
 
     if not row:
@@ -159,41 +191,65 @@ def get_stats_influenceur(code: str, db: Session = Depends(get_db)):
     if not influenceur:
         raise HTTPException(404, "Ce code n'est pas un code influenceur.")
 
-    uses_count   = int(promo.get("uses_count") or promo.get("utilisations") or 0)
     gain_par_cmd = float(promo.get("gain_influenceur") or 0)
 
-    # Commandes générées par ce code
+    # ✅ CORRIGÉ — toutes les commandes, sans LIMIT
     try:
         cmds_rows = db.execute(text("""
-            SELECT ref, statut, created_at
+            SELECT ref, statut, created_at, total_euro
             FROM commandes
             WHERE promo_code = :code
             ORDER BY created_at DESC
-            LIMIT 50
-        """), {"code": code.strip().upper()}).mappings().all()
+        """), {"code": code}).mappings().all()
         commandes = [dict(r) for r in cmds_rows]
-    except Exception:
+    except Exception as e:
+        print(f"[promo] Erreur récup commandes {code}: {e}")
         commandes = []
 
-    # ✅ Gain calculé sur commandes actives seulement (exclut annulées/refusées)
-    STATUTS_EXCLUS = {"annulee", "paiement_refuse", "en_attente_paiement"}
-    commandes_actives = [c for c in commandes if c.get("statut") not in STATUTS_EXCLUS]
-    gain_total = round(gain_par_cmd * len(commandes_actives))
-    ca_euro    = sum(float(c.get("total_euro") or 0) for c in commandes_actives)
+    # ✅ CORRIGÉ — séparer précisément par statut
+    STATUTS_CONFIRMES = {"paye", "achete", "expedie", "arrive", "recupere"}
+    STATUTS_ANNULES   = {"annulee", "paiement_refuse"}
+
+    commandes_confirmees = [c for c in commandes if c.get("statut") in STATUTS_CONFIRMES]
+    commandes_attente    = [c for c in commandes if c.get("statut") == "en_attente_paiement"]
+    commandes_annulees   = [c for c in commandes if c.get("statut") in STATUTS_ANNULES]
+
+    # uses_count = confirmées + en attente (excluant uniquement les annulées/refusées)
+    uses_count_reel = len(commandes_confirmees) + len(commandes_attente)
+
+    # gain_total = confirmées uniquement
+    gain_total = round(gain_par_cmd * len(commandes_confirmees))
+    ca_euro    = sum(float(c.get("total_euro") or 0) for c in commandes_confirmees)
+
+    # ✅ Resynchroniser uses_count si écart détecté
+    uses_count_base = int(promo.get("uses_count") or promo.get("utilisations") or 0)
+    if uses_count_reel != uses_count_base:
+        try:
+            db.execute(text(
+                "UPDATE promo_codes SET uses_count = :n WHERE code = :c"
+            ), {"n": uses_count_reel, "c": code})
+            db.commit()
+            print(f"[promo] uses_count resync {code}: {uses_count_base} → {uses_count_reel}")
+        except Exception as e:
+            db.rollback()
+            print(f"[promo] resync error: {e}")
 
     return {
         "code":             promo["code"],
         "influenceur":      influenceur,
-        "pays":             promo.get("pays") or "",   # ✅ pays de l'influenceur
+        "pays":             promo.get("pays") or "",
         "actif":            True,
         "type":             promo.get("type", "fixe"),
         "valeur":           float(promo.get("valeur") or 0),
-        "uses_count":       uses_count,
-        "nb_commandes":     len(commandes_actives),
+        "expiry":           str(promo.get("expiry") or ""),
+        "uses_count":       uses_count_reel,
+        "nb_commandes":     len(commandes_confirmees),
+        "nb_en_attente":    len(commandes_attente),
+        "nb_annulees":      len(commandes_annulees),
         "gain_par_cmd":     gain_par_cmd,
         "gain_influenceur": gain_par_cmd,
         "gain_total":       gain_total,
-        "expiry":           str(promo.get("expiry") or ""),
+        "ca_euro":          round(ca_euro, 2),
         "commandes":        commandes,
     }
 
@@ -206,9 +262,12 @@ def get_stats_influenceur(code: str, db: Session = Depends(get_db)):
 def list_promos(
     request: Request,
     db: Session = Depends(get_db),
-    role: str = Depends(require_patron)   # ✅ require_patron — pas require_auth
+    role: str = Depends(require_patron)
 ):
-    """Liste tous les codes promo avec stats."""
+    """
+    Liste tous les codes promo avec stats.
+    ✅ CORRIGÉ — uses_count et gain recalculés depuis les vraies commandes.
+    """
     rows = db.execute(
         text("SELECT * FROM promo_codes ORDER BY created_at DESC")
     ).fetchall()
@@ -223,38 +282,83 @@ def list_promos(
         except Exception:
             cmds = []
 
-        uses  = p.uses_count or getattr(p, "utilisations", 0) or 0
-        max_u = p.max_uses or p.quota or 0
-        valeur = p.valeur or p.reduction_fcfa or 0
-        type_  = p.type or "fixe"
+        # ✅ CORRIGÉ — compter depuis les vraies commandes
+        cmds_confirmees = [c for c in cmds if c.statut in ("paye","achete","expedie","arrive","recupere")]
+        cmds_attente    = [c for c in cmds if c.statut == "en_attente_paiement"]
+        cmds_annulees   = [c for c in cmds if c.statut in ("annulee","paiement_refuse")]
+
+        uses_reel    = len(cmds_confirmees) + len(cmds_attente)
+        max_u        = p.max_uses or p.quota or 0
+        valeur       = p.valeur or p.reduction_fcfa or 0
+        type_        = p.type or "fixe"
         gain_par_cmd = getattr(p, "gain_influenceur", 0) or 0
-        gain  = gain_par_cmd * uses
-        ca    = sum(c.total_euro or 0 for c in cmds)
+        gain         = gain_par_cmd * len(cmds_confirmees)
+        ca           = sum(c.total_euro or 0 for c in cmds_confirmees)
 
         result.append({
-            "id":          p.id,
-            "code":        p.code,
-            "type":        type_,
-            "valeur":      valeur,
-            "reduction_fcfa": valeur if type_ == "fixe" else None,
-            "influenceur": getattr(p, "influenceur", None),
-            "gain_influenceur": gain_par_cmd,
-            "gain_par_cmd":    gain_par_cmd,
-            "client_tel":  getattr(p, "client_tel", None),
-            "max_uses":    max_u,
-            "uses_count":  uses,
-            "quota":       max_u,
-            "utilisations": uses,
-            "utilisations_restantes": max(0, max_u - uses) if max_u > 0 else None,
-            "note":        getattr(p, "note", None),
-            "expiry":      str(p.expiry) if p.expiry else None,
-            "actif":       bool(p.actif),
-            "ca_euro":     round(ca, 2),
-            "gain_total_fcfa": round(gain),
-            "commandes":   [{"ref": c.ref, "statut": c.statut} for c in cmds],
-            "created_at":  str(p.created_at),
+            "id":                     p.id,
+            "code":                   p.code,
+            "type":                   type_,
+            "valeur":                 valeur,
+            "reduction_fcfa":         valeur if type_ == "fixe" else None,
+            "influenceur":            getattr(p, "influenceur", None),
+            "gain_influenceur":       gain_par_cmd,
+            "gain_par_cmd":           gain_par_cmd,
+            "client_tel":             getattr(p, "client_tel", None),
+            "max_uses":               max_u,
+            "uses_count":             uses_reel,
+            "quota":                  max_u,
+            "utilisations":           uses_reel,
+            "utilisations_restantes": max(0, max_u - uses_reel) if max_u > 0 else None,
+            "note":                   getattr(p, "note", None),
+            "expiry":                 str(p.expiry) if p.expiry else None,
+            "actif":                  bool(p.actif),
+            "ca_euro":                round(ca, 2),
+            "gain_total_fcfa":        round(gain),
+            "nb_confirmees":          len(cmds_confirmees),
+            "nb_en_attente":          len(cmds_attente),
+            "nb_annulees":            len(cmds_annulees),
+            "commandes":              [{"ref": c.ref, "statut": c.statut} for c in cmds],
+            "created_at":             str(p.created_at),
         })
     return result
+
+
+# ✅ AJOUT — Resync manuel depuis l'admin
+@router.get("/admin/resync")
+def resync_uses_count(
+    request: Request,
+    db: Session = Depends(get_db),
+    role: str = Depends(require_patron)
+):
+    """Resynchronise TOUS les uses_count depuis les vraies commandes."""
+    try:
+        db.execute(text("""
+            UPDATE promo_codes p
+            SET uses_count = (
+                SELECT COUNT(*)
+                FROM commandes c
+                WHERE c.promo_code = p.code
+                  AND c.statut NOT IN ('annulee', 'paiement_refuse')
+            )
+            WHERE p.code IS NOT NULL
+        """))
+        db.commit()
+        rows = db.execute(text(
+            "SELECT code, influenceur, uses_count FROM promo_codes "
+            "WHERE influenceur IS NOT NULL ORDER BY uses_count DESC"
+        )).fetchall()
+        return {
+            "ok": True,
+            "message": "uses_count resynchronisé depuis les commandes réelles",
+            "influenceurs": [
+                {"code": r.code, "influenceur": r.influenceur, "uses_count": r.uses_count}
+                for r in rows
+            ]
+        }
+    except Exception as e:
+        db.rollback()
+        return {"ok": False, "error": str(e)}
 
 
 @router.post("", status_code=201)
@@ -282,7 +386,6 @@ def create_promo(
         raise HTTPException(400, "Type invalide (fixe, pct ou livraison)")
 
     valeur = float(body.get("valeur", body.get("reduction_fcfa", 0)))
-    # ✅ Type livraison → valeur = 0 est valide (pas de réduction sur le prix)
     if type_ != "livraison" and valeur <= 0:
         raise HTTPException(400, "La valeur doit être positive")
     if type_ == "pct" and valeur > 100:
@@ -356,12 +459,6 @@ def update_promo_by_id(
     db: Session = Depends(get_db),
     role: str = Depends(require_patron)
 ):
-    # Whitelist stricte des colonnes modifiables
-    ALLOWED_COLS = {
-        "actif", "type", "valeur", "reduction_fcfa",
-        "quota", "max_uses", "gain_influenceur",
-        "note", "expiry", "client_tel"
-    }
     updates, params = [], {"id": promo_id}
 
     if "actif"           in body: updates.append("actif=:actif");                      params["actif"]           = bool(body["actif"])
@@ -380,7 +477,6 @@ def update_promo_by_id(
         updates += ["uses_count=0","actif=TRUE"]
 
     if updates:
-        # Colonnes construites depuis la whitelist — pas d'injection possible
         db.execute(text(f"UPDATE promo_codes SET {', '.join(updates)} WHERE id=:id"), params)
         db.commit()
     return {"ok": True}
@@ -421,8 +517,9 @@ def delete_promo_by_id(
 
 def utiliser_code(code: str, db: Session):
     """
-    ✅ CORRIGÉ — Incrémente uses_count UNE SEULE FOIS.
-    Ancienne version incrémentait uses_count ET utilisations → doublait le compteur.
+    Incrémente uses_count UNE SEULE FOIS.
+    Note : uses_count est aussi resynchronisé au startup via _resync_uses_count()
+    et à chaque visite de la page influenceur — source de vérité = table commandes.
     """
     if not code:
         return
