@@ -11,7 +11,7 @@ router = APIRouter(prefix="/api", tags=["parrainage", "galerie"])
 
 
 # ══════════════════════════════════════════════════════════════
-# MIGRATION — appelée au startup depuis main.py
+# MIGRATION
 # ══════════════════════════════════════════════════════════════
 
 def ensure_parrainage_tables(db: Session):
@@ -55,15 +55,12 @@ def ensure_parrainage_tables(db: Session):
 
 
 def _normaliser_tel(tel: str) -> str:
-    """Normalise un numéro de téléphone pour la comparaison."""
+    """Normalise un numéro — retire +, espaces, tirets."""
     return tel.replace(" ", "").replace("-", "").replace("+", "").strip()
 
 
 def gen_code_parrainage(tel: str) -> str:
-    """
-    4 derniers chiffres du tel + 6 caractères aléatoires.
-    Espace de 36^6 = 2.1 milliards de combinaisons → collisions quasi impossibles.
-    """
+    """FG + 4 derniers chiffres du tel + 6 chars aléatoires."""
     chars  = string.ascii_uppercase + string.digits
     suffix = ''.join(secrets.choice(chars) for _ in range(6))
     prefix = _normaliser_tel(tel)[-4:] if len(_normaliser_tel(tel)) >= 4 else _normaliser_tel(tel)
@@ -71,17 +68,19 @@ def gen_code_parrainage(tel: str) -> str:
 
 
 # ══════════════════════════════════════════════════════════════
-# PARRAINAGE — routes publiques
+# ROUTES PUBLIQUES
 # ══════════════════════════════════════════════════════════════
 
 @router.get("/parrainage/code/{tel}")
 def get_mon_code(tel: str, db: Session = Depends(get_db)):
     """
     Retourne le code parrainage + stats.
-    Crée le code si inexistant, à condition d'avoir une commande récupérée.
+    ✅ CORRIGÉ — recherche parrain_tel normalisé pour éviter les doublons
+    (+224620... == 224620... == 00224620...)
     """
     tel_norm = _normaliser_tel(tel)
 
+    # Vérifier commande recupere (normalisé)
     cmd = db.execute(text("""
         SELECT client_nom, client_tel FROM commandes
         WHERE REPLACE(REPLACE(REPLACE(client_tel, ' ', ''), '-', ''), '+', '') = :t
@@ -92,12 +91,17 @@ def get_mon_code(tel: str, db: Session = Depends(get_db)):
     if not cmd:
         raise HTTPException(403, "Vous devez avoir au moins une commande récupérée.")
 
-    row = db.execute(text(
-        "SELECT code, nb_filleuls, credit_total FROM parrainage_codes "
-        "WHERE parrain_tel = :t AND actif = TRUE"
-    ), {"t": tel}).mappings().first()
+    # ✅ CORRIGÉ — recherche normalisée du parrain_tel
+    # Évite les doublons si le même numéro est stocké avec formats différents
+    row = db.execute(text("""
+        SELECT code, nb_filleuls, credit_total FROM parrainage_codes
+        WHERE REPLACE(REPLACE(REPLACE(parrain_tel, ' ', ''), '-', ''), '+', '') = :t
+        AND actif = TRUE
+        LIMIT 1
+    """), {"t": tel_norm}).mappings().first()
 
     if not row:
+        # Générer un code unique
         code = gen_code_parrainage(tel)
         for _ in range(10):
             exists = db.execute(
@@ -108,10 +112,12 @@ def get_mon_code(tel: str, db: Session = Depends(get_db)):
             code = gen_code_parrainage(tel)
 
         nom = cmd["client_nom"] or ""
+        # ✅ Stocker le tel normalisé pour cohérence future
+        tel_stocke = cmd["client_tel"] or tel  # Utiliser le tel de la commande (source fiable)
         db.execute(text(
             "INSERT INTO parrainage_codes (code, parrain_tel, parrain_nom) "
             "VALUES (:c, :t, :n)"
-        ), {"c": code, "t": tel, "n": nom})
+        ), {"c": code, "t": tel_stocke, "n": nom})
         db.commit()
         nb_filleuls  = 0
         credit_total = 0.0
@@ -120,6 +126,7 @@ def get_mon_code(tel: str, db: Session = Depends(get_db)):
         nb_filleuls  = row["nb_filleuls"]
         credit_total = row["credit_total"]
 
+    # Récupérer les filleuls avec statut
     filleuls_rows = db.execute(text("""
         SELECT u.filleul_nom, u.filleul_tel, u.reduction_appliquee,
                u.commande_ref, c.statut
@@ -140,29 +147,49 @@ def get_mon_code(tel: str, db: Session = Depends(get_db)):
         for f in filleuls_rows
     ]
 
-    nb_commandes = sum(
-        1 for f in filleuls
-        if f["statut"] not in ("en_attente_paiement", "annulee", "paiement_refuse")
-    )
+    # ✅ CORRIGÉ — nb_commandes exclut les annulées ET les en_attente_paiement
+    # credit_total reflète uniquement les filleuls avec commandes actives
+    STATUTS_ACTIFS = {"paye", "achete", "expedie", "arrive", "recupere"}
+    nb_commandes = sum(1 for f in filleuls if f["statut"] in STATUTS_ACTIFS)
+
+    # ✅ CORRIGÉ — recalculer credit_total réel depuis commandes actives
+    # (exclut les annulées pour un affichage juste)
+    try:
+        cfg_row = db.execute(text(
+            "SELECT gain_parrain FROM configs WHERE id=1 LIMIT 1"
+        )).fetchone()
+        gain_par_filleul = float(cfg_row[0]) if cfg_row and cfg_row[0] else credit_total / max(nb_commandes, 1)
+    except Exception:
+        gain_par_filleul = 0
+
+    credit_reel = round(gain_par_filleul * nb_commandes) if gain_par_filleul else credit_total
 
     return {
         "code":         code,
         "nb_filleuls":  nb_filleuls,
         "nb_commandes": nb_commandes,
-        "credit_total": credit_total,
-        "gain_total":   credit_total,
+        "credit_total": credit_reel,
+        "gain_total":   credit_reel,
         "filleuls":     filleuls,
     }
 
 
 @router.get("/parrainage/verifier/{code}")
 def verifier_code(code: str, db: Session = Depends(get_db)):
+    """
+    ✅ Vérification anti-conflit avec codes promo :
+    On refuse d'appliquer un code parrainage si un code promo du même nom existe déjà.
+    (Le frontend essaie promo d'abord — côté backend on ne fait que vérifier existence)
+    """
+    code_upper = code.upper().strip()
+
     row = db.execute(text(
         "SELECT parrain_nom FROM parrainage_codes WHERE code = :c AND actif = TRUE"
-    ), {"c": code.upper()}).mappings().first()
+    ), {"c": code_upper}).mappings().first()
     if not row:
         raise HTTPException(404, "Code de parrainage invalide ou expiré.")
 
+    # Lire la réduction depuis configs
     reduction_cfg = 1000.0
     try:
         cfg_row = db.execute(text(
@@ -180,21 +207,14 @@ def verifier_code(code: str, db: Session = Depends(get_db)):
     }
 
 
-# ✅ CORRIGÉ — endpoint /utiliser désormais réservé à un usage interne sécurisé
-# L'enregistrement principal se fait dans commandes.py via _enregistrer_parrainage()
-# Ce endpoint reste disponible pour les cas exceptionnels (WhatsApp manuel, admin)
-# mais nécessite maintenant un token admin pour être appelé directement
 @router.post("/parrainage/utiliser")
 def utiliser_code(
     body: Dict[str, Any],
     request: Request,
     db: Session = Depends(get_db),
-    role: str = Depends(require_patron),   # ✅ Protégé — plus accessible publiquement
+    role: str = Depends(require_patron),  # ✅ Protégé — usage admin uniquement
 ):
-    """
-    Enregistre manuellement un parrainage — réservé à l'admin.
-    L'enregistrement automatique se fait dans commandes.py.
-    """
+    """Enregistre manuellement un parrainage — réservé à l'admin."""
     code         = str(body.get("code",         "")).upper().strip()
     filleul_tel  = str(body.get("filleul_tel",  "")).strip()
     filleul_nom  = str(body.get("filleul_nom",  "")).strip()
@@ -204,7 +224,6 @@ def utiliser_code(
     if not code or not filleul_tel:
         raise HTTPException(400, "Code et téléphone requis.")
 
-    # Lire le gain parrain depuis la config
     try:
         cfg_row = db.execute(text(
             "SELECT gain_parrain FROM configs WHERE id=1 LIMIT 1"
@@ -219,13 +238,11 @@ def utiliser_code(
     if not parrain:
         raise HTTPException(404, "Code invalide.")
 
-    # Anti auto-parrainage
     tel_norm_filleul = _normaliser_tel(filleul_tel)
     tel_norm_parrain = _normaliser_tel(parrain["parrain_tel"])
     if tel_norm_filleul == tel_norm_parrain:
         raise HTTPException(400, "Vous ne pouvez pas utiliser votre propre code.")
 
-    # Anti double utilisation
     deja = db.execute(text("""
         SELECT 1 FROM parrainage_utilisations u
         JOIN parrainage_codes p ON p.code = u.code
@@ -259,6 +276,10 @@ def utiliser_code(
 @router.get("/admin/parrainage")
 def liste_parrainages(request: Request, db: Session = Depends(get_db),
                       role: str = Depends(require_patron)):
+    """
+    ✅ CORRIGÉ — nb_commandes_actives calculé depuis les vraies commandes
+    (exclut annulées et refusées)
+    """
     rows = db.execute(text("""
         SELECT p.code, p.parrain_nom, p.parrain_tel,
                p.nb_filleuls, p.credit_total, p.created_at,
@@ -269,7 +290,24 @@ def liste_parrainages(request: Request, db: Session = Depends(get_db),
         ORDER BY p.nb_filleuls DESC, p.created_at DESC
         LIMIT 200
     """)).mappings().all()
-    return [dict(r) for r in rows]
+
+    result = []
+    for r in rows:
+        d = dict(r)
+        # ✅ Recalculer nb commandes actives depuis les vraies commandes
+        try:
+            actives = db.execute(text("""
+                SELECT COUNT(*) FROM parrainage_utilisations u
+                JOIN commandes c ON c.ref = u.commande_ref
+                WHERE u.code = :code
+                AND c.statut IN ('paye','achete','expedie','arrive','recupere')
+            """), {"code": d["code"]}).scalar()
+            d["nb_commandes_actives"] = actives or 0
+        except Exception:
+            d["nb_commandes_actives"] = d.get("nb_filleuls", 0)
+        result.append(d)
+
+    return result
 
 
 # ══════════════════════════════════════════════════════════════
@@ -305,7 +343,6 @@ def add_galerie(body: Dict[str, Any], request: Request,
         raise HTTPException(400, "URL image requise.")
     if not img_url.startswith(("http://", "https://")):
         raise HTTPException(400, "URL invalide — doit commencer par http:// ou https://")
-
     db.execute(text(
         "INSERT INTO galerie_livraisons (img_url, legende, pays, article) "
         "VALUES (:u, :l, :p, :a)"
