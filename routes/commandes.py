@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 from pydantic import BaseModel
@@ -71,11 +71,13 @@ def get_port(db, pays):
 def generate_ref(db) -> str:
     year = datetime.now().year
     prefix = f"CMD-{year}-"
+    # FIX: Ajout de FOR UPDATE pour éviter les doublons de ref en cas de requêtes concurrentes
     result = db.execute(
         text("""
             SELECT COALESCE(MAX(CAST(SUBSTRING(ref FROM :pos) AS INTEGER)), 0) + 1
             FROM commandes
             WHERE ref LIKE :pattern
+            FOR UPDATE
         """),
         {"pos": len(prefix) + 1, "pattern": f"{prefix}%"}
     ).scalar()
@@ -89,12 +91,12 @@ def calc_article_sans_port_ni_commission(prix_eu, qty, pays, cfg):
 
     if m["symbole"] == "GNF":
         taux_conv  = taux_gnf / 656
-        base_local = round(prix_eu * taux_gnf) * qty
+        base_local = round(prix_eu * taux_gnf * qty)   # FIX: multiplier qty AVANT round
         base_fcfa  = round(prix_eu * taux_fcfa)
     else:
         taux_conv  = 1.0
         base_fcfa  = round(prix_eu * taux_fcfa)
-        base_local = round(prix_eu * taux_fcfa) * qty
+        base_local = round(prix_eu * taux_fcfa * qty)  # FIX: multiplier qty AVANT round
 
     return {
         "base_fcfa":   base_fcfa,
@@ -116,10 +118,18 @@ def appliquer_promo(db, promo_code: str, total_local: float, taux_conv: float) -
         if not promo:
             return total_local
 
+        # FIX: Gérer expiry string ET date object
         expiry = getattr(promo, "expiry", None)
         if expiry:
             from datetime import date
-            exp_date = expiry if hasattr(expiry, "year") else None
+            exp_date = None
+            if hasattr(expiry, "year"):
+                exp_date = expiry  # déjà un objet date
+            elif isinstance(expiry, str) and expiry:
+                try:
+                    exp_date = date.fromisoformat(expiry[:10])
+                except ValueError:
+                    pass
             if exp_date and exp_date < date.today():
                 return total_local
 
@@ -140,6 +150,7 @@ def appliquer_promo(db, promo_code: str, total_local: float, taux_conv: float) -
             reduction = round(float(valeur) * taux_conv)
             nouveau_total = max(0, total_local - reduction)
 
+        # FIX: Essayer uses_count en premier, NE PAS essayer utilisations si uses_count a réussi
         incremente = False
         try:
             db.execute(
@@ -168,7 +179,6 @@ def appliquer_promo(db, promo_code: str, total_local: float, taux_conv: float) -
         return total_local
 
 
-# ✅ NOUVEAU — Lit le gain parrain depuis la config BDD
 def _get_gain_parrain(db, reduction_fcfa: float) -> float:
     try:
         cfg_row = db.execute(
@@ -181,7 +191,6 @@ def _get_gain_parrain(db, reduction_fcfa: float) -> float:
     return round(reduction_fcfa * 0.5)
 
 
-# ✅ NOUVEAU — Enregistre le parrainage côté serveur de façon atomique
 def _enregistrer_parrainage(
     db,
     code: str,
@@ -190,14 +199,8 @@ def _enregistrer_parrainage(
     commande_ref: str,
     reduction_fcfa: float,
 ) -> bool:
-    """
-    Enregistre l'utilisation d'un code parrainage.
-    Retourne True si enregistré, False si déjà utilisé ou invalide.
-    Toutes les vérifications et écritures sont faites ici côté serveur.
-    """
     code = code.upper().strip()
     try:
-        # Vérifier que le code existe et est actif
         parrain = db.execute(
             text("SELECT parrain_tel FROM parrainage_codes WHERE code=:c AND actif=TRUE"),
             {"c": code}
@@ -206,13 +209,15 @@ def _enregistrer_parrainage(
             print(f"[parrainage] Code {code} invalide ou inactif")
             return False
 
-        # Anti auto-parrainage
-        def norm(t): return ''.join(filter(str.isdigit, t or ""))
-        if norm(filleul_tel) == norm(parrain["parrain_tel"]):
+        # FIX: Normalisation robuste pour l'anti auto-parrainage (suffixe 9 chiffres)
+        def norm_suffix(t):
+            digits = ''.join(filter(str.isdigit, t or ""))
+            return digits[-9:] if len(digits) >= 9 else digits
+
+        if norm_suffix(filleul_tel) == norm_suffix(parrain["parrain_tel"]):
             print(f"[parrainage] Auto-parrainage bloqué pour {filleul_tel}")
             return False
 
-        # Anti double utilisation
         deja = db.execute(
             text("""
                 SELECT 1 FROM parrainage_utilisations u
@@ -227,10 +232,8 @@ def _enregistrer_parrainage(
             print(f"[parrainage] Déjà utilisé par {filleul_tel} pour code {code}")
             return False
 
-        # Lire le gain parrain depuis la config
         gain = _get_gain_parrain(db, reduction_fcfa)
 
-        # ✅ INSERT avec commande_ref directement — pas de patch en deux temps
         db.execute(
             text("""
                 INSERT INTO parrainage_utilisations
@@ -241,7 +244,6 @@ def _enregistrer_parrainage(
              "r": commande_ref, "red": reduction_fcfa}
         )
 
-        # Créditer le parrain
         db.execute(
             text("""
                 UPDATE parrainage_codes
@@ -294,6 +296,11 @@ class CommandeCreate(BaseModel):
     total_local_client:     Optional[float] = None
     monnaie_client:         Optional[str]   = None
     taux_utilise:           Optional[float] = None
+    # FIX: Champs cadeau manquants
+    is_cadeau:              Optional[bool]  = False
+    dest_nom:               Optional[str]   = None
+    dest_tel:               Optional[str]   = None
+    payeur_nom:             Optional[str]   = None
 
 
 class CalculRequest(BaseModel):
@@ -325,6 +332,8 @@ class CommandeWACreate(BaseModel):
     client_tel:          str
     client_pays:         str
     client_adresse:      str
+    # FIX: client_instructions manquant
+    client_instructions: Optional[str]   = None
     paniers:             List[PanierWA]
     total_eur:           float
     total_local:         float
@@ -357,7 +366,7 @@ def _calculer_total_serveur(
     cfg,
     promo_code: Optional[str],
     db,
-) -> tuple[float, float, float, float, str]:
+) -> tuple:
     m = MONNAIES.get(pays, {"symbole": "FCFA", "taux_base": 656})
     total_local_sans_comm = 0.0
     total_eu              = 0.0
@@ -431,7 +440,7 @@ def calculer(body: CalculRequest, db: Session = Depends(get_db)):
 
 
 @router.post("/", status_code=201)
-def creer_commande(body: CommandeCreate, db: Session = Depends(get_db)):
+def creer_commande(body: CommandeCreate, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     if not body.articles:
         raise HTTPException(400, "Panier vide")
 
@@ -492,13 +501,16 @@ def creer_commande(body: CommandeCreate, db: Session = Depends(get_db)):
         delai_livraison     = port_info.delai if port_info else "—",
         note_admin          = note_auto,
         promo_code          = body.promo_code,
+        # FIX: Champs cadeau enregistrés
+        is_cadeau           = body.is_cadeau or False,
+        dest_nom            = body.dest_nom,
+        dest_tel            = body.dest_tel,
+        payeur_nom          = body.payeur_nom,
     )
     db.add(commande)
     db.commit()
     db.refresh(commande)
 
-    # ✅ CORRIGÉ — Parrainage enregistré côté serveur, une seule fois, avec la ref réelle
-    # Plus de double appel frontend + backend, plus de patch en deux temps
     if body.code_parrainage and body.code_parrainage.strip():
         try:
             _enregistrer_parrainage(
@@ -506,7 +518,7 @@ def creer_commande(body: CommandeCreate, db: Session = Depends(get_db)):
                 code         = body.code_parrainage,
                 filleul_tel  = body.client_tel,
                 filleul_nom  = body.client_nom,
-                commande_ref = commande.ref,          # ✅ ref réelle directement
+                commande_ref = commande.ref,
                 reduction_fcfa = float(body.reduction_parrainage or 1000),
             )
             db.commit()
@@ -524,10 +536,10 @@ def creer_commande(body: CommandeCreate, db: Session = Depends(get_db)):
     )
     db.commit()
 
+    # FIX: Utiliser BackgroundTasks au lieu de asyncio.create_task (fonction sync)
     try:
         from routes.onedrive import ajouter_commande_excel
-        import asyncio
-        asyncio.create_task(ajouter_commande_excel({
+        background_tasks.add_task(ajouter_commande_excel, {
             "ref":         commande.ref,
             "client_nom":  commande.client_nom,
             "client_tel":  commande.client_tel,
@@ -540,7 +552,7 @@ def creer_commande(body: CommandeCreate, db: Session = Depends(get_db)):
             "promo_code":  commande.promo_code,
             "created_at":  commande.created_at,
             "taux_gnf":    cfg.taux_gnf or 9500,
-        }))
+        })
     except Exception as e:
         print(f"[OneDrive] Erreur sync commande: {e}")
 
@@ -588,7 +600,21 @@ def suivi(ref: str, tel: str = Query(...), db: Session = Depends(get_db)):
 
     tel_saisi = _normaliser_tel(tel)
     tel_cmd   = _normaliser_tel(cmd.client_tel or "")
-    if len(tel_saisi) < 8 or tel_saisi[-8:] not in tel_cmd:
+
+    # FIX: Comparer les suffixes (9 chiffres) pour gérer indicatifs différents
+    if len(tel_saisi) < 8:
+        raise HTTPException(403, "Numéro de téléphone incorrect")
+
+    suffix_saisi = tel_saisi[-9:] if len(tel_saisi) >= 9 else tel_saisi
+    suffix_cmd   = tel_cmd[-9:]   if len(tel_cmd)   >= 9 else tel_cmd
+
+    # Accepter si suffixe commun d'au moins 8 chiffres
+    match = False
+    for n in range(8, min(len(suffix_saisi), len(suffix_cmd)) + 1):
+        if suffix_saisi[-n:] == suffix_cmd[-n:]:
+            match = True
+            break
+    if not match:
         raise HTTPException(403, "Numéro de téléphone incorrect")
 
     return {
@@ -722,7 +748,7 @@ def annuler_commande(body: AnnulationBody, db: Session = Depends(get_db)):
 
 
 @router.post("/whatsapp", status_code=201)
-def creer_commande_whatsapp(body: CommandeWACreate, db: Session = Depends(get_db)):
+def creer_commande_whatsapp(body: CommandeWACreate, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     if not body.paniers:
         raise HTTPException(400, "Aucun panier fourni")
 
@@ -740,7 +766,9 @@ def creer_commande_whatsapp(body: CommandeWACreate, db: Session = Depends(get_db
         round(p.prix * taux) + round((p.livraison or 0) * taux)
         for p in body.paniers
     )
-    commission_fcfa   = get_commission(prix_articles)
+
+    # FIX: Commission calculée sur total_eur (prix + livraison) comme pour les articles
+    commission_fcfa   = get_commission(total_eur)
     commission_locale = round(commission_fcfa * taux_conv)
     total_brut_serveur  = total_converti + commission_locale
 
@@ -781,12 +809,9 @@ def creer_commande_whatsapp(body: CommandeWACreate, db: Session = Depends(get_db
 
     articles_detail = []
     for i, p in enumerate(body.paniers):
-        # ✅ CORRIGÉ — calculer total_local pour que la page suivi affiche le bon prix
-        prix_total_eu = p.prix + (p.livraison or 0)
-        if is_gnf:
-            total_local_art = round(p.prix * taux)
-        else:
-            total_local_art = round(p.prix * taux)
+        # FIX: Inclure la livraison boutique dans total_local_art
+        prix_avec_livr = p.prix + (p.livraison or 0)
+        total_local_art = round(prix_avec_livr * taux)
         articles_detail.append({
             "lien":                     _sanitize_url(p.lien),
             "nom":                      f"Panier {i + 1}",
@@ -801,28 +826,29 @@ def creer_commande_whatsapp(body: CommandeWACreate, db: Session = Depends(get_db
     port_info = db.query(PortKg).filter(PortKg.pays == body.client_pays).first()
 
     commande = Commande(
-        ref             = generate_ref(db),
-        client_nom      = body.client_nom,
-        client_tel      = body.client_tel,
-        client_pays     = body.client_pays,
-        client_adresse  = body.client_adresse,
-        operateur       = "WhatsApp",
-        monnaie         = m["symbole"],
-        total_euro      = round(total_eur, 2),
-        total_local     = round(total_local),
-        poids_estime    = round(len(body.paniers) * 0.5, 2),
-        articles        = json.dumps(articles_detail, ensure_ascii=False),
-        nb_articles     = len(body.paniers),
-        statut          = "en_attente_paiement",
-        delai_livraison = port_info.delai if port_info else "—",
-        note_admin      = f"[WhatsApp] {len(body.paniers)} panier(s) — en attente de confirmation",
-        promo_code      = promo_code_valide or parrain_code_valide,
+        ref                 = generate_ref(db),
+        client_nom          = body.client_nom,
+        client_tel          = body.client_tel,
+        client_pays         = body.client_pays,
+        client_adresse      = body.client_adresse,
+        # FIX: client_instructions enregistré
+        client_instructions = body.client_instructions,
+        operateur           = "WhatsApp",
+        monnaie             = m["symbole"],
+        total_euro          = round(total_eur, 2),
+        total_local         = round(total_local),
+        poids_estime        = round(len(body.paniers) * 0.5, 2),
+        articles            = json.dumps(articles_detail, ensure_ascii=False),
+        nb_articles         = len(body.paniers),
+        statut              = "en_attente_paiement",
+        delai_livraison     = port_info.delai if port_info else "—",
+        note_admin          = f"[WhatsApp] {len(body.paniers)} panier(s) — en attente de confirmation",
+        promo_code          = promo_code_valide or parrain_code_valide,
     )
     db.add(commande)
     db.commit()
     db.refresh(commande)
 
-    # ✅ CORRIGÉ — Parrainage WA via la même fonction centralisée
     if parrain_code_valide:
         try:
             _enregistrer_parrainage(
@@ -848,10 +874,10 @@ def creer_commande_whatsapp(body: CommandeWACreate, db: Session = Depends(get_db
     )
     db.commit()
 
+    # FIX: Utiliser BackgroundTasks au lieu de asyncio.create_task (fonction sync)
     try:
         from routes.onedrive import ajouter_commande_excel
-        import asyncio
-        asyncio.create_task(ajouter_commande_excel({
+        background_tasks.add_task(ajouter_commande_excel, {
             "ref":         commande.ref,
             "client_nom":  commande.client_nom,
             "client_tel":  commande.client_tel,
@@ -864,7 +890,7 @@ def creer_commande_whatsapp(body: CommandeWACreate, db: Session = Depends(get_db
             "promo_code":  commande.promo_code,
             "created_at":  commande.created_at,
             "taux_gnf":    cfg.taux_gnf or 9500,
-        }))
+        })
     except Exception as e:
         print(f"[OneDrive] Erreur sync commande WA: {e}")
 
