@@ -1,8 +1,8 @@
-from fastapi import APIRouter, Depends, HTTPException, Request, Query
+from fastapi import APIRouter, Depends, HTTPException, Request, Query, BackgroundTasks
 from sqlalchemy.orm import Session
 from sqlalchemy import func, text
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List
 import json, csv, io, re
 from fastapi.responses import StreamingResponse
 from database import get_db
@@ -93,6 +93,25 @@ def serialize_cmd(c):
     instructions = c.client_instructions or ""
     cadeau_info  = parse_cadeau(instructions)
 
+    # FIX: Lire aussi les colonnes directes is_cadeau/dest_nom/dest_tel si elles existent
+    is_cadeau = bool(cadeau_info)
+    dest_nom  = cadeau_info.get("dest_nom")
+    dest_tel  = cadeau_info.get("dest_tel")
+    payeur_nom = cadeau_info.get("payeur_nom")
+    payeur_tel = cadeau_info.get("payeur_tel")
+
+    try:
+        if getattr(c, "is_cadeau", None):
+            is_cadeau = True
+        if getattr(c, "dest_nom", None):
+            dest_nom = c.dest_nom
+        if getattr(c, "dest_tel", None):
+            dest_tel = c.dest_tel
+        if getattr(c, "payeur_nom", None):
+            payeur_nom = c.payeur_nom
+    except Exception:
+        pass
+
     instructions_propres = re.sub(
         r"\s*\|?\s*🎁 CADEAU POUR:.*$", "", instructions, flags=re.DOTALL
     ).strip(" |")
@@ -126,11 +145,11 @@ def serialize_cmd(c):
         "suivi_num":            c.suivi_num,
         "motif_refus":          c.motif_refus,
         "created_at":           c.created_at,
-        "is_cadeau":            bool(cadeau_info),
-        "dest_nom":             cadeau_info.get("dest_nom"),
-        "dest_tel":             cadeau_info.get("dest_tel"),
-        "payeur_nom":           cadeau_info.get("payeur_nom"),
-        "payeur_tel":           cadeau_info.get("payeur_tel"),
+        "is_cadeau":            is_cadeau,
+        "dest_nom":             dest_nom,
+        "dest_tel":             dest_tel,
+        "payeur_nom":           payeur_nom,
+        "payeur_tel":           payeur_tel,
     }
 
 
@@ -256,12 +275,14 @@ def stats_finances(request: Request, db: Session = Depends(get_db),
     top_pays = sorted(par_pays.items(), key=lambda x: x[1]["comm"], reverse=True)[:5]
 
     return {
-        "comm_mois_fcfa":   comm_mois_fcfa,
-        "volume_eu":        round(volume_eu, 2),
-        "nb_mois":          len(cmds_mois),
-        "comm_encaissee":   comm_encaissee,
-        "comm_attente":     comm_attente,
-        "total_enc_fcfa":   round(total_enc_fcfa),
+        "kpis_mois": {
+            "comm_mois_fcfa":  comm_mois_fcfa,
+            "volume_eu":       round(volume_eu, 2),
+            "nb_mois":         len(cmds_mois),
+            "comm_encaissee":  comm_encaissee,
+            "comm_attente":    comm_attente,
+            "total_enc_fcfa":  round(total_enc_fcfa),
+        },
         "mois_6": [
             {"key": m["key"], "label": m["label"],
              "comm": m["comm"], "volume": round(m["volume"], 2)}
@@ -282,7 +303,6 @@ def liste_commandes(
     search:     Optional[str] = None,
     date_debut: Optional[str] = None,
     date_fin:   Optional[str] = None,
-    # ✅ Fix filtres pays et opérateur — envoyés par le frontend
     pays:       Optional[str] = None,
     operateur:  Optional[str] = None,
     page:       int = Query(default=1,  ge=0),
@@ -292,6 +312,14 @@ def liste_commandes(
 ):
     q = db.query(Commande)
     statuts_autorises = STATUTS_PAR_ROLE.get(role, ["paye", "achete"])
+
+    # FIX: Exclure les commandes archivées de la liste principale
+    try:
+        q = q.filter(
+            (Commande.archived == False) | (Commande.archived == None)
+        )
+    except Exception:
+        pass  # colonne archived peut ne pas exister encore
 
     if role in ("employe", "logisticien"):
         if statut and statut in statuts_autorises:
@@ -311,7 +339,6 @@ def liste_commandes(
         q = q.filter(Commande.created_at >= date_debut)
     if date_fin:
         q = q.filter(Commande.created_at <= date_fin + " 23:59:59")
-    # ✅ Fix filtres côté serveur — couvrent toutes les pages, pas juste les 30 premiers
     if pays:
         q = q.filter(Commande.client_pays == pays)
     if operateur:
@@ -319,7 +346,6 @@ def liste_commandes(
 
     q = q.order_by(Commande.created_at.desc())
 
-    # ── Mode legacy : pas de pagination (page=0 ou limit=0) ──
     if page == 0 or limit == 0:
         cmds   = q.all()
         result = []
@@ -332,7 +358,6 @@ def liste_commandes(
             result.append(d)
         return result
 
-    # ── Mode paginé ───────────────────────────────────────────
     total_count = q.count()
     offset      = (page - 1) * limit
     cmds        = q.offset(offset).limit(limit).all()
@@ -355,20 +380,32 @@ def liste_commandes(
     }
 
 
+# FIX: Ajout des champs paniers/total_local/total_eur dans le schéma
+class PanierUpdate(BaseModel):
+    lien:      Optional[str]   = None
+    prix:      Optional[float] = None
+    livraison: Optional[float] = 0.0
+
+
 class StatutUpdate(BaseModel):
     statut:          str
-    note_admin:      Optional[str]   = None
-    poids_reel:      Optional[float] = None
-    delai_livraison: Optional[str]   = None
-    suivi_num:       Optional[str]   = None
-    motif_refus:     Optional[str]   = None
-    port_categorie:  Optional[str]   = None
+    note_admin:      Optional[str]        = None
+    poids_reel:      Optional[float]      = None
+    delai_livraison: Optional[str]        = None
+    suivi_num:       Optional[str]        = None
+    motif_refus:     Optional[str]        = None
+    port_categorie:  Optional[str]        = None
+    # FIX: Champs modification panier
+    paniers:         Optional[List[PanierUpdate]] = None
+    total_eur:       Optional[float]      = None
+    total_local:     Optional[float]      = None
 
 
 @router.patch("/commandes/{ref}/statut")
 def update_statut(
     ref: str, body: StatutUpdate,
     request: Request,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     role: str   = Depends(require_auth),
 ):
@@ -382,6 +419,38 @@ def update_statut(
 
     cmd.statut = body.statut
     port_local = 0
+
+    # FIX: Mise à jour articles/total depuis paniers (modification panier admin)
+    if body.paniers is not None and len(body.paniers) > 0:
+        try:
+            articles_existants = json.loads(cmd.articles) if cmd.articles else []
+        except Exception:
+            articles_existants = []
+
+        nouveaux_articles = []
+        for i, p in enumerate(body.paniers):
+            # Conserver les métadonnées de l'article existant si possible
+            art_existant = articles_existants[i] if i < len(articles_existants) else {}
+            art = dict(art_existant)
+            if p.lien is not None:
+                art["lien"] = p.lien
+            if p.prix is not None:
+                art["prix_eu"] = p.prix
+            if p.livraison is not None:
+                art["frais_livraison_boutique"] = p.livraison
+            if not art.get("nom"):
+                art["nom"] = f"Panier {i + 1}"
+            art["qty"] = art.get("qty", 1)
+            nouveaux_articles.append(art)
+
+        cmd.articles    = json.dumps(nouveaux_articles, ensure_ascii=False)
+        cmd.nb_articles = len(nouveaux_articles)
+
+    # FIX: Remplacer total_local/total_euro si fournis explicitement (pas additionner)
+    if body.total_local is not None and body.paniers is not None:
+        cmd.total_local = round(body.total_local)
+    if body.total_eur is not None and body.paniers is not None:
+        cmd.total_euro = round(body.total_eur, 2)
 
     if body.note_admin:
         note_existante = (cmd.note_admin or "")[-1500:]
@@ -493,7 +562,11 @@ def update_statut(
 
         taux_local = (cfg.taux_gnf if cfg else 9500) if cmd.monnaie == "GNF" else 656
         port_local = round(port_fcfa * (taux_local / 656))
-        cmd.total_local = (cmd.total_local or 0) + port_local
+
+        # FIX: N'ajouter le port que si total_local n'a pas déjà été remplacé via paniers
+        if body.paniers is None:
+            cmd.total_local = (cmd.total_local or 0) + port_local
+
         note_port = f"Poids réel: {body.poids_reel}kg | Port: {port_local:,} {cmd.monnaie or 'FCFA'}"
         note_existante = (cmd.note_admin or "")[-1500:]
         cmd.note_admin  = (note_existante + " | " + note_port)[-2000:]
@@ -505,7 +578,9 @@ def update_statut(
     cadeau_info = parse_cadeau(cmd.client_instructions or "")
     STATUTS_WA  = {"paye","achete","expedie","arrive","paiement_refuse","annulee"}
 
-    if body.statut in STATUTS_WA and cmd.client_tel:
+    # FIX: N'envoyer WA automatique que si ce n'est pas une simple modification de panier
+    # (si paniers fourni, le frontend gère lui-même l'envoi WA)
+    if body.paniers is None and body.statut in STATUTS_WA and cmd.client_tel:
         livraison_info = {}
         try:
             livr_row = db.execute(text(
@@ -544,7 +619,7 @@ def update_statut(
         "arrive":          "📦 Votre colis est arrivé ! Contactez-nous.",
         "paiement_refuse": "❌ Paiement non confirmé. Contactez-nous.",
     }
-    if body.statut in labels:
+    if body.paniers is None and body.statut in labels:
         msg = labels[body.statut]
         notifier_client(db, cmd.ref, f"🛍️ Commande {cmd.ref}", msg)
         if body.statut == "paye":
@@ -554,14 +629,15 @@ def update_statut(
             notifier_patron(db, f"📦 Logistique — {STATUT_LABELS.get(body.statut, body.statut)}",
                 f"{cmd.ref} · {cmd.client_nom} · {cmd.client_pays}", cmd.ref)
 
+    # FIX: BackgroundTasks au lieu de asyncio.create_task (fonction sync)
     try:
         from routes.onedrive import mettre_a_jour_statut
-        import asyncio
-        asyncio.create_task(mettre_a_jour_statut(
+        background_tasks.add_task(
+            mettre_a_jour_statut,
             ref=ref,
             nouveau_statut=body.statut,
             frais_port=port_local if port_local else None
-        ))
+        )
     except Exception as e:
         print(f"[OneDrive] Erreur sync statut: {e}")
 
