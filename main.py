@@ -20,6 +20,7 @@ from routes.avis       import router as avis_router
 from routes.whatsapp   import router as whatsapp_router
 from routes.parrainage import router as parrainage_router
 from routes.annonce    import router as annonce_router
+from routes.bot        import router as bot_router        # ✅ Bot IA Fouga
 
 # ── Imports fonctions startup ─────────────────────────────────
 from routes.promo      import ensure_tables as ensure_promo_tables
@@ -28,7 +29,7 @@ from routes.admin      import ensure_archived_column
 from routes.auth       import (
     ensure_sessions_table, purge_expired_sessions,
     ensure_totp_columns,
-    migrate_pwd_to_bcrypt,  # ✅ migration bcrypt au startup
+    migrate_pwd_to_bcrypt,
 )
 from routes.notifs     import ensure_tokens_table, purge_old_tokens
 from routes.parrainage import ensure_parrainage_tables
@@ -96,11 +97,9 @@ async def lifespan(app: FastAPI):
         ensure_avis_columns(db)
         print("✅ Colonnes avis vérifiées (photos_urls, client_tel, commande_ref...)")
 
-        # ✅ NOUVEAU — colonnes 2FA (totp_secret, totp_enabled)
         ensure_totp_columns(db)
         print("✅ Colonnes 2FA vérifiées (totp_secret, totp_enabled)")
 
-        # ✅ Migration bcrypt — hashe tous les mots de passe encore en clair
         migrate_pwd_to_bcrypt(db)
         print("✅ Mots de passe vérifiés / migrés vers bcrypt")
 
@@ -199,6 +198,7 @@ app.include_router(avis_router)
 app.include_router(whatsapp_router)
 app.include_router(parrainage_router)
 app.include_router(annonce_router)
+app.include_router(bot_router)                            # ✅ Bot IA Fouga
 
 # ── Frontend statique ─────────────────────────────────────────
 static_dir = os.path.join(os.path.dirname(__file__), "static")
