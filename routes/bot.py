@@ -1,6 +1,5 @@
 """
-routes/bot.py — Router FastAPI pour le bot IA FougahShop
-À placer dans : routes/bot.py
+routes/bot.py — Router FastAPI pour le bot IA FougahShop (Fouga)
 """
 
 from fastapi import APIRouter, Request, HTTPException
@@ -17,7 +16,6 @@ WA_TOKEN           = os.getenv("WA_TOKEN", "")
 WA_PHONE_ID        = os.getenv("WA_PHONE_ID", "")
 WA_VERIFY_TOKEN    = os.getenv("WA_VERIFY_TOKEN", "fougahshop_verify")
 
-# Paliers commission (miroir de routes/commandes.py)
 PALIERS = [
     {"max": 50,    "comm": 3500},
     {"max": 100,   "comm": 5000},
@@ -51,7 +49,6 @@ STATUTS_FR = {
     "paiement_refuse": "🚫 Paiement refusé",
 }
 
-# ─── System prompt ───────────────────────────────────────────
 SYSTEM_PROMPT = """Tu es l'assistant IA de FougahShop, un service de proxy shopping qui permet aux clients en Afrique de commander sur les boutiques européennes, américaines et asiatiques et de payer en Mobile Money (Orange Money, Wave, etc.).
 
 === QUI TU ES ===
@@ -143,11 +140,16 @@ TOOLS = [
     }
 ]
 
-# Mémoire sessions WhatsApp (en mémoire — suffit pour commencer)
 _wa_sessions: dict = {}
 
+CORS_HEADERS = {
+    "Access-Control-Allow-Origin":  "*",
+    "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, X-Admin-Token",
+}
 
-# ─── Tools implémentation ─────────────────────────────────────
+
+# ─── Tools ───────────────────────────────────────────────────
 async def exec_suivi_commande(ref: str, tel: str) -> str:
     try:
         async with httpx.AsyncClient(timeout=10) as client:
@@ -160,23 +162,21 @@ async def exec_suivi_commande(ref: str, tel: str) -> str:
         if resp.status_code == 403:
             return "❌ Le numéro de téléphone ne correspond pas à cette commande."
         if resp.status_code != 200:
-            return "⚠️ Je n'arrive pas à récupérer les informations de ta commande. Réessaie dans quelques instants."
-
-        data = resp.json()
+            return "⚠️ Je n'arrive pas à récupérer les informations. Réessaie dans quelques instants."
+        data    = resp.json()
         statut  = STATUTS_FR.get(data.get("statut", ""), data.get("statut", "inconnu"))
         nom     = data.get("client_nom", "Client")
         total   = data.get("total_local", 0)
         monnaie = data.get("monnaie", "FCFA")
-
-        result = f"📦 **Commande {data['ref']}**\n👤 {nom}\n📊 Statut : {statut}\n"
+        result  = f"📦 **Commande {data['ref']}**\n👤 {nom}\n📊 Statut : {statut}\n"
         if total:
             result += f"💰 Total : {int(total):,} {monnaie}\n".replace(",", " ")
         suivi_num = data.get("suivi_num")
         if suivi_num:
-            result += f"🔍 N° de suivi transporteur : {suivi_num}\n"
+            result += f"🔍 N° suivi transporteur : {suivi_num}\n"
         return result
     except Exception as e:
-        return f"⚠️ Erreur lors de la récupération : {str(e)}"
+        return f"⚠️ Erreur : {str(e)}"
 
 
 def exec_calculer_prix(prix_euros: float, pays: str, qty: int = 1) -> str:
@@ -186,17 +186,14 @@ def exec_calculer_prix(prix_euros: float, pays: str, qty: int = 1) -> str:
             if k.lower() in pays.lower() or pays.lower() in k.lower():
                 m = MONNAIES[k]; pays = k; break
     if not m:
-        return f"Pays non reconnu. Pays disponibles : {', '.join(MONNAIES.keys())}."
-
+        return f"Pays non reconnu. Disponibles : {', '.join(MONNAIES.keys())}."
     total_eu  = prix_euros * qty
     comm_fcfa = next((p["comm"] for p in PALIERS if total_eu <= p["max"]), 20000)
     symbole   = m["symbole"]
     taux      = m["taux"]
-
     article_local = round(total_eu * taux)
     comm_local    = round(comm_fcfa * (taux / 656)) if symbole == "GNF" else comm_fcfa
     total_local   = article_local + comm_local
-
     r  = f"💰 **Calcul pour {qty}× article à {prix_euros}€** ({pays})\n\n"
     r += f"• Prix article(s) : {article_local:,} {symbole}\n".replace(",", " ")
     r += f"• Commission FougahShop : {comm_local:,} {symbole}\n".replace(",", " ")
@@ -209,7 +206,6 @@ def exec_calculer_prix(prix_euros: float, pays: str, qty: int = 1) -> str:
 async def run_bot(messages: list) -> str:
     if not ANTHROPIC_API_KEY:
         return "⚠️ Le bot n'est pas encore configuré (ANTHROPIC_API_KEY manquante)."
-
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     resp = client.messages.create(
         model="claude-sonnet-4-20250514",
@@ -218,7 +214,6 @@ async def run_bot(messages: list) -> str:
         tools=TOOLS,
         messages=messages
     )
-
     while resp.stop_reason == "tool_use":
         results = []
         for block in resp.content:
@@ -231,7 +226,6 @@ async def run_bot(messages: list) -> str:
                 else:
                     res = "Outil inconnu."
                 results.append({"type": "tool_result", "tool_use_id": block.id, "content": res})
-
         messages = messages + [
             {"role": "assistant", "content": resp.content},
             {"role": "user",      "content": results}
@@ -243,7 +237,6 @@ async def run_bot(messages: list) -> str:
             tools=TOOLS,
             messages=messages
         )
-
     for block in resp.content:
         if hasattr(block, "text"):
             return block.text
@@ -251,21 +244,33 @@ async def run_bot(messages: list) -> str:
 
 
 # ─── Routes ───────────────────────────────────────────────────
+
+# ✅ OPTIONS preflight — nécessaire pour CORS cross-origin
+@router.options("/chat")
+async def chat_options():
+    return JSONResponse({}, headers=CORS_HEADERS)
+
+
 @router.post("/chat")
 async def chat(request: Request):
     try:
         body = await request.json()
     except Exception:
-        raise HTTPException(400, "Corps JSON invalide")
+        return JSONResponse({"error": "Corps JSON invalide"}, status_code=400, headers=CORS_HEADERS)
 
     message = (body.get("message") or "").strip()
     if not message:
-        raise HTTPException(400, "Message vide")
+        return JSONResponse({"error": "Message vide"}, status_code=400, headers=CORS_HEADERS)
 
     history  = body.get("history") or []
     messages = list(history) + [{"role": "user", "content": message}]
-    reply    = await run_bot(messages)
-    return {"reply": reply}
+
+    try:
+        reply = await run_bot(messages)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500, headers=CORS_HEADERS)
+
+    return JSONResponse({"reply": reply}, headers=CORS_HEADERS)
 
 
 @router.get("/whatsapp")
@@ -282,28 +287,23 @@ async def wa_verify(request: Request):
 @router.post("/whatsapp")
 async def wa_webhook(request: Request):
     try:
-        body = await request.json()
+        body  = await request.json()
         entry = body["entry"][0]
         msg   = entry["changes"][0]["value"]["messages"][0]
     except (KeyError, IndexError):
         return JSONResponse({"status": "ok"})
-
     if msg.get("type") != "text":
         return JSONResponse({"status": "ok"})
-
     from_tel = msg["from"]
     text     = msg["text"]["body"].strip()
     history  = _wa_sessions.get(from_tel, [])
     if len(history) > 20:
         history = history[-20:]
-
     messages = history + [{"role": "user", "content": text}]
     reply    = await run_bot(messages)
     _wa_sessions[from_tel] = messages + [{"role": "assistant", "content": reply}]
-
     if WA_TOKEN and WA_PHONE_ID:
         await _send_wa_message(from_tel, reply)
-
     return JSONResponse({"status": "ok"})
 
 
