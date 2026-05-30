@@ -208,7 +208,7 @@ async def run_bot(messages: list) -> str:
         return "⚠️ Le bot n'est pas encore configuré (ANTHROPIC_API_KEY manquante)."
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     resp = client.messages.create(
-        model="claude-sonnet-4-20250514",
+        model="claude-haiku-4-5-20251001",   # ✅ modèle compatible platform.claude.com
         max_tokens=1000,
         system=SYSTEM_PROMPT,
         tools=TOOLS,
@@ -231,7 +231,7 @@ async def run_bot(messages: list) -> str:
             {"role": "user",      "content": results}
         ]
         resp = client.messages.create(
-            model="claude-sonnet-4-20250514",
+            model="claude-haiku-4-5-20251001",   # ✅ modèle compatible platform.claude.com
             max_tokens=1000,
             system=SYSTEM_PROMPT,
             tools=TOOLS,
@@ -245,7 +245,6 @@ async def run_bot(messages: list) -> str:
 
 # ─── Routes ───────────────────────────────────────────────────
 
-# ✅ OPTIONS preflight — nécessaire pour CORS cross-origin
 @router.options("/chat")
 async def chat_options():
     return JSONResponse({}, headers=CORS_HEADERS)
