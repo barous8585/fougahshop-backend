@@ -5,7 +5,7 @@ from typing import Dict, Any
 import secrets, string
 from database import get_db
 from models import Commande
-from routes.auth import require_patron
+from routes.auth import require_auth, require_patron
 
 router = APIRouter(prefix="/api", tags=["parrainage", "galerie"])
 
@@ -55,12 +55,10 @@ def ensure_parrainage_tables(db: Session):
 
 
 def _normaliser_tel(tel: str) -> str:
-    """Normalise un numéro — retire +, espaces, tirets."""
     return tel.replace(" ", "").replace("-", "").replace("+", "").strip()
 
 
 def gen_code_parrainage(tel: str) -> str:
-    """FG + 4 derniers chiffres du tel + 6 chars aléatoires."""
     chars  = string.ascii_uppercase + string.digits
     suffix = ''.join(secrets.choice(chars) for _ in range(6))
     prefix = _normaliser_tel(tel)[-4:] if len(_normaliser_tel(tel)) >= 4 else _normaliser_tel(tel)
@@ -73,14 +71,8 @@ def gen_code_parrainage(tel: str) -> str:
 
 @router.get("/parrainage/code/{tel}")
 def get_mon_code(tel: str, db: Session = Depends(get_db)):
-    """
-    Retourne le code parrainage + stats.
-    ✅ CORRIGÉ — recherche parrain_tel normalisé pour éviter les doublons
-    (+224620... == 224620... == 00224620...)
-    """
     tel_norm = _normaliser_tel(tel)
 
-    # Vérifier commande recupere (normalisé)
     cmd = db.execute(text("""
         SELECT client_nom, client_tel FROM commandes
         WHERE REPLACE(REPLACE(REPLACE(client_tel, ' ', ''), '-', ''), '+', '') = :t
@@ -91,8 +83,6 @@ def get_mon_code(tel: str, db: Session = Depends(get_db)):
     if not cmd:
         raise HTTPException(403, "Vous devez avoir au moins une commande récupérée.")
 
-    # ✅ CORRIGÉ — recherche normalisée du parrain_tel
-    # Évite les doublons si le même numéro est stocké avec formats différents
     row = db.execute(text("""
         SELECT code, nb_filleuls, credit_total FROM parrainage_codes
         WHERE REPLACE(REPLACE(REPLACE(parrain_tel, ' ', ''), '-', ''), '+', '') = :t
@@ -101,7 +91,6 @@ def get_mon_code(tel: str, db: Session = Depends(get_db)):
     """), {"t": tel_norm}).mappings().first()
 
     if not row:
-        # Générer un code unique
         code = gen_code_parrainage(tel)
         for _ in range(10):
             exists = db.execute(
@@ -111,9 +100,8 @@ def get_mon_code(tel: str, db: Session = Depends(get_db)):
                 break
             code = gen_code_parrainage(tel)
 
-        nom = cmd["client_nom"] or ""
-        # ✅ Stocker le tel normalisé pour cohérence future
-        tel_stocke = cmd["client_tel"] or tel  # Utiliser le tel de la commande (source fiable)
+        nom        = cmd["client_nom"] or ""
+        tel_stocke = cmd["client_tel"] or tel
         db.execute(text(
             "INSERT INTO parrainage_codes (code, parrain_tel, parrain_nom) "
             "VALUES (:c, :t, :n)"
@@ -126,10 +114,9 @@ def get_mon_code(tel: str, db: Session = Depends(get_db)):
         nb_filleuls  = row["nb_filleuls"]
         credit_total = row["credit_total"]
 
-    # Récupérer les filleuls avec statut
     filleuls_rows = db.execute(text("""
         SELECT u.filleul_nom, u.filleul_tel, u.reduction_appliquee,
-               u.commande_ref, c.statut
+               u.commande_ref, u.created_at, c.statut
         FROM parrainage_utilisations u
         LEFT JOIN commandes c ON c.ref = u.commande_ref
         WHERE u.code = :code
@@ -143,53 +130,52 @@ def get_mon_code(tel: str, db: Session = Depends(get_db)):
             "statut":         f["statut"] or "en_attente_paiement",
             "reduction_fcfa": f["reduction_appliquee"] or 0,
             "commande_ref":   f["commande_ref"] or "",
+            "created_at":     str(f["created_at"]) if f["created_at"] else "",
         }
         for f in filleuls_rows
     ]
 
-    # ✅ CORRIGÉ — nb_commandes exclut les annulées ET les en_attente_paiement
-    # credit_total reflète uniquement les filleuls avec commandes actives
     STATUTS_ACTIFS = {"paye", "achete", "expedie", "arrive", "recupere"}
-    nb_commandes = sum(1 for f in filleuls if f["statut"] in STATUTS_ACTIFS)
+    nb_commandes   = sum(1 for f in filleuls if f["statut"] in STATUTS_ACTIFS)
 
-    # ✅ CORRIGÉ — recalculer credit_total réel depuis commandes actives
-    # (exclut les annulées pour un affichage juste)
+    # FIX: Utiliser credit_total en base comme source fiable
+    # Recalculer uniquement si incohérence détectée
     try:
         cfg_row = db.execute(text(
             "SELECT gain_parrain FROM configs WHERE id=1 LIMIT 1"
         )).fetchone()
-        gain_par_filleul = float(cfg_row[0]) if cfg_row and cfg_row[0] else credit_total / max(nb_commandes, 1)
+        gain_par_filleul = float(cfg_row[0]) if cfg_row and cfg_row[0] else 0
     except Exception:
         gain_par_filleul = 0
 
-    credit_reel = round(gain_par_filleul * nb_commandes) if gain_par_filleul else credit_total
+    # Recalculer le crédit réel depuis les utilisations actives
+    credit_reel = round(
+        sum(f["reduction_fcfa"] * 0.5 for f in filleuls if f["statut"] in STATUTS_ACTIFS)
+        if not gain_par_filleul
+        else gain_par_filleul * nb_commandes
+    )
+    # Toujours afficher au moins le credit_total enregistré en base
+    credit_affiche = max(credit_reel, round(credit_total))
 
     return {
         "code":         code,
         "nb_filleuls":  nb_filleuls,
         "nb_commandes": nb_commandes,
-        "credit_total": credit_reel,
-        "gain_total":   credit_reel,
+        "credit_total": credit_affiche,
+        "gain_total":   credit_affiche,
         "filleuls":     filleuls,
     }
 
 
 @router.get("/parrainage/verifier/{code}")
 def verifier_code(code: str, db: Session = Depends(get_db)):
-    """
-    ✅ Vérification anti-conflit avec codes promo :
-    On refuse d'appliquer un code parrainage si un code promo du même nom existe déjà.
-    (Le frontend essaie promo d'abord — côté backend on ne fait que vérifier existence)
-    """
     code_upper = code.upper().strip()
-
     row = db.execute(text(
         "SELECT parrain_nom FROM parrainage_codes WHERE code = :c AND actif = TRUE"
     ), {"c": code_upper}).mappings().first()
     if not row:
         raise HTTPException(404, "Code de parrainage invalide ou expiré.")
 
-    # Lire la réduction depuis configs
     reduction_cfg = 1000.0
     try:
         cfg_row = db.execute(text(
@@ -212,9 +198,8 @@ def utiliser_code(
     body: Dict[str, Any],
     request: Request,
     db: Session = Depends(get_db),
-    role: str = Depends(require_patron),  # ✅ Protégé — usage admin uniquement
+    role: str = Depends(require_patron),
 ):
-    """Enregistre manuellement un parrainage — réservé à l'admin."""
     code         = str(body.get("code",         "")).upper().strip()
     filleul_tel  = str(body.get("filleul_tel",  "")).strip()
     filleul_nom  = str(body.get("filleul_nom",  "")).strip()
@@ -276,35 +261,55 @@ def utiliser_code(
 @router.get("/admin/parrainage")
 def liste_parrainages(request: Request, db: Session = Depends(get_db),
                       role: str = Depends(require_patron)):
-    """
-    ✅ CORRIGÉ — nb_commandes_actives calculé depuis les vraies commandes
-    (exclut annulées et refusées)
-    """
     rows = db.execute(text("""
         SELECT p.code, p.parrain_nom, p.parrain_tel,
-               p.nb_filleuls, p.credit_total, p.created_at,
-               COUNT(u.id) as nb_util
+               p.nb_filleuls, p.credit_total, p.created_at
         FROM parrainage_codes p
-        LEFT JOIN parrainage_utilisations u ON u.code = p.code
-        GROUP BY p.id
         ORDER BY p.nb_filleuls DESC, p.created_at DESC
         LIMIT 200
     """)).mappings().all()
 
+    # FIX: Charger tous les filleuls en une seule query (évite N+1)
+    codes = [r["code"] for r in rows]
+    filleuls_map: Dict[str, list] = {c: [] for c in codes}
+
+    if codes:
+        placeholders = ', '.join(f':c{i}' for i in range(len(codes)))
+        params = {f'c{i}': c for i, c in enumerate(codes)}
+        try:
+            filleuls_rows = db.execute(text(f"""
+                SELECT u.code, u.filleul_nom, u.filleul_tel,
+                       u.reduction_appliquee, u.commande_ref, u.created_at,
+                       c.statut
+                FROM parrainage_utilisations u
+                LEFT JOIN commandes c ON c.ref = u.commande_ref
+                WHERE u.code IN ({placeholders})
+                ORDER BY u.created_at DESC
+            """), params).mappings().all()
+
+            for f in filleuls_rows:
+                code_f = f["code"]
+                if code_f in filleuls_map:
+                    filleuls_map[code_f].append({
+                        "filleul_nom":    f["filleul_nom"] or "Client",
+                        "filleul_tel":    f["filleul_tel"] or "",
+                        "statut":         f["statut"] or "en_attente_paiement",
+                        "reduction_fcfa": float(f["reduction_appliquee"] or 0),
+                        "commande_ref":   f["commande_ref"] or "",
+                        "created_at":     str(f["created_at"]) if f["created_at"] else "",
+                    })
+        except Exception as e:
+            print(f"[parrainage] Erreur chargement filleuls: {e}")
+
+    STATUTS_ACTIFS = {"paye", "achete", "expedie", "arrive", "recupere"}
     result = []
     for r in rows:
         d = dict(r)
-        # ✅ Recalculer nb commandes actives depuis les vraies commandes
-        try:
-            actives = db.execute(text("""
-                SELECT COUNT(*) FROM parrainage_utilisations u
-                JOIN commandes c ON c.ref = u.commande_ref
-                WHERE u.code = :code
-                AND c.statut IN ('paye','achete','expedie','arrive','recupere')
-            """), {"code": d["code"]}).scalar()
-            d["nb_commandes_actives"] = actives or 0
-        except Exception:
-            d["nb_commandes_actives"] = d.get("nb_filleuls", 0)
+        filleuls = filleuls_map.get(d["code"], [])
+        nb_actifs = sum(1 for f in filleuls if f["statut"] in STATUTS_ACTIFS)
+        d["filleuls"]              = filleuls
+        d["nb_commandes_actives"]  = nb_actifs
+        d["created_at"]            = str(d.get("created_at", ""))
         result.append(d)
 
     return result
