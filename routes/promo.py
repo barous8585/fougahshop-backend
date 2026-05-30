@@ -14,7 +14,6 @@ router = APIRouter(prefix="/api/promos", tags=["promos"])
 # ══════════════════════════════════════════════════════════════
 
 def ensure_tables(db: Session):
-    """Crée ou migre la table promo_codes. À appeler au startup, pas à chaque requête."""
     try:
         db.execute(text("""
             CREATE TABLE IF NOT EXISTS promo_codes (
@@ -69,22 +68,14 @@ def ensure_tables(db: Session):
         except Exception:
             pass
         db.commit()
-
-        # ✅ AJOUT — Resync uses_count depuis les vraies commandes au startup
         _resync_uses_count(db)
         print("[promo] ✅ uses_count resynchronisé depuis les commandes réelles")
-
     except Exception as e:
         db.rollback()
         print(f"[promo] ensure_tables error: {e}")
 
 
-# ✅ AJOUT — Resynchronise uses_count depuis les vraies commandes
 def _resync_uses_count(db: Session):
-    """
-    Recalcule uses_count de chaque code promo depuis la table commandes.
-    Exclut les commandes annulées et refusées.
-    """
     try:
         db.execute(text("""
             UPDATE promo_codes p
@@ -170,12 +161,10 @@ def verifier_code_post(body: Dict[str, Any], db: Session = Depends(get_db)):
 def get_stats_influenceur(code: str, db: Session = Depends(get_db)):
     """
     Stats temps réel pour un influenceur.
-    ✅ CORRIGÉ :
-      - Plus de LIMIT 50 : toutes les commandes comptées
-      - uses_count recalculé depuis la table commandes (pas promo_codes.uses_count)
-      - gain_total basé sur commandes confirmées uniquement
-      - nb_en_attente et nb_annulees retournés pour le frontend
-      - Resync automatique si écart détecté
+    ✅ uses_count calculé depuis les vraies commandes (sans LIMIT)
+    ✅ gain_total basé sur commandes confirmées uniquement
+    ✅ nb_en_attente et nb_annulees retournés pour affichage frontend
+    ✅ Resync automatique si écart détecté
     """
     code = code.strip().upper()
     row = db.execute(
@@ -193,7 +182,6 @@ def get_stats_influenceur(code: str, db: Session = Depends(get_db)):
 
     gain_par_cmd = float(promo.get("gain_influenceur") or 0)
 
-    # ✅ CORRIGÉ — toutes les commandes, sans LIMIT
     try:
         cmds_rows = db.execute(text("""
             SELECT ref, statut, created_at, total_euro
@@ -206,7 +194,6 @@ def get_stats_influenceur(code: str, db: Session = Depends(get_db)):
         print(f"[promo] Erreur récup commandes {code}: {e}")
         commandes = []
 
-    # ✅ CORRIGÉ — séparer précisément par statut
     STATUTS_CONFIRMES = {"paye", "achete", "expedie", "arrive", "recupere"}
     STATUTS_ANNULES   = {"annulee", "paiement_refuse"}
 
@@ -214,14 +201,11 @@ def get_stats_influenceur(code: str, db: Session = Depends(get_db)):
     commandes_attente    = [c for c in commandes if c.get("statut") == "en_attente_paiement"]
     commandes_annulees   = [c for c in commandes if c.get("statut") in STATUTS_ANNULES]
 
-    # uses_count = confirmées + en attente (excluant uniquement les annulées/refusées)
     uses_count_reel = len(commandes_confirmees) + len(commandes_attente)
+    gain_total      = round(gain_par_cmd * len(commandes_confirmees))
+    ca_euro         = sum(float(c.get("total_euro") or 0) for c in commandes_confirmees)
 
-    # gain_total = confirmées uniquement
-    gain_total = round(gain_par_cmd * len(commandes_confirmees))
-    ca_euro    = sum(float(c.get("total_euro") or 0) for c in commandes_confirmees)
-
-    # ✅ Resynchroniser uses_count si écart détecté
+    # Resync si écart
     uses_count_base = int(promo.get("uses_count") or promo.get("utilisations") or 0)
     if uses_count_reel != uses_count_base:
         try:
@@ -229,10 +213,8 @@ def get_stats_influenceur(code: str, db: Session = Depends(get_db)):
                 "UPDATE promo_codes SET uses_count = :n WHERE code = :c"
             ), {"n": uses_count_reel, "c": code})
             db.commit()
-            print(f"[promo] uses_count resync {code}: {uses_count_base} → {uses_count_reel}")
         except Exception as e:
             db.rollback()
-            print(f"[promo] resync error: {e}")
 
     return {
         "code":             promo["code"],
@@ -265,35 +247,68 @@ def list_promos(
     role: str = Depends(require_patron)
 ):
     """
-    Liste tous les codes promo avec stats.
-    ✅ CORRIGÉ — uses_count et gain recalculés depuis les vraies commandes.
+    FIX: Remplace la boucle N+1 par une seule query agrégée.
+    Beaucoup plus rapide avec de nombreux codes.
     """
     rows = db.execute(
         text("SELECT * FROM promo_codes ORDER BY created_at DESC")
     ).fetchall()
 
+    if not rows:
+        return []
+
+    # FIX: Une seule query pour toutes les stats commandes — plus de N+1
+    codes = [p.code for p in rows]
+    placeholders = ', '.join(f':c{i}' for i in range(len(codes)))
+    params = {f'c{i}': c for i, c in enumerate(codes)}
+
+    try:
+        stats_rows = db.execute(text(f"""
+            SELECT
+                promo_code,
+                COUNT(*) FILTER (WHERE statut IN ('paye','achete','expedie','arrive','recupere')) AS nb_confirmees,
+                COUNT(*) FILTER (WHERE statut = 'en_attente_paiement')                           AS nb_attente,
+                COUNT(*) FILTER (WHERE statut IN ('annulee','paiement_refuse'))                   AS nb_annulees,
+                SUM(total_euro) FILTER (WHERE statut IN ('paye','achete','expedie','arrive','recupere')) AS ca_euro
+            FROM commandes
+            WHERE promo_code IN ({placeholders})
+            GROUP BY promo_code
+        """), params).mappings().all()
+        stats_map = {r["promo_code"]: dict(r) for r in stats_rows}
+    except Exception as e:
+        print(f"[promo] list_promos stats error: {e}")
+        stats_map = {}
+
+    # FIX: Charger toutes les commandes en une seule query pour le détail
+    try:
+        cmds_rows = db.execute(text(f"""
+            SELECT promo_code, ref, statut
+            FROM commandes
+            WHERE promo_code IN ({placeholders})
+            ORDER BY created_at DESC
+        """), params).mappings().all()
+        cmds_map: Dict[str, list] = {}
+        for c in cmds_rows:
+            key = c["promo_code"]
+            if key not in cmds_map:
+                cmds_map[key] = []
+            cmds_map[key].append({"ref": c["ref"], "statut": c["statut"]})
+    except Exception:
+        cmds_map = {}
+
     result = []
     for p in rows:
-        try:
-            cmds = db.execute(
-                text("SELECT ref, statut, total_euro FROM commandes WHERE promo_code=:code"),
-                {"code": p.code}
-            ).fetchall()
-        except Exception:
-            cmds = []
-
-        # ✅ CORRIGÉ — compter depuis les vraies commandes
-        cmds_confirmees = [c for c in cmds if c.statut in ("paye","achete","expedie","arrive","recupere")]
-        cmds_attente    = [c for c in cmds if c.statut == "en_attente_paiement"]
-        cmds_annulees   = [c for c in cmds if c.statut in ("annulee","paiement_refuse")]
-
-        uses_reel    = len(cmds_confirmees) + len(cmds_attente)
+        s = stats_map.get(p.code, {})
         max_u        = p.max_uses or p.quota or 0
         valeur       = p.valeur or p.reduction_fcfa or 0
         type_        = p.type or "fixe"
         gain_par_cmd = getattr(p, "gain_influenceur", 0) or 0
-        gain         = gain_par_cmd * len(cmds_confirmees)
-        ca           = sum(c.total_euro or 0 for c in cmds_confirmees)
+        nb_conf      = int(s.get("nb_confirmees") or 0)
+        nb_att       = int(s.get("nb_attente") or 0)
+        nb_ann       = int(s.get("nb_annulees") or 0)
+        uses_reel    = nb_conf + nb_att
+        ca           = float(s.get("ca_euro") or 0)
+        gain         = round(gain_par_cmd * nb_conf)
 
         result.append({
             "id":                     p.id,
@@ -313,25 +328,24 @@ def list_promos(
             "note":                   getattr(p, "note", None),
             "expiry":                 str(p.expiry) if p.expiry else None,
             "actif":                  bool(p.actif),
+            "pays":                   getattr(p, "pays", None),
             "ca_euro":                round(ca, 2),
-            "gain_total_fcfa":        round(gain),
-            "nb_confirmees":          len(cmds_confirmees),
-            "nb_en_attente":          len(cmds_attente),
-            "nb_annulees":            len(cmds_annulees),
-            "commandes":              [{"ref": c.ref, "statut": c.statut} for c in cmds],
+            "gain_total_fcfa":        gain,
+            "nb_confirmees":          nb_conf,
+            "nb_en_attente":          nb_att,
+            "nb_annulees":            nb_ann,
+            "commandes":              cmds_map.get(p.code, []),
             "created_at":             str(p.created_at),
         })
     return result
 
 
-# ✅ AJOUT — Resync manuel depuis l'admin
 @router.get("/admin/resync")
 def resync_uses_count(
     request: Request,
     db: Session = Depends(get_db),
     role: str = Depends(require_patron)
 ):
-    """Resynchronise TOUS les uses_count depuis les vraies commandes."""
     try:
         db.execute(text("""
             UPDATE promo_codes p
@@ -511,16 +525,7 @@ def delete_promo_by_id(
     return {"ok": True}
 
 
-# ══════════════════════════════════════════════════════════════
-# FONCTION INTERNE — appelée depuis commandes.py
-# ══════════════════════════════════════════════════════════════
-
 def utiliser_code(code: str, db: Session):
-    """
-    Incrémente uses_count UNE SEULE FOIS.
-    Note : uses_count est aussi resynchronisé au startup via _resync_uses_count()
-    et à chaque visite de la page influenceur — source de vérité = table commandes.
-    """
     if not code:
         return
     try:
