@@ -26,30 +26,26 @@ _blocked_ips: dict = {}  # { ip: unblock_timestamp }
 # CONFIGURATION PAR TYPE DE ROUTE
 # ══════════════════════════════════════════════════════════════
 
-# 1. Rate général — toutes routes confondues
 RATE_LIMIT_REQUESTS = 200
-RATE_LIMIT_WINDOW   = 60   # 200 req / 60s par IP
+RATE_LIMIT_WINDOW   = 60
 
-# 2. Création de commande — POST /api/commandes/ uniquement
-#    Un client normal en crée 1-2 par session. 5 en 60s = très généreux.
 CREATE_COMMANDE_MAX    = 5
 CREATE_COMMANDE_WINDOW = 60
 
-# 3. Routes d'écriture sensibles (annulation, vérification promo/parrainage)
 WRITE_RATE_MAX    = 15
 WRITE_RATE_WINDOW = 60
 
-# 4. Historique — GET /api/commandes/historique/
-#    Appelé à la connexion + rafraîchissements. 30/60s suffisant.
 HISTORIQUE_MAX    = 30
 HISTORIQUE_WINDOW = 60
 
-# 5. Auth — brute force login
-LOGIN_MAX_ATTEMPTS  = 5
-LOGIN_WINDOW        = 300   # 5 minutes
-LOGIN_BLOCK_SECONDS = 1800  # 30 min de blocage
+# ✅ Bot : limite généreuse — chaque message = 1 requête POST
+BOT_RATE_MAX    = 30   # 30 messages par minute par IP (très large)
+BOT_RATE_WINDOW = 60
 
-# Routes par catégorie
+LOGIN_MAX_ATTEMPTS  = 5
+LOGIN_WINDOW        = 300
+LOGIN_BLOCK_SECONDS = 1800
+
 WRITE_ROUTES = [
     "/api/commandes/annuler",
     "/api/promos/verifier",
@@ -141,7 +137,6 @@ class SecurityMiddleware(BaseHTTPMiddleware):
                 )
 
         # ── Création de commande ───────────────────────────────
-        # POST /api/commandes/ uniquement (pas /calculer, /suivi, /historique)
         if path == "/api/commandes/" and method == "POST":
             if rate_check(f"cmd_create:{ip}", CREATE_COMMANDE_MAX, CREATE_COMMANDE_WINDOW):
                 print(f"⚠️  Rate limit création commande: {ip}")
@@ -171,6 +166,17 @@ class SecurityMiddleware(BaseHTTPMiddleware):
                     headers={"Retry-After": "60"},
                 )
 
+        # ── Bot chat — rate limit dédié ────────────────────────
+        # ✅ Route publique mais limitée pour éviter l'abus de l'API Anthropic
+        elif path == "/bot/chat" and method == "POST":
+            if rate_check(f"bot:{ip}", BOT_RATE_MAX, BOT_RATE_WINDOW):
+                print(f"⚠️  Rate limit bot: {ip}")
+                return JSONResponse(
+                    status_code=429,
+                    content={"detail": "Trop de messages. Réessayez dans une minute."},
+                    headers={"Retry-After": "60"},
+                )
+
         # ── Rate général ───────────────────────────────────────
         if rate_check(ip, RATE_LIMIT_REQUESTS, RATE_LIMIT_WINDOW):
             print(f"⚠️  Rate limit général: {ip}")
@@ -194,7 +200,9 @@ class SecurityMiddleware(BaseHTTPMiddleware):
             "script-src 'self' 'unsafe-inline' 'unsafe-eval' https: blob:; "
             "style-src 'self' 'unsafe-inline' https:; "
             "img-src 'self' data: https: blob:; "
-            "connect-src 'self' https: wss:; "
+            # ✅ Ajout explicite du backend pour autoriser le fetch() du bot
+            # Les autres domaines https: restent autorisés (paiement, FCM, etc.)
+            "connect-src 'self' https://fougahshop-backend.onrender.com https: wss:; "
             "frame-src https://kkiapay.me https://*.kkiapay.me; "
             "manifest-src 'self' data:; "
             "worker-src 'self' blob:;"
