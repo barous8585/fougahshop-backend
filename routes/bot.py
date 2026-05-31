@@ -16,6 +16,13 @@ WA_TOKEN           = os.getenv("WA_TOKEN", "")
 WA_PHONE_ID        = os.getenv("WA_PHONE_ID", "")
 WA_VERIFY_TOKEN    = os.getenv("WA_VERIFY_TOKEN", "fougahshop_verify")
 
+# ✅ Origines autorisées — restreint à fougahshop.com uniquement
+ALLOWED_ORIGINS = {"https://fougahshop.com", "https://www.fougahshop.com"}
+
+# ✅ Limites de sécurité
+MAX_MESSAGE_LENGTH = 1000    # caractères max par message client
+MAX_HISTORY_TURNS  = 10      # max 10 tours d'historique acceptés
+
 PALIERS = [
     {"max": 50,    "comm": 3500},
     {"max": 100,   "comm": 5000},
@@ -27,7 +34,7 @@ PALIERS = [
 STATUTS_FR = {
     "en_attente_paiement": "⏳ En attente de paiement",
     "paye":      "💛 Paiement reçu — on passe commande",
-    "achete":    "🛒 Article acheté en Europe",
+    "achete":    "🛒 Commande achetée en Europe",
     "expedie":   "✈️ En route vers l'Afrique",
     "arrive":    "📦 Arrivé — en attente de récupération",
     "recupere":  "✅ Récupéré par le client",
@@ -128,12 +135,8 @@ R: Oui ! Tu peux créer plusieurs paniers dans la même commande — un panier p
 TOOLS = [
     {
         "name": "get_config",
-        "description": "Récupère la configuration en temps réel depuis l'admin FougahShop : taux de change GNF, frais de port par pays, opérateurs de paiement, numéros de paiement, délais de livraison, etc. Utilise cet outil quand le client pose une question sur les tarifs, frais de port, délais, opérateurs ou numéros de paiement.",
-        "input_schema": {
-            "type": "object",
-            "properties": {},
-            "required": []
-        }
+        "description": "Récupère la configuration en temps réel depuis l'admin FougahShop : taux de change GNF, frais de port par pays, opérateurs de paiement, numéros de paiement, délais de livraison, etc.",
+        "input_schema": {"type": "object", "properties": {}, "required": []}
     },
     {
         "name": "suivi_commande",
@@ -164,23 +167,27 @@ TOOLS = [
 
 _wa_sessions: dict = {}
 
-CORS_HEADERS = {
-    "Access-Control-Allow-Origin":  "*",
-    "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, X-Admin-Token",
-}
+
+def _cors_headers(origin: str) -> dict:
+    """Retourne les headers CORS — restreint à fougahshop.com."""
+    allowed = origin if origin in ALLOWED_ORIGINS else "https://fougahshop.com"
+    return {
+        "Access-Control-Allow-Origin":  allowed,
+        "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type",
+        "Vary": "Origin",
+    }
 
 
 # ─── Tools ───────────────────────────────────────────────────
 async def exec_get_config() -> str:
-    """Récupère la config publique depuis l'API FougahShop."""
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(f"{FOUGAHSHOP_API_URL}/api/config/public")
         if resp.status_code != 200:
             return "⚠️ Impossible de récupérer la configuration."
 
-        cfg = resp.json()
+        cfg       = resp.json()
         taux_gnf  = cfg.get("taux_gnf", 9500)
         taux_fcfa = cfg.get("taux_change", 660)
         port_kg   = cfg.get("port_kg", {})
@@ -188,39 +195,36 @@ async def exec_get_config() -> str:
         numeros   = cfg.get("numeros_paiement", {})
         livdom    = cfg.get("livraison_domicile", {})
 
-        result = f"📊 **Configuration FougahShop (en temps réel)**\n\n"
-        result += f"💱 **Taux de change**\n"
-        result += f"• 1€ = {taux_gnf:,.0f} GNF (Guinée)\n".replace(",", " ")
-        result += f"• 1€ = {taux_fcfa:,.0f} FCFA (zone FCFA)\n\n".replace(",", " ")
+        result  = "📊 **Configuration FougahShop (en temps réel)**\n\n"
+        result += f"💱 **Taux de change**\n• 1€ = {taux_gnf:,.0f} GNF\n• 1€ = {taux_fcfa:,.0f} FCFA\n\n".replace(",", " ")
 
-        # Pays actifs
-        pays_actifs = {k: v for k, v in port_kg.items() if v.get("actif")}
+        pays_actifs   = {k: v for k, v in port_kg.items() if v.get("actif")}
         pays_inactifs = {k: v for k, v in port_kg.items() if not v.get("actif")}
 
         if pays_actifs:
-            result += f"🚚 **Frais de livraison (pays actifs)**\n"
+            result += "🚚 **Frais de livraison (pays actifs)**\n"
             for pays, info in pays_actifs.items():
                 result += f"• {pays} : {int(info['prix']):,} FCFA/kg — {info['delai']}\n".replace(",", " ")
             result += "\n"
 
         if pays_inactifs:
-            result += f"🔜 **Pays bientôt disponibles**\n"
+            result += "🔜 **Pays bientôt disponibles**\n"
             result += ", ".join(pays_inactifs.keys()) + "\n\n"
 
         if operateurs:
-            result += f"📱 **Opérateurs de paiement**\n"
+            result += "📱 **Opérateurs de paiement**\n"
             for pays, ops in operateurs.items():
                 result += f"• {pays} : {', '.join(ops)}\n"
             result += "\n"
 
         if numeros:
-            result += f"📞 **Numéros de paiement**\n"
+            result += "📞 **Numéros de paiement**\n"
             for op, num in numeros.items():
                 result += f"• {op} : {num}\n"
             result += "\n"
 
         if livdom and livdom.get("retrait"):
-            result += f"🏠 **Livraison à domicile**\n"
+            result += "🏠 **Livraison à domicile**\n"
             result += f"• Zone : {livdom.get('zones', 'N/A')}\n"
             result += f"• Prix : {int(livdom.get('prix', 0)):,} GNF\n".replace(",", " ")
             result += f"• Délai : {livdom.get('delai', 'N/A')}\n"
@@ -229,8 +233,9 @@ async def exec_get_config() -> str:
 
         return result
 
-    except Exception as e:
-        return f"⚠️ Erreur récupération config : {str(e)}"
+    except Exception:
+        # ✅ Ne pas exposer les détails de l'erreur au client
+        return "⚠️ Impossible de récupérer la configuration pour le moment."
 
 
 async def exec_suivi_commande(ref: str, tel: str) -> str:
@@ -246,6 +251,7 @@ async def exec_suivi_commande(ref: str, tel: str) -> str:
             return "❌ Le numéro de téléphone ne correspond pas à cette commande."
         if resp.status_code != 200:
             return "⚠️ Je n'arrive pas à récupérer les informations. Réessaie dans quelques instants."
+
         data    = resp.json()
         statut  = STATUTS_FR.get(data.get("statut", ""), data.get("statut", "inconnu"))
         nom     = data.get("client_nom", "Client")
@@ -258,12 +264,12 @@ async def exec_suivi_commande(ref: str, tel: str) -> str:
         if suivi_num:
             result += f"🔍 N° suivi transporteur : {suivi_num}\n"
         return result
-    except Exception as e:
-        return f"⚠️ Erreur : {str(e)}"
+
+    except Exception:
+        return "⚠️ Erreur lors de la récupération de la commande."
 
 
 async def exec_calculer_prix(prix_euros: float, pays: str, qty: int = 1) -> str:
-    """Calcule le prix avec les taux en temps réel depuis l'API."""
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(f"{FOUGAHSHOP_API_URL}/api/config/public")
@@ -274,15 +280,12 @@ async def exec_calculer_prix(prix_euros: float, pays: str, qty: int = 1) -> str:
     taux_gnf  = cfg.get("taux_gnf", 9500)
     taux_fcfa = cfg.get("taux_change", 660)
 
-    # Trouver le pays
     pays_lower = pays.lower().strip()
     monnaie = "FCFA"
     taux    = taux_fcfa
 
     if "guin" in pays_lower:
-        monnaie = "GNF"
-        taux    = taux_gnf
-        pays    = "Guinée"
+        monnaie = "GNF"; taux = taux_gnf; pays = "Guinée"
     elif "s" in pays_lower and "n" in pays_lower and "gal" in pays_lower:
         pays = "Sénégal"
     elif "cote" in pays_lower or "ivoire" in pays_lower:
@@ -290,24 +293,29 @@ async def exec_calculer_prix(prix_euros: float, pays: str, qty: int = 1) -> str:
     elif "burkina" in pays_lower:
         pays = "Burkina Faso"
 
-    total_eu  = prix_euros * qty
-    comm_fcfa = next((p["comm"] for p in PALIERS if total_eu <= p["max"]), 20000)
-    comm_local = round(comm_fcfa * (taux / 656)) if monnaie == "GNF" else comm_fcfa
-    article_local = round(total_eu * taux)
-    total_local   = article_local + comm_local
+    total_eu      = prix_euros * qty
+    comm_fcfa     = next((p["comm"] for p in PALIERS if total_eu <= p["max"]), 20000)
+    comm_local    = round(comm_fcfa * (taux / 656)) if monnaie == "GNF" else comm_fcfa
+    panier_local  = round(total_eu * taux)
+    total_local   = panier_local + comm_local
 
-    r  = f"💰 **Calcul pour {qty}× article à {prix_euros}€** ({pays})\n\n"
-    r += f"• Prix article(s) : {article_local:,} {monnaie}\n".replace(",", " ")
+    r  = f"💰 **Calcul pour {qty}× panier à {prix_euros}€** ({pays})\n\n"
+    r += f"• Prix panier(s) : {panier_local:,} {monnaie}\n".replace(",", " ")
     r += f"• Commission FougahShop : {comm_local:,} {monnaie}\n".replace(",", " ")
-    r += f"• **Total article + commission : {total_local:,} {monnaie}**\n\n".replace(",", " ")
-    r += f"_(+ frais de livraison selon le poids du colis — visible à la commande)_"
+    r += f"• **Total : {total_local:,} {monnaie}**\n\n".replace(",", " ")
+    r += "_(+ frais de livraison selon le poids — visible à la commande)_"
     return r
 
 
 # ─── Moteur Claude ────────────────────────────────────────────
 async def run_bot(messages: list) -> str:
     if not ANTHROPIC_API_KEY:
-        return "⚠️ Le bot n'est pas encore configuré (ANTHROPIC_API_KEY manquante)."
+        return "⚠️ Le bot n'est pas encore configuré."
+
+    # ✅ Limiter l'historique côté serveur
+    if len(messages) > MAX_HISTORY_TURNS * 2 + 1:
+        messages = messages[-(MAX_HISTORY_TURNS * 2):]
+
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     resp = client.messages.create(
         model="claude-haiku-4-5-20251001",
@@ -316,6 +324,7 @@ async def run_bot(messages: list) -> str:
         tools=TOOLS,
         messages=messages
     )
+
     while resp.stop_reason == "tool_use":
         results = []
         for block in resp.content:
@@ -332,6 +341,7 @@ async def run_bot(messages: list) -> str:
                 else:
                     res = "Outil inconnu."
                 results.append({"type": "tool_result", "tool_use_id": block.id, "content": res})
+
         messages = messages + [
             {"role": "assistant", "content": resp.content},
             {"role": "user",      "content": results}
@@ -343,6 +353,7 @@ async def run_bot(messages: list) -> str:
             tools=TOOLS,
             messages=messages
         )
+
     for block in resp.content:
         if hasattr(block, "text"):
             return block.text
@@ -352,30 +363,45 @@ async def run_bot(messages: list) -> str:
 # ─── Routes ───────────────────────────────────────────────────
 
 @router.options("/chat")
-async def chat_options():
-    return JSONResponse({}, headers=CORS_HEADERS)
+async def chat_options(request: Request):
+    origin = request.headers.get("origin", "")
+    return JSONResponse({}, headers=_cors_headers(origin))
 
 
 @router.post("/chat")
 async def chat(request: Request):
+    origin = request.headers.get("origin", "")
+    headers = _cors_headers(origin)
+
     try:
         body = await request.json()
     except Exception:
-        return JSONResponse({"error": "Corps JSON invalide"}, status_code=400, headers=CORS_HEADERS)
+        return JSONResponse({"error": "Corps JSON invalide"}, status_code=400, headers=headers)
 
+    # ✅ Limite taille du message
     message = (body.get("message") or "").strip()
     if not message:
-        return JSONResponse({"error": "Message vide"}, status_code=400, headers=CORS_HEADERS)
+        return JSONResponse({"error": "Message vide"}, status_code=400, headers=headers)
+    if len(message) > MAX_MESSAGE_LENGTH:
+        return JSONResponse({"error": "Message trop long."}, status_code=400, headers=headers)
 
-    history  = body.get("history") or []
-    messages = list(history) + [{"role": "user", "content": message}]
+    # ✅ Nettoyer et limiter l'historique entrant
+    raw_history = body.get("history") or []
+    if len(raw_history) > MAX_HISTORY_TURNS * 2:
+        raw_history = raw_history[-(MAX_HISTORY_TURNS * 2):]
+    messages = list(raw_history) + [{"role": "user", "content": message}]
 
     try:
         reply = await run_bot(messages)
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500, headers=CORS_HEADERS)
+    except Exception:
+        # ✅ Ne pas exposer les détails de l'erreur
+        return JSONResponse(
+            {"error": "Une erreur est survenue. Réessayez dans quelques instants."},
+            status_code=500,
+            headers=headers
+        )
 
-    return JSONResponse({"reply": reply}, headers=CORS_HEADERS)
+    return JSONResponse({"reply": reply}, headers=headers)
 
 
 @router.get("/whatsapp")
@@ -397,16 +423,20 @@ async def wa_webhook(request: Request):
         msg   = entry["changes"][0]["value"]["messages"][0]
     except (KeyError, IndexError):
         return JSONResponse({"status": "ok"})
+
     if msg.get("type") != "text":
         return JSONResponse({"status": "ok"})
+
     from_tel = msg["from"]
-    text     = msg["text"]["body"].strip()
+    text     = msg["text"]["body"].strip()[:MAX_MESSAGE_LENGTH]  # ✅ limiter aussi WA
     history  = _wa_sessions.get(from_tel, [])
-    if len(history) > 20:
-        history = history[-20:]
+    if len(history) > MAX_HISTORY_TURNS * 2:
+        history = history[-(MAX_HISTORY_TURNS * 2):]
+
     messages = history + [{"role": "user", "content": text}]
     reply    = await run_bot(messages)
     _wa_sessions[from_tel] = messages + [{"role": "assistant", "content": reply}]
+
     if WA_TOKEN and WA_PHONE_ID:
         await _send_wa_message(from_tel, reply)
     return JSONResponse({"status": "ok"})
@@ -425,4 +455,5 @@ async def _send_wa_message(to: str, text: str):
 
 @router.get("/health")
 def health():
-    return {"status": "ok", "bot": "Fougah — FougahShop IA"}
+    # ✅ Réponse minimaliste — ne révèle pas les détails du service
+    return {"status": "ok"}
