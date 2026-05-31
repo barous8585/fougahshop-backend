@@ -4,7 +4,7 @@ from sqlalchemy import text
 from pydantic import BaseModel
 from typing import List, Optional
 from datetime import datetime
-import json
+import json, traceback
 from database import get_db
 from models import Commande, Config, PortKg
 
@@ -43,7 +43,7 @@ PALIERS_COMMISSION = [
 ]
 
 TOTAL_VALIDATION_WARN_ONLY = True
-TOTAL_TOLERANCE_PCT        = 5  # %
+TOTAL_TOLERANCE_PCT        = 5
 
 
 def get_commission(total_euros: float) -> float:
@@ -69,19 +69,22 @@ def get_port(db, pays):
 
 
 def generate_ref(db) -> str:
-    year = datetime.now().year
+    year   = datetime.now().year
     prefix = f"CMD-{year}-"
-    # FIX: Ajout de FOR UPDATE pour éviter les doublons de ref en cas de requêtes concurrentes
-    result = db.execute(
-        text("""
-            SELECT COALESCE(MAX(CAST(SUBSTRING(ref FROM :pos) AS INTEGER)), 0) + 1
-            FROM commandes
-            WHERE ref LIKE :pattern
-            FOR UPDATE
-        """),
-        {"pos": len(prefix) + 1, "pattern": f"{prefix}%"}
-    ).scalar()
-    return f"{prefix}{result:04d}"
+    # FIX: Supprimé FOR UPDATE (peut planter sur table vide ou PostgreSQL strict)
+    try:
+        result = db.execute(
+            text("""
+                SELECT COALESCE(MAX(CAST(SUBSTRING(ref FROM :pos) AS INTEGER)), 0) + 1
+                FROM commandes
+                WHERE ref LIKE :pattern
+            """),
+            {"pos": len(prefix) + 1, "pattern": f"{prefix}%"}
+        ).scalar()
+    except Exception as e:
+        print(f"[generate_ref] Erreur SQL : {e}")
+        result = 1
+    return f"{prefix}{result or 1:04d}"
 
 
 def calc_article_sans_port_ni_commission(prix_eu, qty, pays, cfg):
@@ -91,12 +94,12 @@ def calc_article_sans_port_ni_commission(prix_eu, qty, pays, cfg):
 
     if m["symbole"] == "GNF":
         taux_conv  = taux_gnf / 656
-        base_local = round(prix_eu * taux_gnf * qty)   # FIX: multiplier qty AVANT round
+        base_local = round(prix_eu * taux_gnf * qty)
         base_fcfa  = round(prix_eu * taux_fcfa)
     else:
         taux_conv  = 1.0
         base_fcfa  = round(prix_eu * taux_fcfa)
-        base_local = round(prix_eu * taux_fcfa * qty)  # FIX: multiplier qty AVANT round
+        base_local = round(prix_eu * taux_fcfa * qty)
 
     return {
         "base_fcfa":   base_fcfa,
@@ -110,21 +113,21 @@ def appliquer_promo(db, promo_code: str, total_local: float, taux_conv: float) -
     if not promo_code:
         return total_local
     try:
+        # FIX: Supprimé FOR UPDATE sur SELECT (inutile, peut deadlock)
         promo = db.execute(
-            text("SELECT * FROM promo_codes WHERE code=:code AND actif=TRUE LIMIT 1 FOR UPDATE"),
+            text("SELECT * FROM promo_codes WHERE code=:code AND actif=TRUE LIMIT 1"),
             {"code": promo_code.strip().upper()}
         ).fetchone()
 
         if not promo:
             return total_local
 
-        # FIX: Gérer expiry string ET date object
         expiry = getattr(promo, "expiry", None)
         if expiry:
             from datetime import date
             exp_date = None
             if hasattr(expiry, "year"):
-                exp_date = expiry  # déjà un objet date
+                exp_date = expiry
             elif isinstance(expiry, str) and expiry:
                 try:
                     exp_date = date.fromisoformat(expiry[:10])
@@ -150,7 +153,6 @@ def appliquer_promo(db, promo_code: str, total_local: float, taux_conv: float) -
             reduction = round(float(valeur) * taux_conv)
             nouveau_total = max(0, total_local - reduction)
 
-        # FIX: Essayer uses_count en premier, NE PAS essayer utilisations si uses_count a réussi
         incremente = False
         try:
             db.execute(
@@ -191,14 +193,7 @@ def _get_gain_parrain(db, reduction_fcfa: float) -> float:
     return round(reduction_fcfa * 0.5)
 
 
-def _enregistrer_parrainage(
-    db,
-    code: str,
-    filleul_tel: str,
-    filleul_nom: str,
-    commande_ref: str,
-    reduction_fcfa: float,
-) -> bool:
+def _enregistrer_parrainage(db, code, filleul_tel, filleul_nom, commande_ref, reduction_fcfa):
     code = code.upper().strip()
     try:
         parrain = db.execute(
@@ -209,7 +204,6 @@ def _enregistrer_parrainage(
             print(f"[parrainage] Code {code} invalide ou inactif")
             return False
 
-        # FIX: Normalisation robuste pour l'anti auto-parrainage (suffixe 9 chiffres)
         def norm_suffix(t):
             digits = ''.join(filter(str.isdigit, t or ""))
             return digits[-9:] if len(digits) >= 9 else digits
@@ -243,7 +237,6 @@ def _enregistrer_parrainage(
             {"c": code, "t": filleul_tel, "n": filleul_nom,
              "r": commande_ref, "red": reduction_fcfa}
         )
-
         db.execute(
             text("""
                 UPDATE parrainage_codes
@@ -296,7 +289,6 @@ class CommandeCreate(BaseModel):
     total_local_client:     Optional[float] = None
     monnaie_client:         Optional[str]   = None
     taux_utilise:           Optional[float] = None
-    # FIX: Champs cadeau manquants
     is_cadeau:              Optional[bool]  = False
     dest_nom:               Optional[str]   = None
     dest_tel:               Optional[str]   = None
@@ -332,7 +324,6 @@ class CommandeWACreate(BaseModel):
     client_tel:          str
     client_pays:         str
     client_adresse:      str
-    # FIX: client_instructions manquant
     client_instructions: Optional[str]   = None
     paniers:             List[PanierWA]
     total_eur:           float
@@ -360,13 +351,7 @@ def _normaliser_tel(tel: str) -> str:
     return ''.join(filter(str.isdigit, tel or ""))
 
 
-def _calculer_total_serveur(
-    articles: List[ArticleIn],
-    pays: str,
-    cfg,
-    promo_code: Optional[str],
-    db,
-) -> tuple:
+def _calculer_total_serveur(articles, pays, cfg, promo_code, db):
     m = MONNAIES.get(pays, {"symbole": "FCFA", "taux_base": 656})
     total_local_sans_comm = 0.0
     total_eu              = 0.0
@@ -395,26 +380,20 @@ def _calculer_total_serveur(
 def _valider_total(total_serveur: float, total_client: Optional[float]) -> float:
     if not total_client or total_client <= 0:
         return total_serveur
-
     ecart_pct = abs(total_serveur - total_client) / max(total_serveur, 1) * 100
-
     if ecart_pct <= TOTAL_TOLERANCE_PCT:
         return total_serveur
-
-    msg = (
+    print(
         f"[VALIDATION TOTAL] Écart détecté : "
         f"serveur={total_serveur:.0f} / client={total_client:.0f} "
         f"({ecart_pct:.1f}%) — total serveur utilisé."
     )
-    print(msg)
-
     if not TOTAL_VALIDATION_WARN_ONLY:
         raise HTTPException(
             400,
             f"Montant incohérent (écart {ecart_pct:.0f}%). "
             "Rechargez la page et réessayez."
         )
-
     return total_serveur
 
 
@@ -441,102 +420,118 @@ def calculer(body: CalculRequest, db: Session = Depends(get_db)):
 
 @router.post("/", status_code=201)
 def creer_commande(body: CommandeCreate, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
-    if not body.articles:
-        raise HTTPException(400, "Panier vide")
+    try:
+        if not body.articles:
+            raise HTTPException(400, "Panier vide")
 
-    cfg       = get_config(db)
-    port_info = db.query(PortKg).filter(PortKg.pays == body.client_pays).first()
+        cfg       = get_config(db)
+        port_info = db.query(PortKg).filter(PortKg.pays == body.client_pays).first()
 
-    total_local_serveur, total_eu, poids_total, taux_conv, monnaie_symbole = (
-        _calculer_total_serveur(body.articles, body.client_pays, cfg, body.promo_code, db)
-    )
+        total_local_serveur, total_eu, poids_total, taux_conv, monnaie_symbole = (
+            _calculer_total_serveur(body.articles, body.client_pays, cfg, body.promo_code, db)
+        )
 
-    total_local = _valider_total(total_local_serveur, body.total_local_client)
+        total_local = _valider_total(total_local_serveur, body.total_local_client)
+        monnaie     = MONNAIES.get(body.client_pays, {"symbole": "FCFA"})["symbole"]
 
-    m_attendue = MONNAIES.get(body.client_pays, {"symbole": "FCFA"})["symbole"]
-    monnaie    = m_attendue
+        articles_detail = []
+        for a in body.articles:
+            frais_b       = float(getattr(a, 'frais_livraison_boutique', 0) or 0)
+            prix_total_eu = a.prix_eu + frais_b
+            detail        = calc_article_sans_port_ni_commission(prix_total_eu, a.qty, body.client_pays, cfg)
+            articles_detail.append({
+                "lien":                     _sanitize_url(a.lien or ""),
+                "nom":                      a.nom,
+                "img":                      a.img,
+                "categorie":                a.categorie,
+                "taille":                   a.taille,
+                "couleur":                  a.couleur,
+                "specs":                    a.specs,
+                "prix_eu":                  a.prix_eu,
+                "frais_livraison_boutique": frais_b,
+                "poids":                    a.poids,
+                "qty":                      a.qty,
+                "total_local":              detail["total_local"],
+                "monnaie":                  detail["monnaie"],
+            })
 
-    articles_detail = []
-    for a in body.articles:
-        frais_b = float(getattr(a, 'frais_livraison_boutique', 0) or 0)
-        prix_total_eu = a.prix_eu + frais_b
-        detail = calc_article_sans_port_ni_commission(prix_total_eu, a.qty, body.client_pays, cfg)
-        articles_detail.append({
-            "lien":                     _sanitize_url(a.lien or ""),
-            "nom":                      a.nom,
-            "img":                      a.img,
-            "categorie":                a.categorie,
-            "taille":                   a.taille,
-            "couleur":                  a.couleur,
-            "specs":                    a.specs,
-            "prix_eu":                  a.prix_eu,
-            "frais_livraison_boutique": frais_b,
-            "poids":                    a.poids,
-            "qty":                      a.qty,
-            "total_local":              detail["total_local"],
-            "monnaie":                  detail["monnaie"],
-        })
+        statut_initial = "paye" if body.mode_paiement == "kkiapay" else "en_attente_paiement"
+        note_auto = None
+        if body.mode_paiement == "kkiapay" and body.kkiapay_transaction_id:
+            note_auto = f"[KKIAPAY] Transaction: {body.kkiapay_transaction_id}"
 
-    statut_initial = "paye" if body.mode_paiement == "kkiapay" else "en_attente_paiement"
+        commande = Commande(
+            ref                 = generate_ref(db),
+            client_nom          = body.client_nom,
+            client_tel          = body.client_tel,
+            client_pays         = body.client_pays,
+            client_adresse      = body.client_adresse,
+            client_instructions = body.client_instructions,
+            operateur           = body.operateur,
+            monnaie             = monnaie,
+            total_euro          = round(total_eu, 2),
+            total_local         = round(total_local),
+            poids_estime        = round(poids_total, 2),
+            articles            = json.dumps(articles_detail, ensure_ascii=False),
+            nb_articles         = len(body.articles),
+            statut              = statut_initial,
+            delai_livraison     = port_info.delai if port_info else "—",
+            note_admin          = note_auto,
+            promo_code          = body.promo_code,
+        )
 
-    note_auto = None
-    if body.mode_paiement == "kkiapay" and body.kkiapay_transaction_id:
-        note_auto = f"[KKIAPAY] Transaction: {body.kkiapay_transaction_id}"
+        # FIX: colonnes optionnelles via setattr — résistant aux migrations partielles
+        for col, val in [
+            ("is_cadeau",  body.is_cadeau or False),
+            ("dest_nom",   body.dest_nom),
+            ("dest_tel",   body.dest_tel),
+            ("payeur_nom", body.payeur_nom),
+        ]:
+            try:
+                setattr(commande, col, val)
+            except Exception:
+                pass
 
-    commande = Commande(
-        ref                 = generate_ref(db),
-        client_nom          = body.client_nom,
-        client_tel          = body.client_tel,
-        client_pays         = body.client_pays,
-        client_adresse      = body.client_adresse,
-        client_instructions = body.client_instructions,
-        operateur           = body.operateur,
-        monnaie             = monnaie,
-        total_euro          = round(total_eu, 2),
-        total_local         = round(total_local),
-        poids_estime        = round(poids_total, 2),
-        articles            = json.dumps(articles_detail, ensure_ascii=False),
-        nb_articles         = len(body.articles),
-        statut              = statut_initial,
-        delai_livraison     = port_info.delai if port_info else "—",
-        note_admin          = note_auto,
-        promo_code          = body.promo_code,
-        # FIX: Champs cadeau enregistrés
-        is_cadeau           = body.is_cadeau or False,
-        dest_nom            = body.dest_nom,
-        dest_tel            = body.dest_tel,
-        payeur_nom          = body.payeur_nom,
-    )
-    db.add(commande)
-    db.commit()
-    db.refresh(commande)
+        db.add(commande)
+        db.commit()
+        db.refresh(commande)
 
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[creer_commande] ERREUR CRITIQUE:\n{traceback.format_exc()}")
+        db.rollback()
+        raise HTTPException(500, f"Erreur lors de la création de la commande : {str(e)}")
+
+    # Parrainage — hors bloc critique
     if body.code_parrainage and body.code_parrainage.strip():
         try:
             _enregistrer_parrainage(
-                db           = db,
-                code         = body.code_parrainage,
-                filleul_tel  = body.client_tel,
-                filleul_nom  = body.client_nom,
-                commande_ref = commande.ref,
+                db             = db,
+                code           = body.code_parrainage,
+                filleul_tel    = body.client_tel,
+                filleul_nom    = body.client_nom,
+                commande_ref   = commande.ref,
                 reduction_fcfa = float(body.reduction_parrainage or 1000),
             )
             db.commit()
         except Exception as e:
-            print(f"[parrainage] Erreur enregistrement: {e}")
+            print(f"[parrainage] Erreur enregistrement (non bloquant): {e}")
             db.rollback()
 
     mode_label = "💳 Kkiapay ✅" if body.mode_paiement == "kkiapay" else "📱 Virement manuel"
-    notifier_patron(
-        db,
-        "🛍️ Nouvelle commande" + (" — PAYÉE ✅" if statut_initial == "paye" else ""),
-        f"{commande.client_nom} · {commande.ref} · "
-        f"{round(commande.total_local or 0):,} {commande.monnaie or 'FCFA'} · {mode_label}",
-        commande.ref
-    )
-    db.commit()
+    try:
+        notifier_patron(
+            db,
+            "🛍️ Nouvelle commande" + (" — PAYÉE ✅" if statut_initial == "paye" else ""),
+            f"{commande.client_nom} · {commande.ref} · "
+            f"{round(commande.total_local or 0):,} {commande.monnaie or 'FCFA'} · {mode_label}",
+            commande.ref
+        )
+        db.commit()
+    except Exception as e:
+        print(f"[notif] Erreur (non bloquant): {e}")
 
-    # FIX: Utiliser BackgroundTasks au lieu de asyncio.create_task (fonction sync)
     try:
         from routes.onedrive import ajouter_commande_excel
         background_tasks.add_task(ajouter_commande_excel, {
@@ -554,7 +549,7 @@ def creer_commande(body: CommandeCreate, background_tasks: BackgroundTasks, db: 
             "taux_gnf":    cfg.taux_gnf or 9500,
         })
     except Exception as e:
-        print(f"[OneDrive] Erreur sync commande: {e}")
+        print(f"[OneDrive] Erreur sync commande (non bloquant): {e}")
 
     return {
         "ref":         commande.ref,
@@ -601,14 +596,12 @@ def suivi(ref: str, tel: str = Query(...), db: Session = Depends(get_db)):
     tel_saisi = _normaliser_tel(tel)
     tel_cmd   = _normaliser_tel(cmd.client_tel or "")
 
-    # FIX: Comparer les suffixes (9 chiffres) pour gérer indicatifs différents
     if len(tel_saisi) < 8:
         raise HTTPException(403, "Numéro de téléphone incorrect")
 
     suffix_saisi = tel_saisi[-9:] if len(tel_saisi) >= 9 else tel_saisi
     suffix_cmd   = tel_cmd[-9:]   if len(tel_cmd)   >= 9 else tel_cmd
 
-    # Accepter si suffixe commun d'au moins 8 chiffres
     match = False
     for n in range(8, min(len(suffix_saisi), len(suffix_cmd)) + 1):
         if suffix_saisi[-n:] == suffix_cmd[-n:]:
@@ -641,7 +634,6 @@ def suivi(ref: str, tel: str = Query(...), db: Session = Depends(get_db)):
 @router.get("/historique/{tel}")
 def historique(tel: str, db: Session = Depends(get_db)):
     tel_chiffres = _normaliser_tel(tel)
-
     if len(tel_chiffres) < 8:
         raise HTTPException(404, "Numéro trop court")
 
@@ -656,7 +648,7 @@ def historique(tel: str, db: Session = Depends(get_db)):
         """), {"pattern": f"%{suffixe}%"}).mappings().all()
         cmds = list(rows)
     except Exception as e:
-        print(f"[historique] REGEXP_REPLACE non supporté, fallback REPLACE: {e}")
+        print(f"[historique] REGEXP_REPLACE non supporté, fallback: {e}")
 
     if not cmds:
         try:
@@ -671,8 +663,8 @@ def historique(tel: str, db: Session = Depends(get_db)):
             print(f"[historique] REPLACE fallback échoué: {e}")
 
     if not cmds:
-        tel_clean = tel.replace(" ", "").replace("+", "").replace("-", "")
-        cmds_orm = db.query(Commande).filter(
+        tel_clean  = tel.replace(" ", "").replace("+", "").replace("-", "")
+        cmds_orm   = db.query(Commande).filter(
             Commande.client_tel.contains(tel_clean)
         ).order_by(Commande.created_at.desc()).all()
         cmds = [
@@ -686,10 +678,8 @@ def historique(tel: str, db: Session = Depends(get_db)):
     result = []
     for c in cmds:
         def g(key):
-            if isinstance(c, dict):
-                return c.get(key)
+            if isinstance(c, dict): return c.get(key)
             return getattr(c, key, None)
-
         created = g("created_at")
         delai   = g("delai_livraison") or ""
         result.append({
@@ -705,7 +695,6 @@ def historique(tel: str, db: Session = Depends(get_db)):
             "created_at":      created,
             "date_estimee":    calculer_date_estimee(created, delai),
         })
-
     return result
 
 
@@ -718,7 +707,6 @@ def annuler_commande(body: AnnulationBody, db: Session = Depends(get_db)):
 
     tel_chiffres     = _normaliser_tel(body.client_tel)
     cmd_tel_chiffres = _normaliser_tel(cmd.client_tel or "")
-
     if len(tel_chiffres) < 8 or tel_chiffres[-8:] not in cmd_tel_chiffres:
         raise HTTPException(403, "Numéro de téléphone incorrect")
 
@@ -726,9 +714,9 @@ def annuler_commande(body: AnnulationBody, db: Session = Depends(get_db)):
     if cmd.statut not in STATUTS_ANNULABLES:
         raise HTTPException(400, f"Annulation impossible — statut actuel : {cmd.statut}")
 
-    ancien_statut = cmd.statut
-    cmd.statut    = "annulee"
-    note          = f"[ANNULATION CLIENT] Tel: {body.client_tel}"
+    ancien_statut  = cmd.statut
+    cmd.statut     = "annulee"
+    note           = f"[ANNULATION CLIENT] Tel: {body.client_tel}"
     if body.motif:
         note += f" | Motif: {body.motif}"
     note_existante = (cmd.note_admin or "")[-500:]
@@ -743,113 +731,130 @@ def annuler_commande(body: AnnulationBody, db: Session = Depends(get_db)):
         )
     except Exception:
         pass
-
     return {"ok": True, "ref": cmd.ref, "statut": "annulee"}
 
 
 @router.post("/whatsapp", status_code=201)
 def creer_commande_whatsapp(body: CommandeWACreate, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
-    if not body.paniers:
-        raise HTTPException(400, "Aucun panier fourni")
+    try:
+        if not body.paniers:
+            raise HTTPException(400, "Aucun panier fourni")
 
-    cfg = get_config(db)
+        cfg    = get_config(db)
+        m      = MONNAIES.get(body.client_pays, {"symbole": "FCFA", "taux_base": 656})
+        is_gnf = m["symbole"] == "GNF"
+        taux   = (cfg.taux_gnf or 9500) if is_gnf else (cfg.taux_change or 656)
 
-    m      = MONNAIES.get(body.client_pays, {"symbole": "FCFA", "taux_base": 656})
-    is_gnf = m["symbole"] == "GNF"
-    taux   = (cfg.taux_gnf or 9500) if is_gnf else (cfg.taux_change or 656)
+        total_eur  = sum(p.prix + (p.livraison or 0) for p in body.paniers)
+        taux_conv  = taux / 656 if is_gnf else 1.0
 
-    prix_articles = sum(p.prix for p in body.paniers)
-    total_eur     = sum(p.prix + (p.livraison or 0) for p in body.paniers)
-    taux_conv     = taux / 656 if is_gnf else 1.0
+        # FIX: Si total_eur == 0 (commande panier-lien sans prix), pas de commission
+        # et total_local = 0 pour signaler "prix à confirmer"
+        is_panier_lien = (total_eur == 0)
 
-    total_converti = sum(
-        round(p.prix * taux) + round((p.livraison or 0) * taux)
-        for p in body.paniers
-    )
+        if is_panier_lien:
+            total_local         = 0
+            total_brut_serveur  = 0
+            commission_locale   = 0
+        else:
+            total_converti = sum(
+                round(p.prix * taux) + round((p.livraison or 0) * taux)
+                for p in body.paniers
+            )
+            commission_fcfa   = get_commission(total_eur)
+            commission_locale = round(commission_fcfa * taux_conv)
+            total_brut_serveur = total_converti + commission_locale
 
-    # FIX: Commission calculée sur total_eur (prix + livraison) comme pour les articles
-    commission_fcfa   = get_commission(total_eur)
-    commission_locale = round(commission_fcfa * taux_conv)
-    total_brut_serveur  = total_converti + commission_locale
+            reduction_serveur = 0
+            promo_code_valide = None
+            if body.promo_code:
+                try:
+                    code_upper        = body.promo_code.strip().upper()
+                    total_apres_promo = appliquer_promo(db, code_upper, total_brut_serveur, taux_conv)
+                    if total_apres_promo != total_brut_serveur:
+                        promo_code_valide = code_upper
+                        reduction_serveur = total_brut_serveur - total_apres_promo
+                except Exception as e:
+                    print(f"[WA] Erreur application promo: {e}")
 
-    reduction_serveur = 0
-    promo_code_valide = None
-    if body.promo_code:
-        try:
-            code_upper = body.promo_code.strip().upper()
-            total_apres_promo = appliquer_promo(db, code_upper, total_brut_serveur, taux_conv)
-            if total_apres_promo != total_brut_serveur:
-                promo_code_valide = code_upper
-                reduction_serveur = total_brut_serveur - total_apres_promo
-            else:
-                promo_code_valide = None
-        except Exception as e:
-            print(f"[WA] Erreur application promo: {e}")
+            parrain_code_valide    = None
+            reduction_parrain_fcfa = 1000.0
+            if body.code_parrainage and not promo_code_valide:
+                try:
+                    parrain_row = db.execute(
+                        text("SELECT parrain_tel FROM parrainage_codes WHERE code=:c AND actif=TRUE"),
+                        {"c": body.code_parrainage.strip().upper()}
+                    ).mappings().first()
+                    if parrain_row and parrain_row["parrain_tel"] != body.client_tel:
+                        parrain_code_valide = body.code_parrainage.strip().upper()
+                        cfg_red = db.execute(
+                            text("SELECT reduction_parrainage FROM configs WHERE id=1 LIMIT 1")
+                        ).fetchone()
+                        reduction_parrain_fcfa = float(cfg_red[0]) if cfg_red and cfg_red[0] else 1000.0
+                        reduction_serveur = round(reduction_parrain_fcfa * taux_conv)
+                except Exception as e:
+                    print(f"[WA] Erreur vérif parrainage: {e}")
 
-    parrain_code_valide = None
-    reduction_parrain_fcfa = 1000.0
-    if body.code_parrainage and not promo_code_valide:
-        try:
-            parrain_row = db.execute(
-                text("SELECT parrain_tel FROM parrainage_codes WHERE code=:c AND actif=TRUE"),
-                {"c": body.code_parrainage.strip().upper()}
-            ).mappings().first()
-            if parrain_row and parrain_row["parrain_tel"] != body.client_tel:
-                parrain_code_valide = body.code_parrainage.strip().upper()
-                cfg_red = db.execute(
-                    text("SELECT reduction_parrainage FROM configs WHERE id=1 LIMIT 1")
-                ).fetchone()
-                reduction_parrain_fcfa = float(cfg_red[0]) if cfg_red and cfg_red[0] else 1000.0
-                reduction_serveur = round(reduction_parrain_fcfa * taux_conv)
-        except Exception as e:
-            print(f"[WA] Erreur vérif parrainage: {e}")
+            total_local = _valider_total(
+                max(0, total_brut_serveur - reduction_serveur),
+                body.total_local
+            )
 
-    total_local_serveur = max(0, total_brut_serveur - reduction_serveur)
-    total_local = _valider_total(total_local_serveur, body.total_local)
+        articles_detail = []
+        for i, p in enumerate(body.paniers):
+            prix_avec_livr  = p.prix + (p.livraison or 0)
+            total_local_art = round(prix_avec_livr * taux) if not is_panier_lien else 0
+            articles_detail.append({
+                "lien":                     _sanitize_url(p.lien),
+                "nom":                      f"Panier {i + 1}",
+                "prix_eu":                  p.prix,
+                "frais_livraison_boutique": p.livraison or 0,
+                "poids":                    0.5,
+                "qty":                      1,
+                "monnaie":                  m["symbole"],
+                "total_local":              total_local_art,
+            })
 
-    articles_detail = []
-    for i, p in enumerate(body.paniers):
-        # FIX: Inclure la livraison boutique dans total_local_art
-        prix_avec_livr = p.prix + (p.livraison or 0)
-        total_local_art = round(prix_avec_livr * taux)
-        articles_detail.append({
-            "lien":                     _sanitize_url(p.lien),
-            "nom":                      f"Panier {i + 1}",
-            "prix_eu":                  p.prix,
-            "frais_livraison_boutique": p.livraison or 0,
-            "poids":                    0.5,
-            "qty":                      1,
-            "monnaie":                  m["symbole"],
-            "total_local":              total_local_art,
-        })
+        port_info = db.query(PortKg).filter(PortKg.pays == body.client_pays).first()
 
-    port_info = db.query(PortKg).filter(PortKg.pays == body.client_pays).first()
+        # FIX: note_admin différenciée selon type de commande WA
+        if is_panier_lien:
+            note = "[WhatsApp] 📎 Panier lien — PRIX À CONFIRMER"
+        else:
+            note = f"[WhatsApp] {len(body.paniers)} panier(s) — en attente de confirmation"
 
-    commande = Commande(
-        ref                 = generate_ref(db),
-        client_nom          = body.client_nom,
-        client_tel          = body.client_tel,
-        client_pays         = body.client_pays,
-        client_adresse      = body.client_adresse,
-        # FIX: client_instructions enregistré
-        client_instructions = body.client_instructions,
-        operateur           = "WhatsApp",
-        monnaie             = m["symbole"],
-        total_euro          = round(total_eur, 2),
-        total_local         = round(total_local),
-        poids_estime        = round(len(body.paniers) * 0.5, 2),
-        articles            = json.dumps(articles_detail, ensure_ascii=False),
-        nb_articles         = len(body.paniers),
-        statut              = "en_attente_paiement",
-        delai_livraison     = port_info.delai if port_info else "—",
-        note_admin          = f"[WhatsApp] {len(body.paniers)} panier(s) — en attente de confirmation",
-        promo_code          = promo_code_valide or parrain_code_valide,
-    )
-    db.add(commande)
-    db.commit()
-    db.refresh(commande)
+        commande = Commande(
+            ref                 = generate_ref(db),
+            client_nom          = body.client_nom,
+            client_tel          = body.client_tel,
+            client_pays         = body.client_pays,
+            client_adresse      = body.client_adresse,
+            client_instructions = body.client_instructions,
+            operateur           = "WhatsApp",
+            monnaie             = m["symbole"],
+            total_euro          = round(total_eur, 2),
+            total_local         = round(total_local),
+            poids_estime        = round(len(body.paniers) * 0.5, 2),
+            articles            = json.dumps(articles_detail, ensure_ascii=False),
+            nb_articles         = len(body.paniers),
+            statut              = "en_attente_paiement",
+            delai_livraison     = port_info.delai if port_info else "—",
+            note_admin          = note,
+            promo_code          = (promo_code_valide or parrain_code_valide) if not is_panier_lien else None,
+        )
+        db.add(commande)
+        db.commit()
+        db.refresh(commande)
 
-    if parrain_code_valide:
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[creer_commande_whatsapp] ERREUR CRITIQUE:\n{traceback.format_exc()}")
+        db.rollback()
+        raise HTTPException(500, f"Erreur lors de la création de la commande WhatsApp : {str(e)}")
+
+    # Parrainage — hors bloc critique
+    if not is_panier_lien and parrain_code_valide:
         try:
             _enregistrer_parrainage(
                 db             = db,
@@ -861,20 +866,22 @@ def creer_commande_whatsapp(body: CommandeWACreate, background_tasks: Background
             )
             db.commit()
         except Exception as e:
-            print(f"[WA] Erreur enregistrement parrainage: {e}")
+            print(f"[WA] Erreur enregistrement parrainage (non bloquant): {e}")
             db.rollback()
 
-    notifier_patron(
-        db,
-        "📲 Nouvelle commande WhatsApp",
-        f"{commande.client_nom} · {commande.ref} · "
-        f"{round(commande.total_local or 0):,} {commande.monnaie} · "
-        f"{len(body.paniers)} panier(s)",
-        commande.ref
-    )
-    db.commit()
+    titre_notif = "📎 Panier lien — PRIX À CONFIRMER" if is_panier_lien else "📲 Nouvelle commande WhatsApp"
+    try:
+        notifier_patron(
+            db,
+            titre_notif,
+            f"{commande.client_nom} · {commande.ref} · {commande.client_pays}"
+            + (f" · {round(commande.total_local or 0):,} {commande.monnaie}" if not is_panier_lien else " · Prix à confirmer"),
+            commande.ref
+        )
+        db.commit()
+    except Exception as e:
+        print(f"[notif] Erreur (non bloquant): {e}")
 
-    # FIX: Utiliser BackgroundTasks au lieu de asyncio.create_task (fonction sync)
     try:
         from routes.onedrive import ajouter_commande_excel
         background_tasks.add_task(ajouter_commande_excel, {
@@ -892,7 +899,7 @@ def creer_commande_whatsapp(body: CommandeWACreate, background_tasks: Background
             "taux_gnf":    cfg.taux_gnf or 9500,
         })
     except Exception as e:
-        print(f"[OneDrive] Erreur sync commande WA: {e}")
+        print(f"[OneDrive] Erreur sync commande WA (non bloquant): {e}")
 
     return {
         "ref":         commande.ref,
