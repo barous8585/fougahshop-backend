@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import JSONResponse          # ✅ ajout
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 from typing import Dict, Any
@@ -175,7 +176,9 @@ async def auto_refresh_taux_gnf():
         await asyncio.sleep(3600)
 
 
-# ── Config publique ───────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+# CONFIG PUBLIQUE
+# ══════════════════════════════════════════════════════════════
 
 @router.get("/public")
 def config_public(db: Session = Depends(get_db)):
@@ -220,7 +223,7 @@ def config_public(db: Session = Depends(get_db)):
     }
     taux_gnf_updated_at = row.get("taux_gnf_updated_at")
 
-    return {
+    data = {
         "taux_change":          cfg.taux_change,
         "commission":           cfg.commission,
         "taux_gnf":             cfg.taux_gnf,
@@ -236,6 +239,13 @@ def config_public(db: Session = Depends(get_db)):
         "gain_parrain":         float(row.get("gain_parrain") or 500),
         "livraison_domicile":   parse_json(row.get("livraison_domicile")) or {},
     }
+
+    # ✅ JSONResponse avec ensure_ascii=False pour corriger l'encodage UTF-8
+    # (évite SÃ©nÃ©gal au lieu de Sénégal, etc.)
+    return JSONResponse(
+        content=data,
+        media_type="application/json; charset=utf-8"
+    )
 
 
 @router.post("/livraison-domicile")
@@ -299,7 +309,6 @@ def update_config(
     if "taux_gnf"    in body: cfg.taux_gnf    = float(body["taux_gnf"])
     if "wa_number"   in body: cfg.wa_number   = str(body["wa_number"])
 
-    # ── Point 2a : changement du mot de passe admin via PUT /config ──
     if "admin_pwd" in body:
         new_pwd = str(body["admin_pwd"]).strip()
         if len(new_pwd) < PWD_MIN_LENGTH:
@@ -329,7 +338,6 @@ def update_config(
         except Exception:
             pass
 
-    # Opérateurs par pays
     ops_updates = {k[4:]: v for k, v in body.items() if k.startswith("ops_")}
     if ops_updates:
         try:
@@ -348,7 +356,6 @@ def update_config(
         except Exception:
             pass
 
-    # Numéros de paiement
     num_updates = {}
     for k, v in body.items():
         if k.startswith("num_") and v:
@@ -466,7 +473,6 @@ def create_employe(
     if not pwd:
         raise HTTPException(400, "Mot de passe requis")
 
-    # ── Point 2a : validation min 8 chars (était 4) ──────────
     if len(pwd) < PWD_MIN_LENGTH:
         raise HTTPException(
             400,
