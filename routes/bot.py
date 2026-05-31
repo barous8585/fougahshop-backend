@@ -16,12 +16,10 @@ WA_TOKEN           = os.getenv("WA_TOKEN", "")
 WA_PHONE_ID        = os.getenv("WA_PHONE_ID", "")
 WA_VERIFY_TOKEN    = os.getenv("WA_VERIFY_TOKEN", "fougahshop_verify")
 
-# ✅ Origines autorisées — restreint à fougahshop.com uniquement
 ALLOWED_ORIGINS = {"https://fougahshop.com", "https://www.fougahshop.com"}
 
-# ✅ Limites de sécurité
-MAX_MESSAGE_LENGTH = 1000    # caractères max par message client
-MAX_HISTORY_TURNS  = 10      # max 10 tours d'historique acceptés
+MAX_MESSAGE_LENGTH = 1000
+MAX_HISTORY_TURNS  = 10
 
 PALIERS = [
     {"max": 50,    "comm": 3500},
@@ -79,17 +77,20 @@ Tu dois TOUJOURS comprendre l'intention du client même si le message est mal é
 - Pas de frais cachés, pas de paiement supplémentaire après
 - Modes de paiement : Orange Money, Wave, MTN MoMo, Moov Money, Free Money
 
-=== COMMISSION FougahShop ===
+=== COMMISSION FougahShop (valeurs exactes en FCFA) ===
 La commission est calculée sur le total de tous les paniers en euros :
-- Total ≤ 50€   → +5€
-- Total ≤ 100€  → +8€
-- Total ≤ 200€  → +11€
-- Total ≤ 500€  → +18€
-- Total > 500€  → +30€
-Pour le montant exact converti en GNF ou FCFA, utilise l'outil calculer_prix.
+- Total ≤ 50€   → 3 500 FCFA
+- Total ≤ 100€  → 5 000 FCFA
+- Total ≤ 200€  → 7 000 FCFA
+- Total ≤ 500€  → 12 000 FCFA
+- Total > 500€  → 20 000 FCFA
+Pour la Guinée, ces montants sont convertis en GNF selon le taux en vigueur.
+Pour le montant exact converti, utilise TOUJOURS l'outil calculer_prix.
 
-=== FRAIS DE PORT ===
-Varient selon le pays et le poids du colis. Pour les tarifs exacts → utilise get_config.
+=== FRAIS DE PORT ET DÉLAIS ===
+RÈGLE ABSOLUE : Ne JAMAIS inventer ou estimer les frais de port ni les délais de livraison.
+TOUJOURS utiliser l'outil get_config pour obtenir les vraies valeurs en temps réel.
+Ne pas dire "2-3 semaines" ou tout autre délai de ta propre initiative.
 
 === BOUTIQUES ===
 65+ boutiques : Nike, Apple, Amazon, Adidas, Shein, Zara, H&M, ASOS, Zalando, Sephora, Decathlon, Fnac, La Redoute, AliExpress, Lululemon, New Balance, Foot Locker, JD Sports, IKEA, Mango, Ralph Lauren, Tommy Hilfiger, Lacoste, Calvin Klein, Puma, Supreme, Carhartt WIP, et bien d'autres.
@@ -110,7 +111,7 @@ Q: "c possible de commander depuis guinée ?"
 R: Oui bien sûr ! La Guinée est notre marché principal. Tu paies en Orange Money.
 
 Q: "combien sa coute de vous envoyer un truc ?"
-R: Le prix dépend du total de ton panier + une commission entre 5€ et 30€ + les frais de port au kilo. Dis-moi ce que tu veux commander et je calcule le total exact.
+R: Le prix dépend du total de ton panier + une commission + les frais de port au kilo. Dis-moi ce que tu veux commander et je calcule le total exact.
 
 Q: "j'ai payé mais toujours rien"
 R: Je vais vérifier ta commande. Donne-moi ta référence CMD-XXXX-XXXX et ton numéro de téléphone.
@@ -123,6 +124,9 @@ R: 100% authentique. On achète directement sur les sites officiels en Europe av
 
 Q: "je peux mettre plusieurs boutiques dans ma commande ?"
 R: Oui ! Tu peux créer plusieurs paniers dans la même commande — un panier par site. Tu paies tout en une seule fois.
+
+Q: "c'est combien le kilo ?" ou "délai livraison ?" ou "frais de port ?"
+R: [Appelle get_config et donne les vraies valeurs — ne jamais estimer]
 
 === STYLE DE RÉPONSE ===
 - Phrases courtes et simples — tes clients lisent sur mobile
@@ -169,7 +173,6 @@ _wa_sessions: dict = {}
 
 
 def _cors_headers(origin: str) -> dict:
-    """Retourne les headers CORS — restreint à fougahshop.com."""
     allowed = origin if origin in ALLOWED_ORIGINS else "https://fougahshop.com"
     return {
         "Access-Control-Allow-Origin":  allowed,
@@ -204,7 +207,16 @@ async def exec_get_config() -> str:
         if pays_actifs:
             result += "🚚 **Frais de livraison (pays actifs)**\n"
             for pays, info in pays_actifs.items():
-                result += f"• {pays} : {int(info['prix']):,} FCFA/kg — {info['delai']}\n".replace(",", " ")
+                # FIX: Afficher le prix dans la bonne monnaie selon le pays
+                is_gnf = pays == "Guinée"
+                prix_brut = int(info['prix'])
+                if is_gnf:
+                    prix_aff = round(prix_brut * taux_gnf / 656)
+                    sym = "GNF"
+                else:
+                    prix_aff = prix_brut
+                    sym = "FCFA"
+                result += f"• {pays} : {prix_aff:,} {sym}/kg — {info['delai']}\n".replace(",", " ")
             result += "\n"
 
         if pays_inactifs:
@@ -234,7 +246,6 @@ async def exec_get_config() -> str:
         return result
 
     except Exception:
-        # ✅ Ne pas exposer les détails de l'erreur au client
         return "⚠️ Impossible de récupérer la configuration pour le moment."
 
 
@@ -312,11 +323,9 @@ async def run_bot(messages: list, pays_client: str = "") -> str:
     if not ANTHROPIC_API_KEY:
         return "⚠️ Le bot n'est pas encore configuré."
 
-    # ✅ Limiter l'historique côté serveur
     if len(messages) > MAX_HISTORY_TURNS * 2 + 1:
         messages = messages[-(MAX_HISTORY_TURNS * 2):]
 
-    # ✅ Personnaliser le system prompt avec le pays du client
     system = SYSTEM_PROMPT
     if pays_client:
         monnaie = "GNF" if "guin" in pays_client.lower() else "FCFA"
@@ -384,17 +393,14 @@ async def chat(request: Request):
     except Exception:
         return JSONResponse({"error": "Corps JSON invalide"}, status_code=400, headers=headers)
 
-    # ✅ Limite taille du message
     message = (body.get("message") or "").strip()
     if not message:
         return JSONResponse({"error": "Message vide"}, status_code=400, headers=headers)
     if len(message) > MAX_MESSAGE_LENGTH:
         return JSONResponse({"error": "Message trop long."}, status_code=400, headers=headers)
 
-    # ✅ Récupérer le pays du client pour personnaliser les réponses
     pays_client = (body.get("pays") or "").strip()
 
-    # ✅ Nettoyer et limiter l'historique entrant
     raw_history = body.get("history") or []
     if len(raw_history) > MAX_HISTORY_TURNS * 2:
         raw_history = raw_history[-(MAX_HISTORY_TURNS * 2):]
@@ -403,7 +409,6 @@ async def chat(request: Request):
     try:
         reply = await run_bot(messages, pays_client=pays_client)
     except Exception:
-        # ✅ Ne pas exposer les détails de l'erreur
         return JSONResponse(
             {"error": "Une erreur est survenue. Réessayez dans quelques instants."},
             status_code=500,
@@ -437,7 +442,7 @@ async def wa_webhook(request: Request):
         return JSONResponse({"status": "ok"})
 
     from_tel = msg["from"]
-    text     = msg["text"]["body"].strip()[:MAX_MESSAGE_LENGTH]  # ✅ limiter aussi WA
+    text     = msg["text"]["body"].strip()[:MAX_MESSAGE_LENGTH]
     history  = _wa_sessions.get(from_tel, [])
     if len(history) > MAX_HISTORY_TURNS * 2:
         history = history[-(MAX_HISTORY_TURNS * 2):]
@@ -464,5 +469,4 @@ async def _send_wa_message(to: str, text: str):
 
 @router.get("/health")
 def health():
-    # ✅ Réponse minimaliste — ne révèle pas les détails du service
     return {"status": "ok"}
