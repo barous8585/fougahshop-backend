@@ -308,7 +308,7 @@ async def exec_calculer_prix(prix_euros: float, pays: str, qty: int = 1) -> str:
 
 
 # ─── Moteur Claude ────────────────────────────────────────────
-async def run_bot(messages: list) -> str:
+async def run_bot(messages: list, pays_client: str = "") -> str:
     if not ANTHROPIC_API_KEY:
         return "⚠️ Le bot n'est pas encore configuré."
 
@@ -316,11 +316,17 @@ async def run_bot(messages: list) -> str:
     if len(messages) > MAX_HISTORY_TURNS * 2 + 1:
         messages = messages[-(MAX_HISTORY_TURNS * 2):]
 
+    # ✅ Personnaliser le system prompt avec le pays du client
+    system = SYSTEM_PROMPT
+    if pays_client:
+        monnaie = "GNF" if "guin" in pays_client.lower() else "FCFA"
+        system += f"\n\n=== CONTEXTE CLIENT ===\nLe client est en {pays_client}. Affiche toujours les montants en {monnaie} en priorité sans lui redemander son pays sauf si nécessaire."
+
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     resp = client.messages.create(
         model="claude-haiku-4-5-20251001",
         max_tokens=1000,
-        system=SYSTEM_PROMPT,
+        system=system,
         tools=TOOLS,
         messages=messages
     )
@@ -349,7 +355,7 @@ async def run_bot(messages: list) -> str:
         resp = client.messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=1000,
-            system=SYSTEM_PROMPT,
+            system=system,
             tools=TOOLS,
             messages=messages
         )
@@ -385,6 +391,9 @@ async def chat(request: Request):
     if len(message) > MAX_MESSAGE_LENGTH:
         return JSONResponse({"error": "Message trop long."}, status_code=400, headers=headers)
 
+    # ✅ Récupérer le pays du client pour personnaliser les réponses
+    pays_client = (body.get("pays") or "").strip()
+
     # ✅ Nettoyer et limiter l'historique entrant
     raw_history = body.get("history") or []
     if len(raw_history) > MAX_HISTORY_TURNS * 2:
@@ -392,7 +401,7 @@ async def chat(request: Request):
     messages = list(raw_history) + [{"role": "user", "content": message}]
 
     try:
-        reply = await run_bot(messages)
+        reply = await run_bot(messages, pays_client=pays_client)
     except Exception:
         # ✅ Ne pas exposer les détails de l'erreur
         return JSONResponse(
