@@ -4,7 +4,7 @@ routes/bot.py — Router FastAPI pour le bot IA FougahShop (Fouga)
 
 from fastapi import APIRouter, Request, HTTPException
 from fastapi.responses import JSONResponse
-import anthropic, httpx, os
+import anthropic, httpx, os, json
 from typing import Optional
 
 router = APIRouter(prefix="/bot", tags=["bot"])
@@ -24,20 +24,6 @@ PALIERS = [
     {"max": 99999, "comm": 20000},
 ]
 
-MONNAIES = {
-    "Guinée":        {"symbole": "GNF",  "taux": 9500},
-    "Sénégal":       {"symbole": "FCFA", "taux": 660},
-    "Mali":          {"symbole": "FCFA", "taux": 660},
-    "Bénin":         {"symbole": "FCFA", "taux": 660},
-    "Côte d'Ivoire": {"symbole": "FCFA", "taux": 660},
-    "Burkina Faso":  {"symbole": "FCFA", "taux": 660},
-    "Togo":          {"symbole": "FCFA", "taux": 660},
-    "Niger":         {"symbole": "FCFA", "taux": 660},
-    "Congo":         {"symbole": "FCFA", "taux": 660},
-    "Gabon":         {"symbole": "FCFA", "taux": 660},
-    "Cameroun":      {"symbole": "FCFA", "taux": 660},
-}
-
 STATUTS_FR = {
     "en_attente_paiement": "⏳ En attente de paiement",
     "paye":      "💛 Paiement reçu — on passe commande",
@@ -49,70 +35,74 @@ STATUTS_FR = {
     "paiement_refuse": "🚫 Paiement refusé",
 }
 
-SYSTEM_PROMPT = """Tu es l'assistant IA de FougahShop, un service de proxy shopping qui permet aux clients en Afrique de commander sur les boutiques européennes, américaines et asiatiques et de payer en Mobile Money (Orange Money, Wave, etc.).
+SYSTEM_PROMPT = """Tu es l'assistant IA de FougahShop, un service de proxy shopping qui permet aux clients en Afrique de commander sur les boutiques européennes, américaines et asiatiques et de payer en Mobile Money.
 
 === QUI TU ES ===
 Tu t'appelles Fouga. Tu es amical, direct et efficace. Tu réponds en français (ou dans la langue du client).
-Tu dois répondre à N'IMPORTE QUELLE question sur FougahShop, quelle que soit la formulation.
 
 === COMMENT ÇA MARCHE ===
-1. Le client choisit un article sur un site comme Nike, Apple, Shein, Amazon, Zara, etc.
-2. Il nous envoie le lien ou une description de l'article
-3. Il remplit le formulaire sur fougahshop.com (onglet "Ajouter")
-4. Il paie en Mobile Money (Orange Money, Wave, MTN, etc.)
-5. On achète l'article pour lui en Europe avec notre carte bancaire
-6. L'article arrive en Afrique, le client récupère sa commande
+1. Le client choisit un article sur un site officiel (Nike, Apple, Zara, Amazon, Shein, etc.)
+2. Il remplit le formulaire sur fougahshop.com (onglet "Ajouter") — il peut mettre plusieurs articles dans son panier
+3. Il paie UNE SEULE FOIS en Mobile Money le montant total affiché (prix article + commission + frais de port)
+4. On achète l'article pour lui en Europe
+5. L'article arrive en Afrique, le client récupère sa commande
 
-=== PAYS DESSERVIS ===
-Guinée (GNF), Sénégal, Mali, Bénin, Burkina Faso, Togo, Niger, Congo, Gabon, Cameroun (FCFA = 656 XOF/EUR)
+=== PAIEMENT — IMPORTANT ===
+- On paie UNE SEULE FOIS au moment de la commande
+- Le montant total affiché inclut TOUT : prix article + commission FougahShop + frais de livraison
+- Pas de frais cachés, pas de paiement supplémentaire après
 
-=== TAUX DE CHANGE (approximatif) ===
-1€ ≈ 9 500 GNF (Guinée)
-1€ ≈ 660 FCFA (zone FCFA)
+=== COMMISSION FougahShop ===
+La commission dépend du montant total de la commande en euros :
+- Commande ≤ 50€   → commission en FCFA/GNF selon le pays
+- Commande ≤ 100€  → commission plus élevée
+- Commande ≤ 200€  → commission plus élevée
+- Commande ≤ 500€  → commission plus élevée
+- Commande > 500€  → commission maximale
+Pour le montant exact en temps réel, utilise l'outil calculer_prix.
 
-=== COMMISSION (frais de service) ===
-- Article ≤ 50€ : +3 500 FCFA (~54 000 GNF)
-- Article 51–100€ : +5 000 FCFA (~77 000 GNF)
-- Article 101–200€ : +7 000 FCFA (~108 000 GNF)
-- Article 201–500€ : +12 000 FCFA (~185 000 GNF)
-- Article > 500€ : +20 000 FCFA (~308 000 GNF)
-(+ frais de livraison locale selon le pays et le poids)
+=== FRAIS DE PORT ===
+Les frais de livraison au kilo sont configurés par l'admin et varient selon le pays et le poids du colis.
+Pour les frais exacts, utilise l'outil get_config qui récupère les tarifs en temps réel depuis l'admin.
 
 === BOUTIQUES DISPONIBLES ===
-Nike, Apple, Amazon, Adidas, Shein, Zara, H&M, ASOS, Zalando, Sephora, Decathlon, Fnac, La Redoute, Yves Rocher, PLT, Boohoo, AliExpress, Alibaba, Lululemon, New Balance, Foot Locker, JD Sports, IKEA, Mango, Ralph Lauren, Tommy Hilfiger, Lacoste, Calvin Klein, Puma, Supreme, Carhartt WIP, et bien d'autres (65+ boutiques).
-
-=== MODES DE PAIEMENT ===
-Orange Money, Wave, MTN Mobile Money, Moov Money, Free Money, et autres Mobile Money locaux.
-
-=== DÉLAIS ===
-- Après paiement : on achète l'article le jour même ou le lendemain
-- Livraison Europe → Afrique : 15 à 30 jours selon le pays
+Nike, Apple, Amazon, Adidas, Shein, Zara, H&M, ASOS, Zalando, Sephora, Decathlon, Fnac, La Redoute, Yves Rocher, PLT, Boohoo, AliExpress, Lululemon, New Balance, Foot Locker, JD Sports, IKEA, Mango, Ralph Lauren, Tommy Hilfiger, Lacoste, Calvin Klein, Puma, Supreme, Carhartt WIP, et bien d'autres (65+ boutiques).
 
 === SUIVI DE COMMANDE ===
-Le client peut suivre sa commande sur fougahshop.com (onglet Suivi) avec sa référence CMD-XXXX-XXXX et son numéro de téléphone. Il reçoit aussi des notifications WhatsApp à chaque étape.
+Référence CMD-XXXX-XXXX + numéro de téléphone sur fougahshop.com onglet Suivi.
+Notifications WhatsApp à chaque étape.
 
 === PARRAINAGE ===
-Chaque client qui a récupéré une commande obtient un code de parrainage FGxxxxxx. Quand quelqu'un l'utilise, le parrain reçoit une réduction.
+Code FGxxxxxx après première commande récupérée. Le parrain gagne une réduction sur sa prochaine commande.
 
 === GARANTIES ===
 - Articles 100% authentiques (achetés sur les vrais sites officiels)
 - Remboursement intégral si article en rupture de stock ou non livré
-- Suivi en temps réel
 
 === CE QUE TU PEUX FAIRE ===
 - Répondre à toutes les questions sur FougahShop
-- Calculer le prix total d'un article (utilise l'outil calculer_prix)
-- Vérifier le statut d'une commande (utilise l'outil suivi_commande)
-- Expliquer la procédure de commande étape par étape
+- Calculer le prix total d'un article → outil calculer_prix
+- Donner les frais de port / taux / config en temps réel → outil get_config
+- Vérifier le statut d'une commande → outil suivi_commande
+- Expliquer la procédure étape par étape
 
 === STYLE ===
-- Réponds de façon concise et claire
-- Utilise des emojis avec modération
-- Si le client parle en wolof, bambara ou autre langue locale, essaie de t'adapter
-- Termine toujours par proposer une aide supplémentaire si besoin
+- Concis et clair
+- Emojis avec modération
+- Adapte-toi si le client parle wolof, bambara ou autre langue locale
+- Propose toujours une aide supplémentaire en fin de réponse
 """
 
 TOOLS = [
+    {
+        "name": "get_config",
+        "description": "Récupère la configuration en temps réel depuis l'admin FougahShop : taux de change GNF, frais de port par pays, opérateurs de paiement, numéros de paiement, délais de livraison, etc. Utilise cet outil quand le client pose une question sur les tarifs, frais de port, délais, opérateurs ou numéros de paiement.",
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": []
+        }
+    },
     {
         "name": "suivi_commande",
         "description": "Récupère le statut en temps réel d'une commande FougahShop. Nécessite la référence (ex: CMD-2026-0048) ET le numéro de téléphone du client.",
@@ -127,7 +117,7 @@ TOOLS = [
     },
     {
         "name": "calculer_prix",
-        "description": "Calcule le prix total d'un article en monnaie locale incluant la commission FougahShop.",
+        "description": "Calcule le prix total d'un article en monnaie locale (GNF ou FCFA) incluant la commission FougahShop. Utilise les taux en temps réel.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -150,6 +140,67 @@ CORS_HEADERS = {
 
 
 # ─── Tools ───────────────────────────────────────────────────
+async def exec_get_config() -> str:
+    """Récupère la config publique depuis l'API FougahShop."""
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(f"{FOUGAHSHOP_API_URL}/api/config/public")
+        if resp.status_code != 200:
+            return "⚠️ Impossible de récupérer la configuration."
+
+        cfg = resp.json()
+        taux_gnf  = cfg.get("taux_gnf", 9500)
+        taux_fcfa = cfg.get("taux_change", 660)
+        port_kg   = cfg.get("port_kg", {})
+        operateurs = cfg.get("operateurs_pays", {})
+        numeros   = cfg.get("numeros_paiement", {})
+        livdom    = cfg.get("livraison_domicile", {})
+
+        result = f"📊 **Configuration FougahShop (en temps réel)**\n\n"
+        result += f"💱 **Taux de change**\n"
+        result += f"• 1€ = {taux_gnf:,.0f} GNF (Guinée)\n".replace(",", " ")
+        result += f"• 1€ = {taux_fcfa:,.0f} FCFA (zone FCFA)\n\n".replace(",", " ")
+
+        # Pays actifs
+        pays_actifs = {k: v for k, v in port_kg.items() if v.get("actif")}
+        pays_inactifs = {k: v for k, v in port_kg.items() if not v.get("actif")}
+
+        if pays_actifs:
+            result += f"🚚 **Frais de livraison (pays actifs)**\n"
+            for pays, info in pays_actifs.items():
+                result += f"• {pays} : {int(info['prix']):,} FCFA/kg — {info['delai']}\n".replace(",", " ")
+            result += "\n"
+
+        if pays_inactifs:
+            result += f"🔜 **Pays bientôt disponibles**\n"
+            result += ", ".join(pays_inactifs.keys()) + "\n\n"
+
+        if operateurs:
+            result += f"📱 **Opérateurs de paiement**\n"
+            for pays, ops in operateurs.items():
+                result += f"• {pays} : {', '.join(ops)}\n"
+            result += "\n"
+
+        if numeros:
+            result += f"📞 **Numéros de paiement**\n"
+            for op, num in numeros.items():
+                result += f"• {op} : {num}\n"
+            result += "\n"
+
+        if livdom and livdom.get("retrait"):
+            result += f"🏠 **Livraison à domicile**\n"
+            result += f"• Zone : {livdom.get('zones', 'N/A')}\n"
+            result += f"• Prix : {int(livdom.get('prix', 0)):,} GNF\n".replace(",", " ")
+            result += f"• Délai : {livdom.get('delai', 'N/A')}\n"
+            if livdom.get("adresse"):
+                result += f"• Adresse : {livdom.get('adresse')}\n"
+
+        return result
+
+    except Exception as e:
+        return f"⚠️ Erreur récupération config : {str(e)}"
+
+
 async def exec_suivi_commande(ref: str, tel: str) -> str:
     try:
         async with httpx.AsyncClient(timeout=10) as client:
@@ -179,26 +230,45 @@ async def exec_suivi_commande(ref: str, tel: str) -> str:
         return f"⚠️ Erreur : {str(e)}"
 
 
-def exec_calculer_prix(prix_euros: float, pays: str, qty: int = 1) -> str:
-    m = MONNAIES.get(pays)
-    if not m:
-        for k in MONNAIES:
-            if k.lower() in pays.lower() or pays.lower() in k.lower():
-                m = MONNAIES[k]; pays = k; break
-    if not m:
-        return f"Pays non reconnu. Disponibles : {', '.join(MONNAIES.keys())}."
+async def exec_calculer_prix(prix_euros: float, pays: str, qty: int = 1) -> str:
+    """Calcule le prix avec les taux en temps réel depuis l'API."""
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(f"{FOUGAHSHOP_API_URL}/api/config/public")
+        cfg = resp.json() if resp.status_code == 200 else {}
+    except Exception:
+        cfg = {}
+
+    taux_gnf  = cfg.get("taux_gnf", 9500)
+    taux_fcfa = cfg.get("taux_change", 660)
+
+    # Trouver le pays
+    pays_lower = pays.lower().strip()
+    monnaie = "FCFA"
+    taux    = taux_fcfa
+
+    if "guin" in pays_lower:
+        monnaie = "GNF"
+        taux    = taux_gnf
+        pays    = "Guinée"
+    elif "s" in pays_lower and "n" in pays_lower and "gal" in pays_lower:
+        pays = "Sénégal"
+    elif "cote" in pays_lower or "ivoire" in pays_lower:
+        pays = "Côte d'Ivoire"
+    elif "burkina" in pays_lower:
+        pays = "Burkina Faso"
+
     total_eu  = prix_euros * qty
     comm_fcfa = next((p["comm"] for p in PALIERS if total_eu <= p["max"]), 20000)
-    symbole   = m["symbole"]
-    taux      = m["taux"]
+    comm_local = round(comm_fcfa * (taux / 656)) if monnaie == "GNF" else comm_fcfa
     article_local = round(total_eu * taux)
-    comm_local    = round(comm_fcfa * (taux / 656)) if symbole == "GNF" else comm_fcfa
     total_local   = article_local + comm_local
+
     r  = f"💰 **Calcul pour {qty}× article à {prix_euros}€** ({pays})\n\n"
-    r += f"• Prix article(s) : {article_local:,} {symbole}\n".replace(",", " ")
-    r += f"• Commission FougahShop : {comm_local:,} {symbole}\n".replace(",", " ")
-    r += f"• **Total à payer : {total_local:,} {symbole}**\n".replace(",", " ")
-    r += "\n_(+ frais de livraison locale selon ton adresse)_"
+    r += f"• Prix article(s) : {article_local:,} {monnaie}\n".replace(",", " ")
+    r += f"• Commission FougahShop : {comm_local:,} {monnaie}\n".replace(",", " ")
+    r += f"• **Total article + commission : {total_local:,} {monnaie}**\n\n".replace(",", " ")
+    r += f"_(+ frais de livraison selon le poids du colis — visible à la commande)_"
     return r
 
 
@@ -208,7 +278,7 @@ async def run_bot(messages: list) -> str:
         return "⚠️ Le bot n'est pas encore configuré (ANTHROPIC_API_KEY manquante)."
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     resp = client.messages.create(
-        model="claude-haiku-4-5-20251001",   # ✅ modèle compatible platform.claude.com
+        model="claude-haiku-4-5-20251001",
         max_tokens=1000,
         system=SYSTEM_PROMPT,
         tools=TOOLS,
@@ -219,10 +289,14 @@ async def run_bot(messages: list) -> str:
         for block in resp.content:
             if block.type == "tool_use":
                 inp = block.input
-                if block.name == "suivi_commande":
+                if block.name == "get_config":
+                    res = await exec_get_config()
+                elif block.name == "suivi_commande":
                     res = await exec_suivi_commande(inp["ref"], inp["tel"])
                 elif block.name == "calculer_prix":
-                    res = exec_calculer_prix(inp["prix_euros"], inp["pays"], inp.get("qty", 1))
+                    res = await exec_calculer_prix(
+                        inp["prix_euros"], inp["pays"], inp.get("qty", 1)
+                    )
                 else:
                     res = "Outil inconnu."
                 results.append({"type": "tool_result", "tool_use_id": block.id, "content": res})
@@ -231,7 +305,7 @@ async def run_bot(messages: list) -> str:
             {"role": "user",      "content": results}
         ]
         resp = client.messages.create(
-            model="claude-haiku-4-5-20251001",   # ✅ modèle compatible platform.claude.com
+            model="claude-haiku-4-5-20251001",
             max_tokens=1000,
             system=SYSTEM_PROMPT,
             tools=TOOLS,
