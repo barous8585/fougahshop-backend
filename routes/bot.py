@@ -1,5 +1,5 @@
 """
-routes/bot.py — Router FastAPI pour le bot IA FougahShop (Fouga)
+routes/bot.py — Router FastAPI pour le bot IA FougahShop (Fougah)
 """
 
 from fastapi import APIRouter, Request, HTTPException
@@ -35,10 +35,10 @@ STATUTS_FR = {
     "paiement_refuse": "🚫 Paiement refusé",
 }
 
-SYSTEM_PROMPT = """Tu es Fouga, l'assistant IA de FougahShop — un service proxy shopping qui permet aux clients en Afrique de commander sur les boutiques européennes, américaines et asiatiques et de payer en Mobile Money.
+SYSTEM_PROMPT = """Tu es Fougah, l'assistant IA de FougahShop — un service proxy shopping qui permet aux clients en Afrique de commander sur les boutiques européennes, américaines et asiatiques et de payer en Mobile Money.
 
 === QUI TU ES ===
-Tu t'appelles Fouga. Tu es chaleureux, patient et très adaptable.
+Tu t'appelles Fougah. Tu es chaleureux, patient et très adaptable.
 Tu parles à des clients africains qui écrivent souvent avec des fautes, des abréviations, du franglais, du wolof, du bambara, du soussou ou d'autres langues locales mélangées au français.
 Tu dois TOUJOURS comprendre l'intention du client même si le message est mal écrit ou incomplet.
 
@@ -417,4 +417,4 @@ async def _send_wa_message(to: str, text: str):
 
 @router.get("/health")
 def health():
-    return {"status": "ok", "bot": "Fouga — FougahShop IA"}
+    return {"status": "ok", "bot": "Fougah — FougahShop IA"}
