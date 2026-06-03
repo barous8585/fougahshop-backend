@@ -168,6 +168,7 @@ _is_prod = os.environ.get("RENDER", "") == "true"
 ALLOWED_ORIGINS = [
     "https://fougahshop.com",
     "https://www.fougahshop.com",
+    "https://mellow-cuchufli-798394.netlify.app",
 ] + ([] if _is_prod else [
     "http://localhost:3000",
     "http://localhost:5500",
