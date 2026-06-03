@@ -71,7 +71,6 @@ def get_port(db, pays):
 def generate_ref(db) -> str:
     year   = datetime.now().year
     prefix = f"CMD-{year}-"
-    # FIX: Supprimé FOR UPDATE (peut planter sur table vide ou PostgreSQL strict)
     try:
         result = db.execute(
             text("""
@@ -113,7 +112,6 @@ def appliquer_promo(db, promo_code: str, total_local: float, taux_conv: float) -
     if not promo_code:
         return total_local
     try:
-        # FIX: Supprimé FOR UPDATE sur SELECT (inutile, peut deadlock)
         promo = db.execute(
             text("SELECT * FROM promo_codes WHERE code=:code AND actif=TRUE LIMIT 1"),
             {"code": promo_code.strip().upper()}
@@ -480,7 +478,6 @@ def creer_commande(body: CommandeCreate, background_tasks: BackgroundTasks, db: 
             promo_code          = body.promo_code,
         )
 
-        # FIX: colonnes optionnelles via setattr — résistant aux migrations partielles
         for col, val in [
             ("is_cadeau",  body.is_cadeau or False),
             ("dest_nom",   body.dest_nom),
@@ -503,7 +500,6 @@ def creer_commande(body: CommandeCreate, background_tasks: BackgroundTasks, db: 
         db.rollback()
         raise HTTPException(500, f"Erreur lors de la création de la commande : {str(e)}")
 
-    # Parrainage — hors bloc critique
     if body.code_parrainage and body.code_parrainage.strip():
         try:
             _enregistrer_parrainage(
@@ -610,19 +606,25 @@ def suivi(ref: str, tel: str = Query(...), db: Session = Depends(get_db)):
     if not match:
         raise HTTPException(403, "Numéro de téléphone incorrect")
 
+    # FIX 3 : total_local=0 affiché comme "Prix à confirmer" côté API aussi
+    total_display = cmd.total_local
+    note_display  = cmd.note_admin
+    if not total_display or total_display == 0:
+        total_display = None  # Le frontend affichera "Prix à confirmer"
+
     return {
         "ref":             cmd.ref,
         "statut":          cmd.statut,
         "client_nom":      cmd.client_nom,
         "client_tel":      cmd.client_tel,
         "nb_articles":     cmd.nb_articles,
-        "total_local":     cmd.total_local,
+        "total_local":     total_display,
         "monnaie":         cmd.monnaie,
         "poids_estime":    cmd.poids_estime,
         "poids_reel":      cmd.poids_reel,
         "delai_livraison": cmd.delai_livraison,
         "articles":        json.loads(cmd.articles) if cmd.articles else [],
-        "note_admin":      cmd.note_admin,
+        "note_admin":      note_display,
         "suivi_num":       getattr(cmd, "suivi_num", None),
         "motif_refus":     getattr(cmd, "motif_refus", None),
         "promo_code":      getattr(cmd, "promo_code", None),
@@ -682,11 +684,12 @@ def historique(tel: str, db: Session = Depends(get_db)):
             return getattr(c, key, None)
         created = g("created_at")
         delai   = g("delai_livraison") or ""
+        total   = g("total_local")
         result.append({
             "ref":             g("ref"),
             "statut":          g("statut"),
             "nb_articles":     g("nb_articles"),
-            "total_local":     g("total_local"),
+            "total_local":     total if total else None,  # FIX 3 : None si panier-lien
             "monnaie":         g("monnaie"),
             "delai_livraison": delai,
             "note_admin":      g("note_admin"),
@@ -748,25 +751,28 @@ def creer_commande_whatsapp(body: CommandeWACreate, background_tasks: Background
         total_eur  = sum(p.prix + (p.livraison or 0) for p in body.paniers)
         taux_conv  = taux / 656 if is_gnf else 1.0
 
-        # FIX: Si total_eur == 0 (commande panier-lien sans prix), pas de commission
-        # et total_local = 0 pour signaler "prix à confirmer"
         is_panier_lien = (total_eur == 0)
 
+        # FIX 1 : Initialisation des variables avant les blocs conditionnels
+        promo_code_valide      = None
+        parrain_code_valide    = None
+        reduction_serveur      = 0
+        # FIX 2 : Initialisation de reduction_parrain_fcfa par défaut
+        reduction_parrain_fcfa = 1000.0
+
         if is_panier_lien:
-            total_local         = 0
-            total_brut_serveur  = 0
-            commission_locale   = 0
+            total_local        = 0
+            total_brut_serveur = 0
+            commission_locale  = 0
         else:
             total_converti = sum(
                 round(p.prix * taux) + round((p.livraison or 0) * taux)
                 for p in body.paniers
             )
-            commission_fcfa   = get_commission(total_eur)
-            commission_locale = round(commission_fcfa * taux_conv)
+            commission_fcfa    = get_commission(total_eur)
+            commission_locale  = round(commission_fcfa * taux_conv)
             total_brut_serveur = total_converti + commission_locale
 
-            reduction_serveur = 0
-            promo_code_valide = None
             if body.promo_code:
                 try:
                     code_upper        = body.promo_code.strip().upper()
@@ -777,8 +783,6 @@ def creer_commande_whatsapp(body: CommandeWACreate, background_tasks: Background
                 except Exception as e:
                     print(f"[WA] Erreur application promo: {e}")
 
-            parrain_code_valide    = None
-            reduction_parrain_fcfa = 1000.0
             if body.code_parrainage and not promo_code_valide:
                 try:
                     parrain_row = db.execute(
@@ -817,7 +821,6 @@ def creer_commande_whatsapp(body: CommandeWACreate, background_tasks: Background
 
         port_info = db.query(PortKg).filter(PortKg.pays == body.client_pays).first()
 
-        # FIX: note_admin différenciée selon type de commande WA
         if is_panier_lien:
             note = "[WhatsApp] 📎 Panier lien — PRIX À CONFIRMER"
         else:
@@ -853,7 +856,6 @@ def creer_commande_whatsapp(body: CommandeWACreate, background_tasks: Background
         db.rollback()
         raise HTTPException(500, f"Erreur lors de la création de la commande WhatsApp : {str(e)}")
 
-    # Parrainage — hors bloc critique
     if not is_panier_lien and parrain_code_valide:
         try:
             _enregistrer_parrainage(
