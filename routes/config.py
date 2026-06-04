@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import JSONResponse          # ✅ ajout
+from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 from typing import Dict, Any
@@ -240,13 +240,65 @@ def config_public(db: Session = Depends(get_db)):
         "livraison_domicile":   parse_json(row.get("livraison_domicile")) or {},
     }
 
-    # ✅ JSONResponse avec ensure_ascii=False pour corriger l'encodage UTF-8
-    # (évite SÃ©nÃ©gal au lieu de Sénégal, etc.)
     return JSONResponse(
         content=data,
         media_type="application/json; charset=utf-8"
     )
 
+
+# ══════════════════════════════════════════════════════════════
+# CONFIG ADMIN (GET)
+# ══════════════════════════════════════════════════════════════
+
+@router.get("/")
+def get_config_admin(
+    request: Request,
+    db: Session = Depends(get_db),
+    role: str = Depends(require_patron)
+):
+    cfg = get_config(db)
+    try:
+        row = db.execute(text(
+            "SELECT tarifs_unite, tarif_poids_kg, operateurs_pays, numeros_paiement,"
+            " stat_delai, stat_badge1, stat_badge2, stat_label1, stat_label2, stat_label3,"
+            " reduction_parrainage, gain_parrain, livraison_domicile"
+            " FROM configs WHERE id = :id"
+        ), {"id": cfg.id}).mappings().first() or {}
+    except Exception:
+        row = {}
+
+    def parse_json(val):
+        if val:
+            try:
+                return json.loads(val)
+            except Exception:
+                pass
+        return None
+
+    return {
+        "taux_change":          cfg.taux_change,
+        "commission":           cfg.commission,
+        "taux_gnf":             cfg.taux_gnf,
+        "wa_number":            cfg.wa_number,
+        "tarifs_unite":         parse_json(row.get("tarifs_unite")),
+        "tarif_poids_kg":       row.get("tarif_poids_kg") or 12.0,
+        "operateurs_pays":      parse_json(row.get("operateurs_pays")) or {},
+        "numeros_paiement":     parse_json(row.get("numeros_paiement")) or {},
+        "stat_delai":           row.get("stat_delai") or "15-25j",
+        "stat_badge1":          row.get("stat_badge1") or "100%",
+        "stat_badge2":          row.get("stat_badge2") or "0€",
+        "stat_label1":          row.get("stat_label1") or "Authentique",
+        "stat_label2":          row.get("stat_label2") or "Livraison",
+        "stat_label3":          row.get("stat_label3") or "Frais cachés",
+        "reduction_parrainage": float(row.get("reduction_parrainage") or 1000),
+        "gain_parrain":         float(row.get("gain_parrain") or 500),
+        "livraison_domicile":   parse_json(row.get("livraison_domicile")) or {},
+    }
+
+
+# ══════════════════════════════════════════════════════════════
+# ROUTES POST/PUT
+# ══════════════════════════════════════════════════════════════
 
 @router.post("/livraison-domicile")
 def save_livraison_domicile(
