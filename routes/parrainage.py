@@ -53,15 +53,67 @@ def ensure_parrainage_tables(db: Session):
         except Exception:
             db.rollback()
 
+    # Resync nb_filleuls et credit_total depuis les vraies utilisations
+    _resync_parrainage(db)
+
 
 def _normaliser_tel(tel: str) -> str:
-    return tel.replace(" ", "").replace("-", "").replace("+", "").strip()
+    """Normalise un numéro de téléphone — garde uniquement les chiffres."""
+    return ''.join(filter(str.isdigit, tel or ""))
+
+
+def _suffix(tel: str, n: int = 8) -> str:
+    """Retourne les n derniers chiffres du téléphone."""
+    digits = _normaliser_tel(tel)
+    return digits[-n:] if len(digits) >= n else digits
+
+
+def _resync_parrainage(db: Session):
+    """
+    Resync nb_filleuls et credit_total depuis les vraies données.
+    Corrige les compteurs à 0 causés par des bugs de normalisation passés.
+    """
+    try:
+        cfg_row = db.execute(text(
+            "SELECT gain_parrain FROM configs WHERE id=1 LIMIT 1"
+        )).fetchone()
+        gain_par_filleul = float(cfg_row[0]) if cfg_row and cfg_row[0] else 500.0
+    except Exception:
+        gain_par_filleul = 500.0
+
+    try:
+        # Recalculer nb_filleuls depuis parrainage_utilisations
+        db.execute(text("""
+            UPDATE parrainage_codes p
+            SET nb_filleuls = (
+                SELECT COUNT(DISTINCT u.filleul_tel)
+                FROM parrainage_utilisations u
+                WHERE u.code = p.code
+            )
+        """))
+        # Recalculer credit_total = nb_filleuls_actifs * gain_par_filleul
+        db.execute(text("""
+            UPDATE parrainage_codes p
+            SET credit_total = (
+                SELECT COUNT(*) * :gain
+                FROM parrainage_utilisations u
+                LEFT JOIN commandes c ON c.ref = u.commande_ref
+                WHERE u.code = p.code
+                  AND (c.statut IS NULL OR c.statut NOT IN ('annulee', 'paiement_refuse'))
+            )
+        """), {"gain": gain_par_filleul})
+        db.commit()
+        print("[parrainage] ✅ Resync nb_filleuls + credit_total effectué")
+    except Exception as e:
+        db.rollback()
+        print(f"[parrainage] Erreur resync: {e}")
 
 
 def gen_code_parrainage(tel: str) -> str:
     chars  = string.ascii_uppercase + string.digits
     suffix = ''.join(secrets.choice(chars) for _ in range(6))
-    prefix = _normaliser_tel(tel)[-4:] if len(_normaliser_tel(tel)) >= 4 else _normaliser_tel(tel)
+    digits = _normaliser_tel(tel)
+    prefix = digits[-4:] if len(digits) >= 4 else digits
     return f"FG{prefix}{suffix}"
 
 
@@ -72,25 +124,57 @@ def gen_code_parrainage(tel: str) -> str:
 @router.get("/parrainage/code/{tel}")
 def get_mon_code(tel: str, db: Session = Depends(get_db)):
     tel_norm = _normaliser_tel(tel)
+    tel_suffix = tel_norm[-9:] if len(tel_norm) >= 9 else tel_norm
 
+    # Chercher une commande récupérée avec ce numéro (suffixe)
     cmd = db.execute(text("""
         SELECT client_nom, client_tel FROM commandes
-        WHERE REPLACE(REPLACE(REPLACE(client_tel, ' ', ''), '-', ''), '+', '') = :t
+        WHERE REGEXP_REPLACE(client_tel, '[^0-9]', '', 'g') LIKE :pattern
         AND statut = 'recupere'
+        ORDER BY created_at DESC
         LIMIT 1
-    """), {"t": tel_norm}).mappings().first()
+    """), {"pattern": f"%{tel_suffix}%"}).mappings().first()
+
+    if not cmd:
+        # Fallback sans REGEXP_REPLACE
+        try:
+            cmd = db.execute(text("""
+                SELECT client_nom, client_tel FROM commandes
+                WHERE REPLACE(REPLACE(REPLACE(client_tel,' ',''),'-',''),'+','') LIKE :pattern
+                AND statut = 'recupere'
+                ORDER BY created_at DESC
+                LIMIT 1
+            """), {"pattern": f"%{tel_suffix}%"}).mappings().first()
+        except Exception:
+            pass
 
     if not cmd:
         raise HTTPException(403, "Vous devez avoir au moins une commande récupérée.")
 
+    # Chercher un code existant pour ce numéro (suffixe robuste)
     row = db.execute(text("""
         SELECT code, nb_filleuls, credit_total FROM parrainage_codes
-        WHERE REPLACE(REPLACE(REPLACE(parrain_tel, ' ', ''), '-', ''), '+', '') = :t
+        WHERE REGEXP_REPLACE(parrain_tel, '[^0-9]', '', 'g') LIKE :pattern
         AND actif = TRUE
+        ORDER BY created_at ASC
         LIMIT 1
-    """), {"t": tel_norm}).mappings().first()
+    """), {"pattern": f"%{tel_suffix}%"}).mappings().first()
 
     if not row:
+        # Fallback
+        try:
+            row = db.execute(text("""
+                SELECT code, nb_filleuls, credit_total FROM parrainage_codes
+                WHERE REPLACE(REPLACE(REPLACE(parrain_tel,' ',''),'-',''),'+','') LIKE :pattern
+                AND actif = TRUE
+                ORDER BY created_at ASC
+                LIMIT 1
+            """), {"pattern": f"%{tel_suffix}%"}).mappings().first()
+        except Exception:
+            pass
+
+    if not row:
+        # Créer un nouveau code
         code = gen_code_parrainage(tel)
         for _ in range(10):
             exists = db.execute(
@@ -111,9 +195,10 @@ def get_mon_code(tel: str, db: Session = Depends(get_db)):
         credit_total = 0.0
     else:
         code         = row["code"]
-        nb_filleuls  = row["nb_filleuls"]
-        credit_total = row["credit_total"]
+        nb_filleuls  = row["nb_filleuls"] or 0
+        credit_total = row["credit_total"] or 0.0
 
+    # Charger les filleuls avec statut commande
     filleuls_rows = db.execute(text("""
         SELECT u.filleul_nom, u.filleul_tel, u.reduction_appliquee,
                u.commande_ref, u.created_at, c.statut
@@ -136,25 +221,19 @@ def get_mon_code(tel: str, db: Session = Depends(get_db)):
     ]
 
     STATUTS_ACTIFS = {"paye", "achete", "expedie", "arrive", "recupere"}
-    nb_commandes   = sum(1 for f in filleuls if f["statut"] in STATUTS_ACTIFS)
+    nb_commandes = sum(1 for f in filleuls if f["statut"] in STATUTS_ACTIFS)
 
-    # FIX: Utiliser credit_total en base comme source fiable
-    # Recalculer uniquement si incohérence détectée
+    # Gain parrain depuis config
     try:
         cfg_row = db.execute(text(
             "SELECT gain_parrain FROM configs WHERE id=1 LIMIT 1"
         )).fetchone()
-        gain_par_filleul = float(cfg_row[0]) if cfg_row and cfg_row[0] else 0
+        gain_par_filleul = float(cfg_row[0]) if cfg_row and cfg_row[0] else 500.0
     except Exception:
-        gain_par_filleul = 0
+        gain_par_filleul = 500.0
 
-    # Recalculer le crédit réel depuis les utilisations actives
-    credit_reel = round(
-        sum(f["reduction_fcfa"] * 0.5 for f in filleuls if f["statut"] in STATUTS_ACTIFS)
-        if not gain_par_filleul
-        else gain_par_filleul * nb_commandes
-    )
-    # Toujours afficher au moins le credit_total enregistré en base
+    # Recalcul crédit réel depuis filleuls actifs
+    credit_reel    = round(gain_par_filleul * nb_commandes)
     credit_affiche = max(credit_reel, round(credit_total))
 
     return {
@@ -223,17 +302,16 @@ def utiliser_code(
     if not parrain:
         raise HTTPException(404, "Code invalide.")
 
-    tel_norm_filleul = _normaliser_tel(filleul_tel)
-    tel_norm_parrain = _normaliser_tel(parrain["parrain_tel"])
-    if tel_norm_filleul == tel_norm_parrain:
+    if _suffix(filleul_tel) == _suffix(parrain["parrain_tel"]):
         raise HTTPException(400, "Vous ne pouvez pas utiliser votre propre code.")
 
+    filleul_suffix = _suffix(filleul_tel)
     deja = db.execute(text("""
         SELECT 1 FROM parrainage_utilisations u
-        JOIN parrainage_codes p ON p.code = u.code
-        WHERE p.code = :c
-        AND REPLACE(REPLACE(REPLACE(u.filleul_tel, ' ', ''), '-', ''), '+', '') = :t
-    """), {"c": code, "t": tel_norm_filleul}).fetchone()
+        WHERE u.code = :c
+        AND REGEXP_REPLACE(u.filleul_tel, '[^0-9]', '', 'g') LIKE :pattern
+    """), {"c": code, "pattern": f"%{filleul_suffix}%"}).fetchone()
+
     if deja:
         raise HTTPException(409, "Ce code a déjà été utilisé par ce numéro.")
 
@@ -261,6 +339,9 @@ def utiliser_code(
 @router.get("/admin/parrainage")
 def liste_parrainages(request: Request, db: Session = Depends(get_db),
                       role: str = Depends(require_patron)):
+    # Resync avant affichage pour avoir les données fraîches
+    _resync_parrainage(db)
+
     rows = db.execute(text("""
         SELECT p.code, p.parrain_nom, p.parrain_tel,
                p.nb_filleuls, p.credit_total, p.created_at
@@ -269,7 +350,6 @@ def liste_parrainages(request: Request, db: Session = Depends(get_db),
         LIMIT 200
     """)).mappings().all()
 
-    # FIX: Charger tous les filleuls en une seule query (évite N+1)
     codes = [r["code"] for r in rows]
     filleuls_map: Dict[str, list] = {c: [] for c in codes}
 
@@ -305,14 +385,21 @@ def liste_parrainages(request: Request, db: Session = Depends(get_db),
     result = []
     for r in rows:
         d = dict(r)
-        filleuls = filleuls_map.get(d["code"], [])
+        filleuls  = filleuls_map.get(d["code"], [])
         nb_actifs = sum(1 for f in filleuls if f["statut"] in STATUTS_ACTIFS)
-        d["filleuls"]              = filleuls
-        d["nb_commandes_actives"]  = nb_actifs
-        d["created_at"]            = str(d.get("created_at", ""))
+        d["filleuls"]             = filleuls
+        d["nb_commandes_actives"] = nb_actifs
+        d["created_at"]           = str(d.get("created_at", ""))
         result.append(d)
 
     return result
+
+
+@router.post("/admin/parrainage/resync")
+def resync_admin(request: Request, db: Session = Depends(get_db),
+                 role: str = Depends(require_patron)):
+    _resync_parrainage(db)
+    return {"ok": True, "message": "Parrainage resynchronisé depuis les données réelles"}
 
 
 # ══════════════════════════════════════════════════════════════
