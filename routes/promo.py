@@ -17,21 +17,21 @@ def ensure_tables(db: Session):
     try:
         db.execute(text("""
             CREATE TABLE IF NOT EXISTS promo_codes (
-                id             SERIAL PRIMARY KEY,
-                code           VARCHAR UNIQUE NOT NULL,
-                influenceur    VARCHAR,
+                id               SERIAL PRIMARY KEY,
+                code             VARCHAR UNIQUE NOT NULL,
+                influenceur      VARCHAR,
                 gain_influenceur FLOAT DEFAULT 0,
-                type           VARCHAR DEFAULT 'fixe',
-                valeur         FLOAT NOT NULL DEFAULT 0,
-                reduction_fcfa FLOAT DEFAULT 0,
-                client_tel     VARCHAR,
-                max_uses       INTEGER DEFAULT 0,
-                uses_count     INTEGER DEFAULT 0,
-                quota          INTEGER DEFAULT 0,
-                note           VARCHAR,
-                expiry         DATE,
-                actif          BOOLEAN DEFAULT TRUE,
-                created_at     TIMESTAMP DEFAULT NOW()
+                type             VARCHAR DEFAULT 'fixe',
+                valeur           FLOAT NOT NULL DEFAULT 0,
+                reduction_fcfa   FLOAT DEFAULT 0,
+                client_tel       VARCHAR,
+                max_uses         INTEGER DEFAULT 0,
+                uses_count       INTEGER DEFAULT 0,
+                quota            INTEGER DEFAULT 0,
+                note             VARCHAR,
+                expiry           DATE,
+                actif            BOOLEAN DEFAULT TRUE,
+                created_at       TIMESTAMP DEFAULT NOW()
             )
         """))
         migrations = [
@@ -45,6 +45,7 @@ def ensure_tables(db: Session):
             "ALTER TABLE promo_codes ADD COLUMN IF NOT EXISTS gain_influenceur FLOAT DEFAULT 0",
             "ALTER TABLE promo_codes ADD COLUMN IF NOT EXISTS pays VARCHAR DEFAULT NULL",
             "ALTER TABLE promo_codes ADD COLUMN IF NOT EXISTS quota INTEGER DEFAULT 0",
+            # ✅ FIX CRITIQUE : corriger valeur=0 pour les anciens codes
             "UPDATE promo_codes SET valeur = reduction_fcfa WHERE valeur = 0 AND reduction_fcfa > 0",
             "ALTER TABLE commandes ADD COLUMN IF NOT EXISTS promo_code VARCHAR",
         ]
@@ -53,6 +54,7 @@ def ensure_tables(db: Session):
                 db.execute(text(sql))
             except Exception:
                 db.rollback()
+        # Sync uses_count/max_uses/quota
         try:
             db.execute(text(
                 "UPDATE promo_codes SET uses_count = utilisations "
@@ -76,6 +78,7 @@ def ensure_tables(db: Session):
 
 
 def _resync_uses_count(db: Session):
+    """Resync uses_count depuis les vraies commandes."""
     try:
         db.execute(text("""
             UPDATE promo_codes p
@@ -130,12 +133,16 @@ def verifier_code_get(code: str, db: Session = Depends(get_db)):
     if not check_quota(row):
         return {"valide": False, "message": "Ce code a atteint son quota d'utilisations."}
 
+    # ✅ FIX : utiliser valeur en priorité, fallback reduction_fcfa
     valeur = row.valeur or row.reduction_fcfa or 0
     type_  = row.type or "fixe"
+
     if type_ == "livraison":
         msg = "Code valide — livraison locale gratuite"
+    elif type_ == "pct":
+        msg = f"Code valide — réduction de {int(valeur)}%"
     else:
-        msg = f"Code valide — réduction de {int(valeur)}{'%' if type_ == 'pct' else ' FCFA'}"
+        msg = f"Code valide — réduction de {int(valeur)} FCFA"
 
     return {
         "valide":         True,
@@ -161,10 +168,9 @@ def verifier_code_post(body: Dict[str, Any], db: Session = Depends(get_db)):
 def get_stats_influenceur(code: str, db: Session = Depends(get_db)):
     """
     Stats temps réel pour un influenceur.
-    ✅ uses_count calculé depuis les vraies commandes (sans LIMIT)
+    ✅ Données calculées depuis les vraies commandes
     ✅ gain_total basé sur commandes confirmées uniquement
-    ✅ nb_en_attente et nb_annulees retournés pour affichage frontend
-    ✅ Resync automatique si écart détecté
+    ✅ valeur correctement lue (fix -0 FCFA)
     """
     code = code.strip().upper()
     row = db.execute(
@@ -181,6 +187,9 @@ def get_stats_influenceur(code: str, db: Session = Depends(get_db)):
         raise HTTPException(404, "Ce code n'est pas un code influenceur.")
 
     gain_par_cmd = float(promo.get("gain_influenceur") or 0)
+
+    # ✅ FIX : valeur correcte (fix -0 FCFA)
+    valeur = float(promo.get("valeur") or promo.get("reduction_fcfa") or 0)
 
     try:
         cmds_rows = db.execute(text("""
@@ -222,7 +231,7 @@ def get_stats_influenceur(code: str, db: Session = Depends(get_db)):
         "pays":             promo.get("pays") or "",
         "actif":            True,
         "type":             promo.get("type", "fixe"),
-        "valeur":           float(promo.get("valeur") or 0),
+        "valeur":           valeur,         # ✅ FIX valeur correcte
         "expiry":           str(promo.get("expiry") or ""),
         "uses_count":       uses_count_reel,
         "nb_commandes":     len(commandes_confirmees),
@@ -246,10 +255,6 @@ def list_promos(
     db: Session = Depends(get_db),
     role: str = Depends(require_patron)
 ):
-    """
-    FIX: Remplace la boucle N+1 par une seule query agrégée.
-    Beaucoup plus rapide avec de nombreux codes.
-    """
     rows = db.execute(
         text("SELECT * FROM promo_codes ORDER BY created_at DESC")
     ).fetchall()
@@ -257,7 +262,6 @@ def list_promos(
     if not rows:
         return []
 
-    # FIX: Une seule query pour toutes les stats commandes — plus de N+1
     codes = [p.code for p in rows]
     placeholders = ', '.join(f':c{i}' for i in range(len(codes)))
     params = {f'c{i}': c for i, c in enumerate(codes)}
@@ -279,7 +283,6 @@ def list_promos(
         print(f"[promo] list_promos stats error: {e}")
         stats_map = {}
 
-    # FIX: Charger toutes les commandes en une seule query pour le détail
     try:
         cmds_rows = db.execute(text(f"""
             SELECT promo_code, ref, statut
@@ -298,8 +301,9 @@ def list_promos(
 
     result = []
     for p in rows:
-        s = stats_map.get(p.code, {})
+        s            = stats_map.get(p.code, {})
         max_u        = p.max_uses or p.quota or 0
+        # ✅ FIX : valeur correcte — priorité à valeur, fallback reduction_fcfa
         valeur       = p.valeur or p.reduction_fcfa or 0
         type_        = p.type or "fixe"
         gain_par_cmd = getattr(p, "gain_influenceur", 0) or 0
@@ -357,16 +361,23 @@ def resync_uses_count(
             )
             WHERE p.code IS NOT NULL
         """))
+        # ✅ FIX : corriger aussi valeur=0 pour les anciens codes
+        db.execute(text("""
+            UPDATE promo_codes
+            SET valeur = reduction_fcfa
+            WHERE valeur = 0 AND reduction_fcfa > 0
+        """))
         db.commit()
         rows = db.execute(text(
-            "SELECT code, influenceur, uses_count FROM promo_codes "
+            "SELECT code, influenceur, uses_count, valeur FROM promo_codes "
             "WHERE influenceur IS NOT NULL ORDER BY uses_count DESC"
         )).fetchall()
         return {
             "ok": True,
-            "message": "uses_count resynchronisé depuis les commandes réelles",
+            "message": "uses_count et valeurs resynchronisés depuis les commandes réelles",
             "influenceurs": [
-                {"code": r.code, "influenceur": r.influenceur, "uses_count": r.uses_count}
+                {"code": r.code, "influenceur": r.influenceur,
+                 "uses_count": r.uses_count, "valeur": r.valeur}
                 for r in rows
             ]
         }
@@ -399,8 +410,11 @@ def create_promo(
     if type_ not in ("fixe", "pct", "livraison"):
         raise HTTPException(400, "Type invalide (fixe, pct ou livraison)")
 
+    # ✅ FIX : accepter valeur OU reduction_fcfa
     valeur = float(body.get("valeur", body.get("reduction_fcfa", 0)))
-    if type_ != "livraison" and valeur <= 0:
+    if type_ == "livraison":
+        valeur = 0
+    elif valeur <= 0:
         raise HTTPException(400, "La valeur doit être positive")
     if type_ == "pct" and valeur > 100:
         raise HTTPException(400, "Le pourcentage ne peut pas dépasser 100")
@@ -475,20 +489,20 @@ def update_promo_by_id(
 ):
     updates, params = [], {"id": promo_id}
 
-    if "actif"           in body: updates.append("actif=:actif");                      params["actif"]           = bool(body["actif"])
-    if "type"            in body: updates.append("type=:type");                         params["type"]            = str(body["type"])
-    if "valeur"          in body: updates.append("valeur=:valeur");                     params["valeur"]          = float(body["valeur"])
-    if "reduction_fcfa"  in body: updates.append("reduction_fcfa=:reduction_fcfa");     params["reduction_fcfa"]  = float(body["reduction_fcfa"])
-    if "gain_influenceur"in body: updates.append("gain_influenceur=:gain_influenceur"); params["gain_influenceur"]= float(body["gain_influenceur"])
-    if "note"            in body: updates.append("note=:note");                         params["note"]            = body["note"] or None
-    if "expiry"          in body: updates.append("expiry=:expiry");                     params["expiry"]          = body["expiry"] or None
-    if "client_tel"      in body: updates.append("client_tel=:client_tel");             params["client_tel"]      = body["client_tel"] or None
-    if "quota"           in body:
-        updates += ["quota=:quota","max_uses=:quota"]; params["quota"] = int(body["quota"])
-    if "max_uses"        in body:
-        updates += ["max_uses=:max_uses","quota=:max_uses"]; params["max_uses"] = int(body["max_uses"])
+    if "actif"            in body: updates.append("actif=:actif");                      params["actif"]            = bool(body["actif"])
+    if "type"             in body: updates.append("type=:type");                         params["type"]             = str(body["type"])
+    if "valeur"           in body: updates.append("valeur=:valeur, reduction_fcfa=:valeur"); params["valeur"]       = float(body["valeur"])
+    if "reduction_fcfa"   in body: updates.append("valeur=:val, reduction_fcfa=:val");   params["val"]             = float(body["reduction_fcfa"])
+    if "gain_influenceur" in body: updates.append("gain_influenceur=:gain_influenceur"); params["gain_influenceur"] = float(body["gain_influenceur"])
+    if "note"             in body: updates.append("note=:note");                         params["note"]             = body["note"] or None
+    if "expiry"           in body: updates.append("expiry=:expiry");                     params["expiry"]           = body["expiry"] or None
+    if "client_tel"       in body: updates.append("client_tel=:client_tel");             params["client_tel"]       = body["client_tel"] or None
+    if "quota"            in body:
+        updates += ["quota=:quota", "max_uses=:quota"]; params["quota"] = int(body["quota"])
+    if "max_uses"         in body:
+        updates += ["max_uses=:max_uses", "quota=:max_uses"]; params["max_uses"] = int(body["max_uses"])
     if body.get("reset_utilisations"):
-        updates += ["uses_count=0","actif=TRUE"]
+        updates += ["uses_count=0", "actif=TRUE"]
 
     if updates:
         db.execute(text(f"UPDATE promo_codes SET {', '.join(updates)} WHERE id=:id"), params)
