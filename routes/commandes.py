@@ -140,7 +140,8 @@ def appliquer_promo(db, promo_code: str, total_local: float, taux_conv: float) -
             return total_local
 
         type_promo = getattr(promo, "type", "fixe") or "fixe"
-        valeur     = getattr(promo, "valeur", None) or getattr(promo, "reduction_fcfa", 0) or 0
+        # ✅ FIX : valeur en priorité, fallback reduction_fcfa
+        valeur = getattr(promo, "valeur", None) or getattr(promo, "reduction_fcfa", 0) or 0
 
         if type_promo == "livraison":
             nouveau_total = total_local
@@ -191,7 +192,23 @@ def _get_gain_parrain(db, reduction_fcfa: float) -> float:
     return round(reduction_fcfa * 0.5)
 
 
+def _normaliser_tel(tel: str) -> str:
+    """Retourne uniquement les chiffres du numéro."""
+    return ''.join(filter(str.isdigit, tel or ""))
+
+
+def _suffix(tel: str, n: int = 8) -> str:
+    """Retourne les n derniers chiffres — robuste peu importe le format."""
+    digits = _normaliser_tel(tel)
+    return digits[-n:] if len(digits) >= n else digits
+
+
 def _enregistrer_parrainage(db, code, filleul_tel, filleul_nom, commande_ref, reduction_fcfa):
+    """
+    Enregistre l'utilisation d'un code parrainage.
+    ✅ FIX : comparaison par suffixe robuste (plus d'échec silencieux)
+    ✅ FIX : vérification doublon par suffixe aussi
+    """
     code = code.upper().strip()
     try:
         parrain = db.execute(
@@ -202,24 +219,38 @@ def _enregistrer_parrainage(db, code, filleul_tel, filleul_nom, commande_ref, re
             print(f"[parrainage] Code {code} invalide ou inactif")
             return False
 
-        def norm_suffix(t):
-            digits = ''.join(filter(str.isdigit, t or ""))
-            return digits[-9:] if len(digits) >= 9 else digits
+        # ✅ FIX : comparaison par suffixe (8 derniers chiffres)
+        filleul_suffix = _suffix(filleul_tel)
+        parrain_suffix = _suffix(parrain["parrain_tel"])
 
-        if norm_suffix(filleul_tel) == norm_suffix(parrain["parrain_tel"]):
+        if filleul_suffix == parrain_suffix:
             print(f"[parrainage] Auto-parrainage bloqué pour {filleul_tel}")
             return False
 
+        # ✅ FIX : doublon vérifié par suffixe aussi
         deja = db.execute(
             text("""
-                SELECT 1 FROM parrainage_utilisations u
-                JOIN parrainage_codes p ON p.code = u.code
-                WHERE p.code = :c
-                AND REPLACE(REPLACE(REPLACE(u.filleul_tel, ' ', ''), '-', ''), '+', '')
-                  = REPLACE(REPLACE(REPLACE(:t, ' ', ''), '-', ''), '+', '')
+                SELECT 1 FROM parrainage_utilisations
+                WHERE code = :c
+                AND RIGHT(REGEXP_REPLACE(filleul_tel, '[^0-9]', '', 'g'), 8) = :suffix
             """),
-            {"c": code, "t": filleul_tel}
+            {"c": code, "suffix": filleul_suffix}
         ).fetchone()
+
+        if not deja:
+            # Fallback sans REGEXP_REPLACE
+            try:
+                deja = db.execute(
+                    text("""
+                        SELECT 1 FROM parrainage_utilisations
+                        WHERE code = :c
+                        AND RIGHT(REPLACE(REPLACE(REPLACE(filleul_tel,' ',''),'-',''),'+',''), 8) = :suffix
+                    """),
+                    {"c": code, "suffix": filleul_suffix}
+                ).fetchone()
+            except Exception:
+                pass
+
         if deja:
             print(f"[parrainage] Déjà utilisé par {filleul_tel} pour code {code}")
             return False
@@ -238,7 +269,7 @@ def _enregistrer_parrainage(db, code, filleul_tel, filleul_nom, commande_ref, re
         db.execute(
             text("""
                 UPDATE parrainage_codes
-                SET nb_filleuls = nb_filleuls + 1,
+                SET nb_filleuls  = nb_filleuls + 1,
                     credit_total = credit_total + :g
                 WHERE code = :c
             """),
@@ -250,6 +281,7 @@ def _enregistrer_parrainage(db, code, filleul_tel, filleul_nom, commande_ref, re
 
     except Exception as e:
         print(f"[parrainage] Erreur _enregistrer_parrainage: {e}")
+        traceback.print_exc()
         return False
 
 
@@ -343,10 +375,6 @@ def _sanitize_url(url: str) -> str:
     if lower.startswith("http://") or lower.startswith("https://"):
         return url
     return ""
-
-
-def _normaliser_tel(tel: str) -> str:
-    return ''.join(filter(str.isdigit, tel or ""))
 
 
 def _calculer_total_serveur(articles, pays, cfg, promo_code, db):
@@ -606,11 +634,10 @@ def suivi(ref: str, tel: str = Query(...), db: Session = Depends(get_db)):
     if not match:
         raise HTTPException(403, "Numéro de téléphone incorrect")
 
-    # FIX 3 : total_local=0 affiché comme "Prix à confirmer" côté API aussi
     total_display = cmd.total_local
     note_display  = cmd.note_admin
     if not total_display or total_display == 0:
-        total_display = None  # Le frontend affichera "Prix à confirmer"
+        total_display = None
 
     return {
         "ref":             cmd.ref,
@@ -689,7 +716,7 @@ def historique(tel: str, db: Session = Depends(get_db)):
             "ref":             g("ref"),
             "statut":          g("statut"),
             "nb_articles":     g("nb_articles"),
-            "total_local":     total if total else None,  # FIX 3 : None si panier-lien
+            "total_local":     total if total else None,
             "monnaie":         g("monnaie"),
             "delai_livraison": delai,
             "note_admin":      g("note_admin"),
@@ -753,11 +780,9 @@ def creer_commande_whatsapp(body: CommandeWACreate, background_tasks: Background
 
         is_panier_lien = (total_eur == 0)
 
-        # FIX 1 : Initialisation des variables avant les blocs conditionnels
         promo_code_valide      = None
         parrain_code_valide    = None
         reduction_serveur      = 0
-        # FIX 2 : Initialisation de reduction_parrain_fcfa par défaut
         reduction_parrain_fcfa = 1000.0
 
         if is_panier_lien:
@@ -789,7 +814,8 @@ def creer_commande_whatsapp(body: CommandeWACreate, background_tasks: Background
                         text("SELECT parrain_tel FROM parrainage_codes WHERE code=:c AND actif=TRUE"),
                         {"c": body.code_parrainage.strip().upper()}
                     ).mappings().first()
-                    if parrain_row and parrain_row["parrain_tel"] != body.client_tel:
+                    # ✅ FIX : comparaison par suffixe
+                    if parrain_row and _suffix(parrain_row["parrain_tel"]) != _suffix(body.client_tel):
                         parrain_code_valide = body.code_parrainage.strip().upper()
                         cfg_red = db.execute(
                             text("SELECT reduction_parrainage FROM configs WHERE id=1 LIMIT 1")
