@@ -6,18 +6,25 @@ CORRECTIONS :
   - exec_get_config : calcul GNF/FCFA cohérent sans division hardcodée par 656
   - run_bot : retry sur erreur transitoire API Anthropic + timeout explicite
   - Meilleure gestion des erreurs HTTP (log structuré)
-  - Nouveaux outils : rechercher_article, estimer_poids, questions_frequentes
-  - SYSTEM_PROMPT enrichi : plaintes fréquentes, suivi paiement, annulation, authenticité
+  - get_commission : formule progressive (5000 FCFA base + 3300/tranche de 50€), synchronisée
+    avec routes/commandes.py et routes/admin.py — remplace l'ancienne grille à paliers fixes
+  - Outils réels disponibles : get_config, suivi_commande, calculer_prix, estimer_poids, info_boutique
 
-AMÉLIORATIONS (réponses aux plaintes clients) :
+AMÉLIORATIONS :
+  - Politique de remboursement précise et nuancée selon les vraies CGV (plus de "remboursement
+    intégral" générique — chaque cas a sa propre règle : rupture stock, annulation avant/après
+    achat, article non conforme, colis perdu, refus de payer le port, droits de douane)
+  - Nouvel outil info_boutique : base de 30+ boutiques partenaires avec URL et conseils
+    spécifiques pour les plus demandées (Nike, Apple, Sephora, IKEA...), recherche tolérante
+    aux variantes d'écriture
+  - Compréhension du langage élargie : davantage d'expressions courantes en français
+    d'Afrique de l'Ouest, abréviations de villes, messages courts type "ok"/"merci"
+  - Sections ajoutées : litiges et réclamations (délais de réponse), protection des données
   - Client dit "j'ai payé mais rien reçu" → guide précis sur les étapes
   - Client dit "trop cher" → explication valeur + comparaison
   - Client dit "combien de temps" → TOUJOURS utiliser get_config (jamais estimer)
-  - Client dit "c'est une arnaque" → réponse rassurante avec preuves
-  - Client pose une question sur un article spécifique → outil rechercher_article
-  - Client demande le poids d'un article → outil estimer_poids
-  - Client veut annuler → procédure claire
-  - Support multilingue amélioré : soussou, bambara, wolof, dioula
+  - Client dit "c'est une arnaque" → réponse rassurante avec preuves, sans survendre la garantie
+  - Client veut annuler → vérifie d'abord le statut réel avant de promettre un remboursement
 """
 
 from fastapi import APIRouter, Request, HTTPException
@@ -82,6 +89,172 @@ POIDS_MOYENS = {
     "tablette": 0.6, "laptop": 2.0, "ordinateur": 2.0,
 }
 
+# ── Boutiques partenaires : URL + conseils pour les plus demandées ──
+# Source : liste officielle FougahShop (CGV + page d'accueil), 37+ boutiques partenaires.
+# Les boutiques avec "conseil" ont une fiche enrichie ; les autres ont juste leur URL.
+BOUTIQUES = {
+    "nike": {
+        "url": "https://www.nike.com",
+        "categorie": "Sport / Sneakers",
+        "conseil": "Les tailles Nike sont souvent en US — vérifie le tableau de conversion EU sur la fiche produit avant de commander. Les Air Max et Air Force 1 sont les plus demandées."
+    },
+    "adidas": {
+        "url": "https://www.adidas.fr",
+        "categorie": "Sport / Sneakers",
+        "conseil": "Les Yeezy et Samba sont en édition limitée — elles partent vite en rupture. Si tu vois le modèle disponible, commande rapidement."
+    },
+    "zara": {
+        "url": "https://www.zara.com",
+        "categorie": "Mode",
+        "conseil": "Zara taille souvent petit comparé aux marques africaines courantes — prends une taille au-dessus si tu hésites."
+    },
+    "shein": {
+        "url": "https://www.shein.com",
+        "categorie": "Mode / Petit budget",
+        "conseil": "Prix très bas mais qualité variable selon l'article — regarde bien les avis clients sur la fiche produit avant de valider."
+    },
+    "asos": {
+        "url": "https://www.asos.com",
+        "categorie": "Mode",
+        "conseil": None
+    },
+    "zalando": {
+        "url": "https://www.zalando.fr",
+        "categorie": "Mode / Chaussures",
+        "conseil": None
+    },
+    "h&m": {
+        "url": "https://www2.hm.com",
+        "categorie": "Mode",
+        "conseil": None
+    },
+    "mango": {
+        "url": "https://shop.mango.com",
+        "categorie": "Mode",
+        "conseil": None
+    },
+    "apple": {
+        "url": "https://www.apple.com/fr",
+        "categorie": "Tech",
+        "conseil": "Pour un iPhone, précise toujours la capacité de stockage (128 Go, 256 Go...) et la couleur — le prix varie beaucoup selon ces deux critères."
+    },
+    "samsung": {
+        "url": "https://www.samsung.com/fr",
+        "categorie": "Tech",
+        "conseil": None
+    },
+    "amazon": {
+        "url": "https://www.amazon.fr",
+        "categorie": "Généraliste",
+        "conseil": "Vérifie bien que le vendeur est 'Amazon' ou 'Expédié par Amazon' pour garantir l'authenticité, certains vendeurs tiers sur Amazon ne sont pas fiables."
+    },
+    "sephora": {
+        "url": "https://www.sephora.fr",
+        "categorie": "Beauté / Parfum",
+        "conseil": "Pour les parfums, vérifie bien le format (50ml, 100ml...) — c'est ce qui fait varier le prix le plus."
+    },
+    "nocibé": {
+        "url": "https://www.nocibe.fr",
+        "categorie": "Beauté / Parfum",
+        "conseil": None
+    },
+    "yves rocher": {
+        "url": "https://www.yves-rocher.fr",
+        "categorie": "Beauté",
+        "conseil": None
+    },
+    "decathlon": {
+        "url": "https://www.decathlon.fr",
+        "categorie": "Sport",
+        "conseil": "Bon rapport qualité-prix pour l'équipement sportif — souvent moins cher que les grandes marques pour un usage similaire."
+    },
+    "puma": {
+        "url": "https://fr.puma.com",
+        "categorie": "Sport / Sneakers",
+        "conseil": None
+    },
+    "new balance": {
+        "url": "https://www.newbalance.fr",
+        "categorie": "Sport / Sneakers",
+        "conseil": None
+    },
+    "supreme": {
+        "url": "https://www.supremenewyork.com",
+        "categorie": "Streetwear",
+        "conseil": "Les drops Supreme partent en quelques minutes — si l'article t'intéresse, envoie-nous le lien dès que possible."
+    },
+    "carhartt": {
+        "url": "https://www.carhartt-wip.com",
+        "categorie": "Streetwear",
+        "conseil": None
+    },
+    "lululemon": {
+        "url": "https://www.lululemon.fr",
+        "categorie": "Sport",
+        "conseil": None
+    },
+    "ralph lauren": {
+        "url": "https://www.ralphlauren.fr",
+        "categorie": "Mode",
+        "conseil": None
+    },
+    "tommy hilfiger": {
+        "url": "https://fr.tommy.com",
+        "categorie": "Mode",
+        "conseil": None
+    },
+    "lacoste": {
+        "url": "https://www.lacoste.com",
+        "categorie": "Mode",
+        "conseil": None
+    },
+    "calvin klein": {
+        "url": "https://www.calvinklein.fr",
+        "categorie": "Mode",
+        "conseil": None
+    },
+    "foot locker": {
+        "url": "https://www.footlocker.fr",
+        "categorie": "Sneakers",
+        "conseil": None
+    },
+    "jd sports": {
+        "url": "https://www.jdsports.fr",
+        "categorie": "Sneakers",
+        "conseil": None
+    },
+    "fnac": {
+        "url": "https://www.fnac.com",
+        "categorie": "Tech / Culture",
+        "conseil": None
+    },
+    "ikea": {
+        "url": "https://www.ikea.com/fr",
+        "categorie": "Maison",
+        "conseil": "Les meubles IKEA sont souvent lourds et volumineux — les frais de port peuvent être élevés, demande toujours une estimation avant de commander."
+    },
+    "la redoute": {
+        "url": "https://www.laredoute.fr",
+        "categorie": "Maison / Mode",
+        "conseil": None
+    },
+    "modanisa": {
+        "url": "https://www.modanisa.com",
+        "categorie": "Mode modeste",
+        "conseil": None
+    },
+    "fashion nova": {
+        "url": "https://www.fashionnova.com",
+        "categorie": "Mode",
+        "conseil": None
+    },
+    "douglas": {
+        "url": "https://www.douglas.fr",
+        "categorie": "Beauté / Parfum",
+        "conseil": None
+    },
+}
+
 SYSTEM_PROMPT = """Tu es Fougah, l'assistant IA de FougahShop — un service proxy shopping qui permet aux clients en Afrique de commander sur les boutiques européennes et de payer en Mobile Money (Orange Money, Wave, MTN MoMo, etc.).
 
 === QUI TU ES ===
@@ -91,18 +264,23 @@ Tes clients écrivent souvent avec des fautes, des abréviations, du franglais, 
 
 === RÈGLES DE COMPRÉHENSION — TRÈS IMPORTANT ===
 - Cherche TOUJOURS l'intention même si le message est mal écrit
-- "coman sa march" → comment ça marche
-- "moi vouloir chaussure nike" → veut commander des Nike
-- "prix iphone" → veut savoir combien coûte la commande d'un iPhone
-- "mo commande" / "ma commande" / "mon colis" → veut suivre sa commande
-- "c koi" / "c quoi" / "ki lé" → question sur FougahShop
-- "jpay dja" / "jai deja pay" → il a déjà payé, veut un suivi
-- "tro cher" → trouve ça trop cher, besoin de justification
-- "arnaque" / "escroc" / "voleur" → méfiance, besoin de réassurance forte
-- "annuler" / "rembours" → veut annuler ou être remboursé
-- Message en soussou/wolof/bambara → réponds en français simple
+- "coman sa march" / "comen ça marche" → comment ça marche
+- "moi vouloir chaussure nike" / "je veux des nike" → veut commander des Nike
+- "prix iphone" / "combien sa coute iphone" → veut savoir combien coûte la commande d'un iPhone
+- "mo commande" / "ma commande" / "mon colis" / "ou est mon colis" → veut suivre sa commande
+- "c koi" / "c quoi" / "ki lé" / "kes ke c" → question sur FougahShop
+- "jpay dja" / "jai deja pay" / "jai envoyé largent" → il a déjà payé, veut un suivi
+- "tro cher" / "c chr sa" / "ya pa moins cher" → trouve ça trop cher, besoin de justification
+- "arnaque" / "escroc" / "voleur" / "ont va me voler mon argent" → méfiance, besoin de réassurance forte
+- "annuler" / "rembours" / "je veux plus" / "laisse tomber la commande" → veut annuler ou être remboursé
+- "stp" / "svp" / "abrège" / "vite vite" → urgence ou politesse, adapte le ton sans ignorer la demande
+- "dkr" / "abj" / "cky" → abréviations de villes (Dakar, Abidjan, Conakry) — utilise le contexte
+- "1 momen" / "atend" / "wait" → demande de patienter, répondre brièvement puis attendre
+- "g pa compri" / "javai pa compri" → n'a pas compris la réponse précédente, reformule plus simplement
+- Message en soussou/wolof/bambara/dioula → réponds en français simple et clair, pas de jargon
 - Message en anglais → réponds en anglais
-- Ne dis JAMAIS "je ne comprends pas" — interprète et réponds toujours
+- Messages très courts type "ok" / "merci" / "daccord" → réponse brève, ne pas relancer une explication complète
+- Ne dis JAMAIS "je ne comprends pas" — interprète et réponds toujours, demande une précision si vraiment ambigu plutôt que de bloquer
 
 === COMMENT ÇA MARCHE ===
 1. Le client va sur fougahshop.com onglet "Commander"
@@ -142,17 +320,28 @@ Si get_config échoue, dis : "Je n'arrive pas à récupérer les tarifs en ce mo
 → "FougahShop existe depuis 2023, des centaines de clients ont déjà reçu leurs commandes."
 → "Tu peux voir les photos de livraisons réelles sur fougahshop.com onglet 'Avis & photos'."
 → "On achète sur les vrais sites officiels (Nike.com, Zara.com...) avec notre carte bancaire."
-→ "Tu ne paies qu'après confirmation du total. Si on ne livre pas, remboursement intégral."
+→ "Si jamais l'article est en rupture de stock avant qu'on l'achète, remboursement intégral sous 48h, garanti."
+
+=== POLITIQUE DE REMBOURSEMENT — RÈGLES EXACTES DES CGV ===
+Ne dis JAMAIS simplement "remboursement intégral" sans préciser le cas. Chaque situation a sa propre règle :
+
+• Rupture de stock AVANT achat → remboursement intégral sous 48h
+• Annulation AVANT achat (statut "en attente" ou "payé") → remboursement intégral
+• Annulation APRÈS achat → remboursement PARTIEL seulement (déduction des frais déjà engagés : achat, frais de retour vendeur le cas échéant)
+• Article non conforme à la commande reçue → remboursement OU renvoi après vérification, selon les possibilités du vendeur (pas automatique, ça dépend du cas)
+• Colis perdu en transit → on lance une procédure de recherche d'abord ; si le colis est déclaré perdu, remboursement partiel ou total étudié selon les circonstances (pas garanti à 100%)
+• Refus de payer les frais de port → AUCUN remboursement de la commission déjà engagée pour l'achat
+• Droits de douane et taxes à l'importation → entièrement à la charge du client, FougahShop ne les prend jamais en charge et n'est pas responsable des blocages douaniers
 
 ** "Je veux annuler ma commande" **
-→ "Tu peux annuler avant qu'on achète l'article (statut 'En attente' ou 'Payé')."
-→ "Après achat, l'annulation n'est plus possible sauf si l'article n'est pas disponible."
-→ "Contacte-nous rapidement sur WhatsApp avec ta référence CMD-XXXX-XXXX."
-→ "Le remboursement se fait sur le même numéro Mobile Money."
+→ D'abord demander : "Est-ce qu'on a déjà acheté ton article, ou pas encore ?" (vérifier le statut avec suivi_commande si la personne a sa référence)
+→ Si statut "en attente" ou "payé" (pas encore acheté) : "Tu peux annuler maintenant, remboursement intégral sur ton Mobile Money."
+→ Si statut "acheté" ou plus avancé : "L'article est déjà acheté — l'annulation reste possible mais le remboursement sera partiel, après déduction de ce qu'on a déjà engagé."
+→ Toujours : "Contacte-nous sur WhatsApp avec ta référence CMD-XXXX-XXXX pour qu'on traite ça rapidement."
 
 ** "L'article n'est pas disponible sur le site" **
-→ "Dis-moi exactement ce que tu cherches — je vais chercher une alternative disponible."
-→ Utiliser l'outil rechercher_article pour suggérer des alternatives.
+→ "Dis-moi exactement ce que tu cherches — je vais te dire si on a une alternative chez un autre partenaire."
+→ Utiliser l'outil info_boutique si le client demande des détails sur une boutique précise.
 
 ** "Vous livrez où exactement ?" **
 → Utiliser get_config pour les pays actifs et les modes de livraison.
@@ -164,12 +353,26 @@ Si get_config échoue, dis : "Je n'arrive pas à récupérer les tarifs en ce mo
 → "Jamais sur AliExpress ou des sites de copie."
 → "Tu reçois une confirmation d'achat avec le lien de la vraie commande."
 
-=== BOUTIQUES (65+) ===
-Mode : Nike, Adidas, Zara, H&M, ASOS, Zalando, Shein, Mango, New Balance, Puma, Supreme, Carhartt, Lululemon, Ralph Lauren, Tommy Hilfiger, Lacoste, Calvin Klein, Foot Locker, JD Sports
-Tech : Apple, Samsung, Fnac, Amazon
-Beauté : Sephora, Douglas
-Maison : IKEA, La Redoute, Decathlon
-Et bien d'autres sur demande.
+** "Mon colis a disparu / je ne le trouve plus" **
+→ Ne JAMAIS promettre un remboursement automatique — c'est étudié au cas par cas.
+→ "On va d'abord lancer une recherche auprès du transporteur. Donne-moi ta référence CMD-XXXX-XXXX."
+→ "Si le colis est officiellement déclaré perdu, on regarde ensemble la solution adaptée à ta situation."
+
+** "Je n'ai pas payé les frais de port, qu'est-ce qui se passe ?" **
+→ "Tu as 7 jours après réception du montant pour régler les frais de port."
+→ "Sans paiement dans ce délai, on doit retourner l'article au vendeur — les frais de retour seront à ta charge."
+→ "Et la commission déjà payée pour l'achat n'est pas remboursable dans ce cas."
+
+** "Y'a des taxes de douane à payer ?" **
+→ "Oui, possible — les droits de douane et taxes d'importation de ton pays sont entièrement à ta charge, FougahShop ne les gère pas."
+→ "Si jamais ton colis est bloqué en douane, on t'accompagne dans les démarches mais on ne peut pas payer les frais à ta place."
+
+=== BOUTIQUES PARTENAIRES (37+) ===
+On a des dizaines de boutiques partenaires couvrant mode, sport, tech, beauté, maison.
+Quand un client demande une boutique précise (Nike, Zara, Apple, Sephora...) ou veut savoir
+où acheter un type d'article, utilise TOUJOURS l'outil info_boutique pour donner le lien exact
+et les conseils spécifiques à jour — ne donne jamais un lien de mémoire, il pourrait être obsolète.
+Si la boutique n'est pas dans notre liste, dis-le honnêtement et propose une alternative similaire.
 
 === SUIVI COMMANDE ===
 Référence CMD-XXXX-XXXX + numéro de téléphone → onglet "Mon colis" sur fougahshop.com
@@ -181,8 +384,15 @@ Réduction pour l'ami qui commande + gain pour le parrain.
 
 === GARANTIES ===
 - Articles 100% authentiques achetés sur les sites officiels
-- Remboursement intégral si rupture de stock ou non livraison
+- Remboursement intégral si rupture de stock avant achat (sous 48h)
 - Paiement sécurisé Mobile Money
+- Voir la section "POLITIQUE DE REMBOURSEMENT" ci-dessus pour les autres cas — ne jamais généraliser à "remboursement garanti" sans préciser la situation
+
+=== LITIGES ET RÉCLAMATIONS ===
+Si un client n'est pas satisfait après une première réponse : "On s'engage à répondre sous 24h ouvrées et à proposer une solution dans un délai de 5 jours ouvrés. Contacte-nous sur WhatsApp si ce n'est pas déjà fait."
+
+=== PROTECTION DES DONNÉES ===
+Si un client demande ce qu'on fait de ses données : "On utilise ton nom, numéro et adresse uniquement pour traiter ta commande — jamais vendues ni partagées à des fins commerciales. Tu peux demander l'accès, la modification ou la suppression de tes données à tout moment sur WhatsApp."
 
 === STYLE DE RÉPONSE ===
 - Phrases courtes — tes clients lisent sur mobile
@@ -237,6 +447,20 @@ TOOLS = [
                 }
             },
             "required": ["articles"]
+        }
+    },
+    {
+        "name": "info_boutique",
+        "description": "Donne l'URL exacte et les conseils spécifiques pour une boutique partenaire (Nike, Zara, Apple, Sephora...). Utiliser dès que le client mentionne une boutique précise ou demande où acheter un type d'article. Ne jamais donner un lien de mémoire — toujours passer par cet outil.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "nom_boutique": {
+                    "type": "string",
+                    "description": "Nom de la boutique recherchée, ex: 'nike', 'zara', 'apple'. Insensible à la casse."
+                }
+            },
+            "required": ["nom_boutique"]
         }
     },
 ]
@@ -473,6 +697,40 @@ def exec_estimer_poids(articles: list) -> str:
     return r
 
 
+def exec_info_boutique(nom_boutique: str) -> str:
+    recherche = nom_boutique.lower().strip()
+    # Normaliser quelques variantes d'écriture courantes
+    recherche = recherche.replace("&", "&").replace(" et ", "&").replace("-", " ")
+
+    # Correspondance directe : utiliser le nom propre du dictionnaire pour l'affichage
+    info = BOUTIQUES.get(recherche)
+    if info:
+        nom_boutique = recherche
+
+    # Correspondance partielle si pas de match direct (ex: "h et m" -> "h&m")
+    if not info:
+        for nom, data in BOUTIQUES.items():
+            if recherche in nom or nom in recherche:
+                info = data
+                nom_boutique = nom
+                break
+
+    if not info:
+        noms_disponibles = ", ".join(sorted(b.title() for b in BOUTIQUES.keys()))
+        return (
+            f"❌ Je ne trouve pas '{nom_boutique}' dans nos boutiques partenaires actuelles.\n\n"
+            f"Voici nos boutiques disponibles : {noms_disponibles}.\n\n"
+            f"Si tu cherches un type d'article précis (chaussures, parfum, téléphone...), dis-le-moi et je te propose une boutique adaptée."
+        )
+
+    r  = f"🛍️ **{nom_boutique.title()}** — {info['categorie']}\n\n"
+    r += f"🔗 {info['url']}\n\n"
+    if info.get("conseil"):
+        r += f"💡 {info['conseil']}\n\n"
+    r += "Copie le lien du produit exact que tu veux et envoie-le-nous sur WhatsApp pour qu'on confirme le prix."
+    return r
+
+
 # ─── Moteur Claude ────────────────────────────────────────────
 async def run_bot(messages: list, pays_client: str = "") -> str:
     if not ANTHROPIC_API_KEY:
@@ -540,6 +798,8 @@ async def run_bot(messages: list, pays_client: str = "") -> str:
                         )
                     elif block.name == "estimer_poids":
                         res = exec_estimer_poids(inp.get("articles", []))
+                    elif block.name == "info_boutique":
+                        res = exec_info_boutique(str(inp.get("nom_boutique", "")))
                     else:
                         res = f"Outil inconnu : {block.name}"
                 except Exception as e:
