@@ -109,7 +109,9 @@ def calc_article_sans_port_ni_commission(prix_eu, qty, pays, cfg):
 
 def appliquer_promo(db, promo_code: str, total_panier: float, commission_locale: float, taux_conv: float) -> float:
     """
-    Applique un code promo UNIQUEMENT sur la commission de service — jamais sur le prix du panier.
+    Applique un code promo dont la cible est "commission" — jamais sur le prix du panier.
+    Si le code cible "expedition" ou "livraison", cette fonction le laisse intact : ces cibles
+    sont gérées ailleurs dans le flux, à leur propre moment (pesée réelle, choix de livraison).
     Retourne la nouvelle commission (toujours >= 0, jamais négative).
     total_panier est utilisé en lecture seule pour le calcul du pourcentage (% du panier, pas de la commission).
     """
@@ -144,6 +146,15 @@ def appliquer_promo(db, promo_code: str, total_panier: float, commission_locale:
             return commission_locale
 
         type_promo = getattr(promo, "type", "fixe") or "fixe"
+        cible = getattr(promo, "cible", None) or "commission"
+
+        # ── Ce code promo ne cible pas la commission — rien à faire à ce point du calcul. ──
+        # Les cibles "expedition" et "livraison" sont gérées à d'autres moments du flux
+        # (pesée réelle, choix de livraison à domicile), pas encore implémentées ici.
+        # On ne touche pas à uses_count ici : ce code n'a pas encore réellement servi.
+        if cible != "commission":
+            return commission_locale
+
         # ✅ FIX : valeur en priorité, fallback reduction_fcfa
         valeur = getattr(promo, "valeur", None) or getattr(promo, "reduction_fcfa", 0) or 0
 
