@@ -45,6 +45,9 @@ def ensure_tables(db: Session):
             "ALTER TABLE promo_codes ADD COLUMN IF NOT EXISTS gain_influenceur FLOAT DEFAULT 0",
             "ALTER TABLE promo_codes ADD COLUMN IF NOT EXISTS pays VARCHAR DEFAULT NULL",
             "ALTER TABLE promo_codes ADD COLUMN IF NOT EXISTS quota INTEGER DEFAULT 0",
+            # ✅ NOUVEAU : cible de la réduction — commission (défaut, comportement historique),
+            # expedition (frais de port après pesée), ou livraison (livraison à domicile Guinée).
+            "ALTER TABLE promo_codes ADD COLUMN IF NOT EXISTS cible VARCHAR DEFAULT 'commission'",
             # ✅ FIX CRITIQUE : corriger valeur=0 pour les anciens codes
             "UPDATE promo_codes SET valeur = reduction_fcfa WHERE valeur = 0 AND reduction_fcfa > 0",
             "ALTER TABLE commandes ADD COLUMN IF NOT EXISTS promo_code VARCHAR",
@@ -136,19 +139,27 @@ def verifier_code_get(code: str, db: Session = Depends(get_db)):
     # ✅ FIX : utiliser valeur en priorité, fallback reduction_fcfa
     valeur = row.valeur or row.reduction_fcfa or 0
     type_  = row.type or "fixe"
+    cible  = getattr(row, "cible", None) or "commission"
+
+    cible_label = {
+        "commission": "la commission de service",
+        "expedition": "les frais d'expédition",
+        "livraison":  "la livraison à domicile",
+    }.get(cible, "la commission de service")
 
     if type_ == "livraison":
         msg = "Code valide — livraison locale gratuite"
     elif type_ == "pct":
-        msg = f"Code valide — réduction de {int(valeur)}%"
+        msg = f"Code valide — réduction de {int(valeur)}% sur {cible_label}"
     else:
-        msg = f"Code valide — réduction de {int(valeur)} FCFA"
+        msg = f"Code valide — réduction de {int(valeur)} FCFA sur {cible_label}"
 
     return {
         "valide":         True,
         "code":           row.code,
         "type":           type_,
         "valeur":         valeur,
+        "cible":          cible,
         "valeur_fcfa":    valeur if type_ == "fixe" else None,
         "reduction_fcfa": valeur if type_ in ("fixe",) else None,
         "influenceur":    getattr(row, "influenceur", None),
@@ -231,6 +242,7 @@ def get_stats_influenceur(code: str, db: Session = Depends(get_db)):
         "pays":             promo.get("pays") or "",
         "actif":            True,
         "type":             promo.get("type", "fixe"),
+        "cible":            promo.get("cible") or "commission",
         "valeur":           valeur,         # ✅ FIX valeur correcte
         "expiry":           str(promo.get("expiry") or ""),
         "uses_count":       uses_count_reel,
@@ -306,6 +318,7 @@ def list_promos(
         # ✅ FIX : valeur correcte — priorité à valeur, fallback reduction_fcfa
         valeur       = p.valeur or p.reduction_fcfa or 0
         type_        = p.type or "fixe"
+        cible        = getattr(p, "cible", None) or "commission"
         gain_par_cmd = getattr(p, "gain_influenceur", 0) or 0
         nb_conf      = int(s.get("nb_confirmees") or 0)
         nb_att       = int(s.get("nb_attente") or 0)
@@ -318,6 +331,7 @@ def list_promos(
             "id":                     p.id,
             "code":                   p.code,
             "type":                   type_,
+            "cible":                  cible,
             "valeur":                 valeur,
             "reduction_fcfa":         valeur if type_ == "fixe" else None,
             "influenceur":            getattr(p, "influenceur", None),
@@ -410,6 +424,11 @@ def create_promo(
     if type_ not in ("fixe", "pct", "livraison"):
         raise HTTPException(400, "Type invalide (fixe, pct ou livraison)")
 
+    # ✅ NOUVEAU : cible de la réduction — défaut commission pour compatibilité avec l'existant
+    cible = str(body.get("cible", "commission")).lower()
+    if cible not in ("commission", "expedition", "livraison"):
+        cible = "commission"
+
     # ✅ FIX : accepter valeur OU reduction_fcfa
     valeur = float(body.get("valeur", body.get("reduction_fcfa", 0)))
     if type_ == "livraison":
@@ -430,12 +449,12 @@ def create_promo(
 
     row = db.execute(text("""
         INSERT INTO promo_codes
-            (code, type, valeur, reduction_fcfa,
+            (code, type, cible, valeur, reduction_fcfa,
              influenceur, gain_influenceur,
              client_tel, max_uses, quota,
              uses_count, note, expiry, pays, actif)
         VALUES
-            (:code, :type, :valeur, :reduction_fcfa,
+            (:code, :type, :cible, :valeur, :reduction_fcfa,
              :influenceur, :gain_influenceur,
              :client_tel, :max_uses, :max_uses,
              0, :note, :expiry, :pays, TRUE)
@@ -443,6 +462,7 @@ def create_promo(
     """), {
         "code":             code,
         "type":             type_,
+        "cible":            cible,
         "valeur":           valeur,
         "reduction_fcfa":   valeur if type_ == "fixe" else 0,
         "influenceur":      body.get("influenceur") or None,
@@ -491,6 +511,11 @@ def update_promo_by_id(
 
     if "actif"            in body: updates.append("actif=:actif");                      params["actif"]            = bool(body["actif"])
     if "type"             in body: updates.append("type=:type");                         params["type"]             = str(body["type"])
+    if "cible"            in body:
+        cible_val = str(body["cible"]).lower()
+        if cible_val not in ("commission", "expedition", "livraison"):
+            cible_val = "commission"
+        updates.append("cible=:cible"); params["cible"] = cible_val
     if "valeur"           in body: updates.append("valeur=:valeur, reduction_fcfa=:valeur"); params["valeur"]       = float(body["valeur"])
     if "reduction_fcfa"   in body: updates.append("valeur=:val, reduction_fcfa=:val");   params["val"]             = float(body["reduction_fcfa"])
     if "gain_influenceur" in body: updates.append("gain_influenceur=:gain_influenceur"); params["gain_influenceur"] = float(body["gain_influenceur"])
