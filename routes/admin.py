@@ -28,6 +28,11 @@ try:
 except Exception:
     def calculer_date_estimee(*a, **kw): return ""
 
+try:
+    from routes.promo import utiliser_code as marquer_promo_utilise
+except Exception:
+    def marquer_promo_utilise(*a, **kw): pass
+
 router = APIRouter(prefix="/api/admin", tags=["admin"])
 
 STATUTS = ["en_attente_paiement","paye","achete","expedie","arrive","recupere","paiement_refuse","annulee"]
@@ -406,6 +411,9 @@ class StatutUpdate(BaseModel):
     paniers:         Optional[List[PanierUpdate]] = None
     total_eur:       Optional[float]      = None
     total_local:     Optional[float]      = None
+    # Code promo appliqué lors d'une modification admin du panier — réduit uniquement la commission,
+    # déjà calculée côté frontend dans total_local. Ici on incrémente juste le compteur d'usage.
+    promo_code:      Optional[str]        = None
 
 
 @router.patch("/commandes/{ref}/statut")
@@ -458,6 +466,16 @@ def update_statut(
         cmd.total_local = round(body.total_local)
     if body.total_eur is not None and body.paniers is not None:
         cmd.total_euro = round(body.total_eur, 2)
+
+    # Code promo appliqué lors de cette modification admin du panier.
+    # La réduction elle-même est déjà calculée côté frontend (dans total_local) —
+    # ici on enregistre juste le code sur la commande et on incrémente son compteur d'usage.
+    if body.promo_code and body.paniers is not None:
+        try:
+            cmd.promo_code = body.promo_code.strip().upper()
+            marquer_promo_utilise(cmd.promo_code, db)
+        except Exception as e:
+            print(f"[promo] Erreur enregistrement promo_code sur modification admin: {e}")
 
     if body.note_admin:
         note_existante = (cmd.note_admin or "")[-1500:]
