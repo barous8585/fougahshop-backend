@@ -31,7 +31,7 @@ def ensure_annonces_table(db: Session):
 def get_annonce_active(db: Session = Depends(get_db)):
     """
     Retourne l'annonce active la plus récente.
-    Appelé par le frontend client au chargement de l'app.
+    Conservé pour compatibilité ascendante — préférer /actives pour le carrousel multi-annonces.
     """
     try:
         row = db.execute(text("""
@@ -54,6 +54,35 @@ def get_annonce_active(db: Session = Depends(get_db)):
     except Exception as e:
         print(f"[annonces] get_active error: {e}")
         return {"annonce": None}
+
+
+@router.get("/actives")
+def get_annonces_actives(db: Session = Depends(get_db)):
+    """
+    Retourne TOUTES les annonces actives, triées de la plus récente à la plus ancienne.
+    Appelé par le frontend client pour alimenter le carrousel d'annonces.
+    """
+    try:
+        rows = db.execute(text("""
+            SELECT id, message, type, created_at
+            FROM annonces
+            WHERE actif = TRUE
+            ORDER BY created_at DESC
+        """)).mappings().all()
+        return {
+            "annonces": [
+                {
+                    "id":         r["id"],
+                    "message":    r["message"],
+                    "type":       r["type"] or "info",
+                    "created_at": str(r["created_at"]),
+                }
+                for r in rows
+            ]
+        }
+    except Exception as e:
+        print(f"[annonces] get_actives error: {e}")
+        return {"annonces": []}
 
 
 # ── Endpoints admin ────────────────────────────────────────────
@@ -83,7 +112,8 @@ def create_annonce(
     db: Session = Depends(get_db),
     role: str = Depends(require_patron)
 ):
-    """Crée une nouvelle annonce et désactive les précédentes."""
+    """Crée une nouvelle annonce, active par défaut, sans désactiver les autres —
+    plusieurs annonces peuvent coexister et tourner en carrousel côté client."""
     message = str(body.get("message", "")).strip()
     if not message:
         raise HTTPException(400, "Message vide")
@@ -93,9 +123,6 @@ def create_annonce(
     type_ = str(body.get("type", "info"))
     if type_ not in ("info", "promo", "alerte"):
         type_ = "info"
-
-    # Désactiver toutes les annonces actives avant d'en créer une nouvelle
-    db.execute(text("UPDATE annonces SET actif = FALSE WHERE actif = TRUE"))
 
     row = db.execute(text("""
         INSERT INTO annonces (message, type, actif)
@@ -114,7 +141,7 @@ def toggle_annonce(
     db: Session = Depends(get_db),
     role: str = Depends(require_patron)
 ):
-    """Active ou désactive une annonce."""
+    """Active ou désactive une annonce, indépendamment des autres."""
     row = db.execute(
         text("SELECT id, actif FROM annonces WHERE id = :id"),
         {"id": annonce_id}
@@ -123,10 +150,6 @@ def toggle_annonce(
         raise HTTPException(404, "Annonce introuvable")
 
     new_actif = not bool(row.actif)
-    # Si on active, désactiver les autres d'abord
-    if new_actif:
-        db.execute(text("UPDATE annonces SET actif = FALSE WHERE actif = TRUE"))
-
     db.execute(
         text("UPDATE annonces SET actif = :actif WHERE id = :id"),
         {"actif": new_actif, "id": annonce_id}
