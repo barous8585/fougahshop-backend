@@ -34,23 +34,22 @@ MONNAIES = {
     "Côte d'Ivoire": {"symbole": "FCFA", "taux_base": 656},
 }
 
-PALIERS_COMMISSION = [
-    {"max": 50,    "comm": 3500},
-    {"max": 100,   "comm": 5000},
-    {"max": 200,   "comm": 7000},
-    {"max": 500,   "comm": 12000},
-    {"max": 99999, "comm": 20000},
-]
+# ── Commission progressive : 5000 FCFA de base, +3300 FCFA par tranche de 50€ entamée ──
+# Règle de borne : un montant exactement égal à un multiple de 50€ reste dans la tranche inférieure
+# (ex: 50,00€ → 5000 FCFA ; 50,01€ → 8300 FCFA). Sans plafond — continue indéfiniment.
+COMMISSION_BASE          = 5000
+COMMISSION_PALIER_EUROS  = 50
+COMMISSION_PALIER_AJOUT  = 3300
 
 TOTAL_VALIDATION_WARN_ONLY = True
 TOTAL_TOLERANCE_PCT        = 5
 
 
 def get_commission(total_euros: float) -> float:
-    for palier in PALIERS_COMMISSION:
-        if total_euros <= palier["max"]:
-            return palier["comm"]
-    return 20000
+    import math
+    depasse     = max(0.0, total_euros - COMMISSION_PALIER_EUROS)
+    nb_tranches = math.ceil(depasse / COMMISSION_PALIER_EUROS)
+    return COMMISSION_BASE + nb_tranches * COMMISSION_PALIER_AJOUT
 
 
 def get_config(db):
