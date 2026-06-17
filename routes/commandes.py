@@ -107,9 +107,14 @@ def calc_article_sans_port_ni_commission(prix_eu, qty, pays, cfg):
     }
 
 
-def appliquer_promo(db, promo_code: str, total_local: float, taux_conv: float) -> float:
+def appliquer_promo(db, promo_code: str, total_panier: float, commission_locale: float, taux_conv: float) -> float:
+    """
+    Applique un code promo UNIQUEMENT sur la commission de service — jamais sur le prix du panier.
+    Retourne la nouvelle commission (toujours >= 0, jamais négative).
+    total_panier est utilisé en lecture seule pour le calcul du pourcentage (% du panier, pas de la commission).
+    """
     if not promo_code:
-        return total_local
+        return commission_locale
     try:
         promo = db.execute(
             text("SELECT * FROM promo_codes WHERE code=:code AND actif=TRUE LIMIT 1"),
@@ -117,7 +122,7 @@ def appliquer_promo(db, promo_code: str, total_local: float, taux_conv: float) -
         ).fetchone()
 
         if not promo:
-            return total_local
+            return commission_locale
 
         expiry = getattr(promo, "expiry", None)
         if expiry:
@@ -131,25 +136,27 @@ def appliquer_promo(db, promo_code: str, total_local: float, taux_conv: float) -
                 except ValueError:
                     pass
             if exp_date and exp_date < date.today():
-                return total_local
+                return commission_locale
 
         uses  = getattr(promo, "uses_count", 0)  or getattr(promo, "utilisations", 0) or 0
         max_u = getattr(promo, "max_uses",   0)  or getattr(promo, "quota",        0) or 0
         if max_u > 0 and uses >= max_u:
-            return total_local
+            return commission_locale
 
         type_promo = getattr(promo, "type", "fixe") or "fixe"
         # ✅ FIX : valeur en priorité, fallback reduction_fcfa
         valeur = getattr(promo, "valeur", None) or getattr(promo, "reduction_fcfa", 0) or 0
 
         if type_promo == "livraison":
-            nouveau_total = total_local
+            nouvelle_commission = commission_locale
         elif type_promo == "pct":
-            reduction = round(total_local * float(valeur) / 100)
-            nouveau_total = max(0, total_local - reduction)
+            # Le pourcentage s'applique sur le panier (référence métier habituelle pour le client),
+            # mais la réduction qui en résulte est déduite de la COMMISSION uniquement, jamais du panier.
+            reduction = round(total_panier * float(valeur) / 100)
+            nouvelle_commission = max(0, commission_locale - reduction)
         else:
             reduction = round(float(valeur) * taux_conv)
-            nouveau_total = max(0, total_local - reduction)
+            nouvelle_commission = max(0, commission_locale - reduction)
 
         incremente = False
         try:
@@ -172,11 +179,11 @@ def appliquer_promo(db, promo_code: str, total_local: float, taux_conv: float) -
             except Exception:
                 pass
 
-        return nouveau_total
+        return nouvelle_commission
 
     except Exception as e:
         print(f"[promo] Erreur application code: {e}")
-        return total_local
+        return commission_locale
 
 
 def _get_gain_parrain(db, reduction_fcfa: float) -> float:
@@ -394,10 +401,11 @@ def _calculer_total_serveur(articles, pays, cfg, promo_code, db):
 
     commission_fcfa   = get_commission(total_eu)
     commission_locale = round(commission_fcfa * taux_conv)
-    total_local       = total_local_sans_comm + commission_locale
 
     if promo_code:
-        total_local = appliquer_promo(db, promo_code, total_local, taux_conv)
+        commission_locale = appliquer_promo(db, promo_code, total_local_sans_comm, commission_locale, taux_conv)
+
+    total_local = total_local_sans_comm + commission_locale
 
     return total_local, total_eu, poids_total, taux_conv, m["symbole"]
 
@@ -781,7 +789,6 @@ def creer_commande_whatsapp(body: CommandeWACreate, background_tasks: Background
 
         promo_code_valide      = None
         parrain_code_valide    = None
-        reduction_serveur      = 0
         reduction_parrain_fcfa = 1000.0
 
         if is_panier_lien:
@@ -795,15 +802,14 @@ def creer_commande_whatsapp(body: CommandeWACreate, background_tasks: Background
             )
             commission_fcfa    = get_commission(total_eur)
             commission_locale  = round(commission_fcfa * taux_conv)
-            total_brut_serveur = total_converti + commission_locale
 
             if body.promo_code:
                 try:
-                    code_upper        = body.promo_code.strip().upper()
-                    total_apres_promo = appliquer_promo(db, code_upper, total_brut_serveur, taux_conv)
-                    if total_apres_promo != total_brut_serveur:
+                    code_upper           = body.promo_code.strip().upper()
+                    commission_avant     = commission_locale
+                    commission_locale    = appliquer_promo(db, code_upper, total_converti, commission_locale, taux_conv)
+                    if commission_locale != commission_avant:
                         promo_code_valide = code_upper
-                        reduction_serveur = total_brut_serveur - total_apres_promo
                 except Exception as e:
                     print(f"[WA] Erreur application promo: {e}")
 
@@ -820,14 +826,14 @@ def creer_commande_whatsapp(body: CommandeWACreate, background_tasks: Background
                             text("SELECT reduction_parrainage FROM configs WHERE id=1 LIMIT 1")
                         ).fetchone()
                         reduction_parrain_fcfa = float(cfg_red[0]) if cfg_red and cfg_red[0] else 1000.0
-                        reduction_serveur = round(reduction_parrain_fcfa * taux_conv)
+                        # Le parrainage suit la même règle : déduit de la commission, jamais du panier.
+                        reduction_a_appliquer = round(reduction_parrain_fcfa * taux_conv)
+                        commission_locale     = max(0, commission_locale - reduction_a_appliquer)
                 except Exception as e:
                     print(f"[WA] Erreur vérif parrainage: {e}")
 
-            total_local = _valider_total(
-                max(0, total_brut_serveur - reduction_serveur),
-                body.total_local
-            )
+            total_brut_serveur = total_converti + commission_locale
+            total_local = _valider_total(total_brut_serveur, body.total_local)
 
         articles_detail = []
         for i, p in enumerate(body.paniers):
