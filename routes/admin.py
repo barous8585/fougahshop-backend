@@ -153,12 +153,19 @@ def serialize_cmd(c):
     }
 
 
+# ── Commission progressive : 5000 FCFA de base, +3300 FCFA par tranche de 50€ entamée ──
+# Identique à la formule dans routes/commandes.py — synchronisation obligatoire entre les deux.
+# Règle de borne : un montant exactement égal à un multiple de 50€ reste dans la tranche inférieure.
+COMMISSION_BASE          = 5000
+COMMISSION_PALIER_EUROS  = 50
+COMMISSION_PALIER_AJOUT  = 3300
+
+
 def get_commission_palier(total_eu: float) -> int:
-    if total_eu <= 50:   return 3500
-    if total_eu <= 100:  return 5000
-    if total_eu <= 200:  return 7000
-    if total_eu <= 500:  return 12000
-    return 20000
+    import math
+    depasse     = max(0.0, (total_eu or 0) - COMMISSION_PALIER_EUROS)
+    nb_tranches = math.ceil(depasse / COMMISSION_PALIER_EUROS)
+    return COMMISSION_BASE + nb_tranches * COMMISSION_PALIER_AJOUT
 
 
 @router.get("/stats")
