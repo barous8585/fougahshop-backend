@@ -286,16 +286,29 @@ Tes clients écrivent souvent avec des fautes, des abréviations, du franglais, 
 1. Le client va sur fougahshop.com onglet "Commander"
 2. Il crée un ou plusieurs paniers (un panier = un site)
 3. Il remplit ses infos (nom, téléphone, pays, adresse)
-4. Il paie UNE SEULE FOIS en Mobile Money
+4. Il paie l'article + la commission en Mobile Money pour valider la commande
 5. FougahShop achète tout en Europe
-6. Les articles arrivent en Afrique, le client récupère sa commande
+6. Une fois le colis pesé, le client paie les frais d'expédition séparément
+7. Les articles arrivent en Afrique ; en Guinée, livraison à domicile optionnelle (paiement séparé) ou retrait gratuit en point relais
+8. Le client récupère sa commande
+
+=== STRUCTURE DE PAIEMENT — TRÈS IMPORTANT, À CLARIFIER PROACTIVEMENT ===
+Le paiement n'est JAMAIS en une seule fois. C'est une source fréquente de confusion client —
+explique-le clairement dès qu'un client demande "combien ça coûte", même sans qu'il se plaigne.
+Il y a 2 à 3 paiements séparés dans le temps, jamais demandés en bloc :
+1️⃣ À la commande : prix de l'article + commission FougahShop (calculés avec calculer_prix)
+2️⃣ Après pesée réelle en Europe : frais d'expédition (montant exact donné par WhatsApp avant envoi)
+3️⃣ Optionnel, Guinée uniquement : livraison à domicile (sinon retrait gratuit en point relais)
+Chaque montant est confirmé par WhatsApp avant que le client n'ait à payer quoi que ce soit —
+aucune surprise, aucun prélèvement caché.
 
 === COMMISSION FougahShop (FCFA/GNF selon pays) ===
 La commission est progressive : 5 000 FCFA de base pour un panier jusqu'à 50€,
 puis +3 300 FCFA pour chaque tranche de 50€ supplémentaire entamée, sans limite.
 Exemples : 30€ → 5 000 FCFA · 75€ → 8 300 FCFA · 120€ → 11 600 FCFA · 300€ → 24 800 FCFA.
 Ne calcule JAMAIS ce montant de tête — utilise TOUJOURS l'outil calculer_prix, qui applique
-la formule exacte et gère la conversion GNF pour la Guinée.
+la formule exacte, gère la conversion GNF pour la Guinée, et présente déjà la structure en
+plusieurs paiements séparés de façon claire.
 
 === FRAIS DE PORT ET DÉLAIS — RÈGLE ABSOLUE ===
 TOUJOURS utiliser get_config. JAMAIS inventer un chiffre, un délai, un prix.
@@ -310,10 +323,10 @@ Si get_config échoue, dis : "Je n'arrive pas à récupérer les tarifs en ce mo
 → Propose le suivi sur fougahshop.com onglet "Mon colis".
 
 ** "C'est trop cher" **
-→ Reconnaître : "Je comprends, le prix total peut surprendre."
-→ Expliquer : prix article + commission service + frais de port au kilo.
+→ Reconnaître : "Je comprends, ça peut sembler beaucoup d'un coup."
+→ Clarifier d'abord que ce n'est PAS payé en une seule fois : "En fait tu paies en plusieurs petits paiements séparés, pas tout d'un coup — d'abord l'article + notre commission, puis le transport une fois le colis pesé, et éventuellement la livraison chez toi si tu la choisis."
 → Valoriser : "Tu économises le billet d'avion, les taxes de douane personnelles, et tu paies en Mobile Money sans carte bancaire."
-→ Proposer : calculer le prix exact avec calculer_prix.
+→ Proposer : calculer le détail exact avec calculer_prix, qui montre bien chaque étape séparément.
 
 ** "C'est une arnaque / je fais pas confiance" **
 → Répondre avec calme et preuves : "Je comprends ta méfiance — c'est normal sur internet."
@@ -666,12 +679,20 @@ async def exec_calculer_prix(prix_euros: float, pays: str, qty: int = 1) -> str:
     haut_tranche   = bas_tranche + COMMISSION_PALIER_EUROS
     palier_label   = f"{bas_tranche}–{haut_tranche}€"
 
-    r  = f"💰 **Prix total pour {qty}× article(s) à {prix_euros}€** ({pays_affiche})\n\n"
-    r += f"• Articles : {panier_local:,} {monnaie}\n".replace(",", " ")
+    r  = f"💰 **Estimation pour {qty}× article(s) à {prix_euros}€** ({pays_affiche})\n\n"
+    is_guinee = "guin" in pays_lower
+    nb_etapes = "2 à 3 paiements séparés" if is_guinee else "2 paiements séparés"
+    r += f"Ta commande se règle en **{nb_etapes}**, pas en une seule fois — voici le détail :\n\n"
+    r += f"**1️⃣ À la commande, maintenant :**\n"
+    r += f"• Article : {panier_local:,} {monnaie}\n".replace(",", " ")
     r += f"• Commission FougahShop (panier {palier_label}) : {comm_local:,} {monnaie}\n".replace(",", " ")
-    r += f"• **Sous-total à payer maintenant : {total_local:,} {monnaie}**\n\n".replace(",", " ")
-    r += "• Frais de port : calculés après pesée réelle — payés séparément à l'expédition\n"
-    r += "\n_Prix confirmé avant tout paiement._"
+    r += f"• **Total à payer pour commander : {total_local:,} {monnaie}**\n\n".replace(",", " ")
+    r += f"**2️⃣ Après réception et pesée réelle en Europe :**\n"
+    r += f"• Frais d'expédition — calculés sur le poids exact, on te donne le montant précis par WhatsApp avant de l'envoyer\n\n"
+    if is_guinee:
+        r += f"**3️⃣ Si tu choisis la livraison à domicile (optionnel, Guinée uniquement) :**\n"
+        r += f"• Un dernier petit montant pour la livraison chez toi — sinon retrait gratuit en point relais\n\n"
+    r += "_Chaque montant t'est confirmé par WhatsApp avant que tu aies à payer quoi que ce soit. Rien n'est surprise._"
     return r
 
 
