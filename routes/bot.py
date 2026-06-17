@@ -44,13 +44,19 @@ MAX_HISTORY_TURNS  = 10
 # Fichier de persistance des sessions WhatsApp (survit aux redémarrages)
 WA_SESSIONS_FILE = Path("/tmp/fg_wa_sessions.json")
 
-PALIERS = [
-    {"max": 50,    "comm": 3500},
-    {"max": 100,   "comm": 5000},
-    {"max": 200,   "comm": 7000},
-    {"max": 500,   "comm": 12000},
-    {"max": 99999, "comm": 20000},
-]
+# ── Commission progressive : 5000 FCFA de base, +3300 FCFA par tranche de 50€ entamée ──
+# Identique à routes/commandes.py et routes/admin.py — synchronisation obligatoire entre les trois.
+# Règle de borne : un montant exactement égal à un multiple de 50€ reste dans la tranche inférieure.
+COMMISSION_BASE          = 5000
+COMMISSION_PALIER_EUROS  = 50
+COMMISSION_PALIER_AJOUT  = 3300
+
+
+def get_commission(total_euros: float) -> float:
+    import math
+    depasse     = max(0.0, total_euros - COMMISSION_PALIER_EUROS)
+    nb_tranches = math.ceil(depasse / COMMISSION_PALIER_EUROS)
+    return COMMISSION_BASE + nb_tranches * COMMISSION_PALIER_AJOUT
 
 STATUTS_FR = {
     "en_attente_paiement": "⏳ En attente de paiement",
@@ -107,12 +113,11 @@ Tes clients écrivent souvent avec des fautes, des abréviations, du franglais, 
 6. Les articles arrivent en Afrique, le client récupère sa commande
 
 === COMMISSION FougahShop (FCFA/GNF selon pays) ===
-- Total ≤ 50€   → 3 500 FCFA
-- Total ≤ 100€  → 5 000 FCFA
-- Total ≤ 200€  → 7 000 FCFA
-- Total ≤ 500€  → 12 000 FCFA
-- Total > 500€  → 20 000 FCFA
-Pour la Guinée, convertir en GNF avec l'outil calculer_prix (ne jamais estimer).
+La commission est progressive : 5 000 FCFA de base pour un panier jusqu'à 50€,
+puis +3 300 FCFA pour chaque tranche de 50€ supplémentaire entamée, sans limite.
+Exemples : 30€ → 5 000 FCFA · 75€ → 8 300 FCFA · 120€ → 11 600 FCFA · 300€ → 24 800 FCFA.
+Ne calcule JAMAIS ce montant de tête — utilise TOUJOURS l'outil calculer_prix, qui applique
+la formule exacte et gère la conversion GNF pour la Guinée.
 
 === FRAIS DE PORT ET DÉLAIS — RÈGLE ABSOLUE ===
 TOUJOURS utiliser get_config. JAMAIS inventer un chiffre, un délai, un prix.
@@ -418,7 +423,7 @@ async def exec_calculer_prix(prix_euros: float, pays: str, qty: int = 1) -> str:
         pays_affiche = "Mali"
 
     total_eu   = round(prix_euros * qty, 2)
-    comm_fcfa  = next((p["comm"] for p in PALIERS if total_eu <= p["max"]), 20000)
+    comm_fcfa  = get_commission(total_eu)
 
     # FIX : conversion GNF cohérente avec le vrai taux (pas division par 656 hardcodé)
     if monnaie == "GNF":
@@ -429,13 +434,13 @@ async def exec_calculer_prix(prix_euros: float, pays: str, qty: int = 1) -> str:
     panier_local = round(total_eu * taux)
     total_local  = panier_local + comm_local
 
-    # Palier label
-    palier_label = (
-        "≤50€" if total_eu <= 50 else
-        "≤100€" if total_eu <= 100 else
-        "≤200€" if total_eu <= 200 else
-        "≤500€" if total_eu <= 500 else ">500€"
-    )
+    # Palier label — généré dynamiquement selon la tranche de 50€ réelle
+    import math
+    depasse_eu     = max(0.0, total_eu - COMMISSION_PALIER_EUROS)
+    nb_tranches    = math.ceil(depasse_eu / COMMISSION_PALIER_EUROS)
+    bas_tranche    = nb_tranches * COMMISSION_PALIER_EUROS
+    haut_tranche   = bas_tranche + COMMISSION_PALIER_EUROS
+    palier_label   = f"{bas_tranche}–{haut_tranche}€"
 
     r  = f"💰 **Prix total pour {qty}× article(s) à {prix_euros}€** ({pays_affiche})\n\n"
     r += f"• Articles : {panier_local:,} {monnaie}\n".replace(",", " ")
