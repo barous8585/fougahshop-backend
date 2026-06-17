@@ -161,9 +161,10 @@ def appliquer_promo(db, promo_code: str, total_panier: float, commission_locale:
         if type_promo == "livraison":
             nouvelle_commission = commission_locale
         elif type_promo == "pct":
-            # Le pourcentage s'applique sur le panier (référence métier habituelle pour le client),
-            # mais la réduction qui en résulte est déduite de la COMMISSION uniquement, jamais du panier.
-            reduction = round(total_panier * float(valeur) / 100)
+            # ✅ Le pourcentage s'applique DIRECTEMENT sur la commission — jamais sur le panier.
+            # Un % de la commission ne peut jamais la dépasser, donc le plafonnement à 0 ci-dessous
+            # n'est qu'une protection mathématique, plus une condition réellement déclenchée.
+            reduction = round(commission_locale * float(valeur) / 100)
             nouvelle_commission = max(0, commission_locale - reduction)
         else:
             reduction = round(float(valeur) * taux_conv)
