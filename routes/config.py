@@ -4,9 +4,6 @@ from sqlalchemy.orm import Session
 from sqlalchemy import text
 from typing import Dict, Any
 import json
-import httpx
-import asyncio
-from datetime import datetime
 from database import get_db, SessionLocal
 from models import Config, PortKg, Employe
 from routes.auth import require_patron, PWD_MIN_LENGTH, hash_password, verify_password
@@ -42,8 +39,6 @@ STAT_FIELDS_MAP = {
     "stat_label2": "stat_label2",
     "stat_label3": "stat_label3",
 }
-
-_taux_gnf_last_update: datetime = datetime.min
 
 
 def get_config(db):
@@ -113,67 +108,6 @@ def ensure_tarifs_columns(db):
             db.commit()
         except Exception:
             db.rollback()
-
-
-# ══════════════════════════════════════════════════════════════
-# TAUX GNF
-# ══════════════════════════════════════════════════════════════
-
-async def fetch_taux_gnf_from_api() -> float | None:
-    urls = [
-        "https://open.er-api.com/v6/latest/EUR",
-        "https://api.exchangerate-api.com/v4/latest/EUR",
-    ]
-    for url in urls:
-        try:
-            async with httpx.AsyncClient(timeout=10) as client:
-                resp = await client.get(url)
-            if resp.status_code == 200:
-                data  = resp.json()
-                rates = data.get("rates") or data.get("conversion_rates") or {}
-                gnf   = rates.get("GNF")
-                if gnf and float(gnf) >= 1000:
-                    print(f"[taux] EUR/GNF={gnf} depuis {url}")
-                    return float(gnf)
-        except Exception as e:
-            print(f"[taux] Erreur {url}: {e}")
-    return None
-
-
-async def refresh_taux_gnf_en_base(db: Session) -> float | None:
-    global _taux_gnf_last_update
-    gnf = await fetch_taux_gnf_from_api()
-    if gnf:
-        cfg = get_config(db)
-        cfg.taux_gnf = gnf
-        try:
-            db.execute(
-                text("UPDATE configs SET taux_gnf_updated_at = NOW() WHERE id = :id"),
-                {"id": cfg.id}
-            )
-        except Exception:
-            pass
-        db.commit()
-        _taux_gnf_last_update = datetime.utcnow()
-        print(f"[taux] taux_gnf mis à jour en base : {gnf} GNF/€")
-        return gnf
-    return None
-
-
-async def auto_refresh_taux_gnf():
-    """Tâche de fond — met à jour le taux GNF toutes les heures."""
-    while True:
-        try:
-            db = SessionLocal()
-            await refresh_taux_gnf_en_base(db)
-        except Exception as e:
-            print(f"[taux] Erreur refresh auto: {e}")
-        finally:
-            try:
-                db.close()
-            except Exception:
-                pass
-        await asyncio.sleep(3600)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -333,18 +267,6 @@ def save_parrainage_config(
         db.rollback()
         raise HTTPException(500, str(e))
     return {"ok": True, "reduction_parrainage": red, "gain_parrain": gain}
-
-
-@router.post("/refresh-taux-gnf")
-async def refresh_taux_gnf(
-    request: Request,
-    db: Session = Depends(get_db),
-    role: str = Depends(require_patron)
-):
-    gnf = await refresh_taux_gnf_en_base(db)
-    if gnf:
-        return {"ok": True, "taux_gnf": gnf, "message": f"Taux mis à jour : {gnf:.0f} GNF/€"}
-    raise HTTPException(503, "API de taux indisponible — réessayez dans quelques secondes")
 
 
 @router.put("/")
