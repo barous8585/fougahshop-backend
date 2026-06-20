@@ -34,10 +34,7 @@ from routes.auth       import (
 from routes.notifs     import ensure_tokens_table, purge_old_tokens
 from routes.parrainage import ensure_parrainage_tables
 from routes.avis       import ensure_avis_columns
-from routes.config     import (
-    init_port, get_config, ensure_tarifs_columns,
-    auto_refresh_taux_gnf, refresh_taux_gnf_en_base
-)
+from routes.config     import init_port, get_config, ensure_tarifs_columns
 
 # ── Créer les tables SQLAlchemy ───────────────────────────────
 Base.metadata.create_all(bind=engine)
@@ -121,12 +118,8 @@ async def lifespan(app: FastAPI):
         purge_old_tokens(db)
         print("✅ Tokens FCM obsolètes nettoyés")
 
-        # ── Taux GNF — première mise à jour ──────────────────
-        try:
-            await refresh_taux_gnf_en_base(db)
-            print("✅ Taux GNF initialisé depuis open.er-api.com")
-        except Exception as e:
-            print(f"⚠️  Taux GNF non initialisé au startup: {e}")
+        # ── Taux GNF : fixé manuellement par l'admin, plus aucun
+        # appel automatique à une API externe au démarrage. ────
 
     except Exception as e:
         print(f"❌ Erreur startup: {e}")
@@ -137,19 +130,14 @@ async def lifespan(app: FastAPI):
     task_cleanup = asyncio.create_task(cleanup_rate_limits())
     print("✅ Tâche nettoyage rate limits démarrée")
 
-    task_taux = asyncio.create_task(auto_refresh_taux_gnf())
-    print("✅ Tâche auto-refresh taux GNF démarrée (toutes les heures)")
-
     yield  # ← l'app tourne ici
 
     # ── Shutdown ──────────────────────────────────────────────
     task_cleanup.cancel()
-    task_taux.cancel()
-    for t in [task_cleanup, task_taux]:
-        try:
-            await t
-        except asyncio.CancelledError:
-            pass
+    try:
+        await task_cleanup
+    except asyncio.CancelledError:
+        pass
 
 
 # ══════════════════════════════════════════════════════════════
