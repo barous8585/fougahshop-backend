@@ -4,7 +4,7 @@ from sqlalchemy import text
 from pydantic import BaseModel
 from typing import List, Optional
 from datetime import datetime
-import json, traceback
+import json, traceback, os, httpx
 from database import get_db
 from models import Commande, Config, PortKg
 
@@ -43,6 +43,80 @@ COMMISSION_PALIER_AJOUT  = 3300
 
 TOTAL_VALIDATION_WARN_ONLY = True
 TOTAL_TOLERANCE_PCT        = 5
+
+# ── Kkiapay — vérification serveur (SDK officiel inspecté pour ces valeurs) ────
+KKIAPAY_PUBLIC_KEY  = os.environ.get("KKIAPAY_PUBLIC_KEY", "")
+KKIAPAY_PRIVATE_KEY = os.environ.get("KKIAPAY_PRIVATE_KEY", "")
+KKIAPAY_SECRET      = os.environ.get("KKIAPAY_SECRET", "")
+KKIAPAY_SANDBOX     = os.environ.get("KKIAPAY_SANDBOX", "false").lower() == "true"
+KKIAPAY_BASE_URL    = "https://api-sandbox.kkiapay.me" if KKIAPAY_SANDBOX else "https://api.kkiapay.me"
+KKIAPAY_MONTANT_TOLERANCE_FCFA = 5  # arrondis
+
+
+async def _verifier_transaction_kkiapay(transaction_id: str) -> dict:
+    """
+    Vérifie une transaction Kkiapay directement auprès de Kkiapay (jamais via le
+    contenu envoyé par le client). Retourne le JSON de réponse de Kkiapay, ou
+    {"erreur": ...} si la vérification a échoué techniquement.
+    """
+    if not (KKIAPAY_PUBLIC_KEY and KKIAPAY_PRIVATE_KEY and KKIAPAY_SECRET):
+        return {"erreur": "Kkiapay non configuré (clés manquantes)"}
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.post(
+                f"{KKIAPAY_BASE_URL}/api/v1/transactions/status",
+                json={"transactionId": transaction_id},
+                headers={
+                    "Accept":         "application/json",
+                    "X-API-KEY":      KKIAPAY_PUBLIC_KEY,
+                    "X-PRIVATE-KEY":  KKIAPAY_PRIVATE_KEY,
+                    "X-SECRET-KEY":   KKIAPAY_SECRET,
+                },
+            )
+            return r.json()
+    except Exception as e:
+        return {"erreur": f"Appel Kkiapay impossible: {e}"}
+
+
+async def _kkiapay_paiement_valide(transaction_id: str, montant_attendu: float, db: Session) -> tuple:
+    """
+    Vérifie une transaction Kkiapay : existe, a réussi, montant correspondant,
+    et n'a encore servi à payer aucune AUTRE commande (anti-rejeu).
+    Retourne (ok: bool, raison: str).
+    """
+    if not transaction_id:
+        return False, "transaction_id manquant"
+
+    data = await _verifier_transaction_kkiapay(transaction_id)
+    if "erreur" in data:
+        return False, data["erreur"]
+
+    statut  = (data.get("status") or "").upper()
+    succes  = data.get("isPaymentSucces", statut == "SUCCESS")
+    montant = data.get("amount")
+
+    if not succes:
+        return False, f"Transaction non réussie (statut: {statut or 'inconnu'})"
+
+    if montant is not None and montant_attendu:
+        try:
+            if abs(float(montant) - float(montant_attendu)) > KKIAPAY_MONTANT_TOLERANCE_FCFA:
+                return False, f"Montant incohérent (payé={montant} / attendu={montant_attendu})"
+        except (TypeError, ValueError):
+            pass
+
+    # ── Anti-rejeu : ce transaction_id a-t-il déjà servi pour une autre commande payée ? ──
+    try:
+        deja = db.query(Commande).filter(
+            Commande.paiement_ref == transaction_id,
+            Commande.statut == "paye"
+        ).first()
+        if deja:
+            return False, f"Transaction déjà utilisée pour la commande {deja.ref}"
+    except Exception:
+        pass
+
+    return True, "ok"
 
 
 def get_commission(total_euros: float) -> float:
@@ -316,12 +390,12 @@ class ArticleIn(BaseModel):
     prix_eu:                 float
     frais_livraison_boutique: Optional[float] = 0.0
     poids:                   float           = 0.5
-    qty:                     int             = 1
+    qty:                     int = 1
 
 
 class CommandeCreate(BaseModel):
     client_nom:             str
-    client_tel:             str
+    client_tel:              str
     client_pays:            str
     client_adresse:         Optional[str]   = None
     client_instructions:    Optional[str]   = None
@@ -464,7 +538,7 @@ def calculer(body: CalculRequest, db: Session = Depends(get_db)):
 
 
 @router.post("/", status_code=201)
-def creer_commande(body: CommandeCreate, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+async def creer_commande(body: CommandeCreate, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     try:
         if not body.articles:
             raise HTTPException(400, "Panier vide")
@@ -500,10 +574,22 @@ def creer_commande(body: CommandeCreate, background_tasks: BackgroundTasks, db: 
                 "monnaie":                  detail["monnaie"],
             })
 
-        statut_initial = "paye" if body.mode_paiement == "kkiapay" else "en_attente_paiement"
-        note_auto = None
+        # ✅ FIX SÉCURITÉ : on ne fait plus jamais confiance à "mode_paiement: kkiapay"
+        # tout seul — avant, ça suffisait à marquer la commande payée sans vérification.
+        # Désormais, le paiement n'est confirmé que si Kkiapay confirme réellement la
+        # transaction (existence, succès, montant correspondant).
+        statut_initial = "en_attente_paiement"
+        note_auto      = None
         if body.mode_paiement == "kkiapay" and body.kkiapay_transaction_id:
-            note_auto = f"[KKIAPAY] Transaction: {body.kkiapay_transaction_id}"
+            ok, raison = await _kkiapay_paiement_valide(
+                body.kkiapay_transaction_id, total_local, db
+            )
+            if ok:
+                statut_initial = "paye"
+                note_auto = f"[KKIAPAY] Transaction vérifiée: {body.kkiapay_transaction_id}"
+            else:
+                note_auto = f"[KKIAPAY] Transaction NON vérifiée ({raison}) — en attente: {body.kkiapay_transaction_id}"
+                print(f"⚠️  Paiement Kkiapay non confirmé à la création — {raison}")
 
         commande = Commande(
             ref                 = generate_ref(db),
@@ -524,6 +610,13 @@ def creer_commande(body: CommandeCreate, background_tasks: BackgroundTasks, db: 
             note_admin          = note_auto,
             promo_code          = body.promo_code,
         )
+
+        if statut_initial == "paye" and body.kkiapay_transaction_id:
+            try:
+                commande.paiement_ref      = body.kkiapay_transaction_id
+                commande.paiement_provider = "kkiapay"
+            except Exception:
+                pass
 
         for col, val in [
             ("is_cadeau",  body.is_cadeau or False),
@@ -562,7 +655,7 @@ def creer_commande(body: CommandeCreate, background_tasks: BackgroundTasks, db: 
             print(f"[parrainage] Erreur enregistrement (non bloquant): {e}")
             db.rollback()
 
-    mode_label = "💳 Kkiapay ✅" if body.mode_paiement == "kkiapay" else "📱 Virement manuel"
+    mode_label = "💳 Kkiapay ✅" if (body.mode_paiement == "kkiapay" and commande.statut == "paye") else "📱 Virement manuel"
     try:
         notifier_patron(
             db,
@@ -605,17 +698,30 @@ def creer_commande(body: CommandeCreate, background_tasks: BackgroundTasks, db: 
 
 
 @router.post("/confirmer-kkiapay")
-def confirmer_kkiapay(body: KkiapayConfirmBody, db: Session = Depends(get_db)):
+async def confirmer_kkiapay(body: KkiapayConfirmBody, db: Session = Depends(get_db)):
     ref = body.ref.strip().upper()
     cmd = db.query(Commande).filter(Commande.ref == ref).first()
     if not cmd:
         raise HTTPException(404, "Commande introuvable")
     if cmd.statut == "paye":
         return {"ok": True, "ref": cmd.ref, "statut": cmd.statut, "already_paid": True}
+
+    # ✅ FIX SÉCURITÉ : on vérifie réellement la transaction auprès de Kkiapay —
+    # avant, n'importe quel transaction_id fourni par le client suffisait.
+    ok, raison = await _kkiapay_paiement_valide(
+        body.transaction_id or "", cmd.total_local, db
+    )
+    if not ok:
+        print(f"🚨 Confirmation Kkiapay refusée pour {ref}: {raison}")
+        raise HTTPException(400, f"Paiement non confirmé par Kkiapay : {raison}")
+
     cmd.statut = "paye"
-    note = "[KKIAPAY] Paiement confirmé automatiquement"
-    if body.transaction_id:
-        note += f" — Transaction: {body.transaction_id}"
+    try:
+        cmd.paiement_ref      = body.transaction_id
+        cmd.paiement_provider = "kkiapay"
+    except Exception:
+        pass
+    note = f"[KKIAPAY] Paiement confirmé et vérifié — Transaction: {body.transaction_id}"
     cmd.note_admin = (cmd.note_admin or "") + " | " + note if cmd.note_admin else note
     db.commit()
     try:
