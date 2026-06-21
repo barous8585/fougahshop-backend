@@ -117,10 +117,27 @@ async def _init_geniuspay(cmd: Commande, db: Session):
 
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.post(GENIUSPAY_URL, json=payload, headers=headers)
-        data = r.json()
+        try:
+            data = r.json()
+        except Exception:
+            print(f"[geniuspay] Réponse non-JSON — HTTP {r.status_code} : {r.text[:500]}")
+            raise HTTPException(400, f"Erreur Genius Pay : réponse invalide (HTTP {r.status_code})")
+
+    # ✅ FIX diagnostic : on logge TOUJOURS la réponse complète côté serveur
+    # (consultable dans les logs Render) pour pouvoir identifier la vraie cause
+    # même quand le message d'erreur affiché au client reste générique.
+    print(f"[geniuspay] HTTP {r.status_code} — réponse : {data}")
 
     if not data.get("success"):
-        raise HTTPException(400, f"Erreur Genius Pay : {data.get('message', 'Inconnue')}")
+        # Genius Pay peut utiliser différents noms de champ selon le type d'erreur
+        msg = (
+            data.get("message")
+            or data.get("error")
+            or data.get("detail")
+            or (data.get("errors")[0] if isinstance(data.get("errors"), list) and data.get("errors") else None)
+            or f"HTTP {r.status_code} — voir logs serveur pour le détail"
+        )
+        raise HTTPException(400, f"Erreur Genius Pay : {msg}")
 
     paiement_data = data["data"]
 
