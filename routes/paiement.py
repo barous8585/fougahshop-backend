@@ -111,6 +111,12 @@ async def _init_geniuspay(cmd: Commande, db: Session):
             "order_id": cmd.ref,
             "pays":     cmd.client_pays,
         },
+        # ✅ FIX : Genius Pay supporte bien un retour automatique, mais via
+        # success_url/error_url (confirmé par la doc officielle) — pas via
+        # un paramètre "return_url" comme CinetPay. On réutilise le même
+        # endpoint /retour qui gère déjà ce flux pour CinetPay.
+        "success_url": f"{APP_URL}/api/paiement/retour?ref={cmd.ref}",
+        "error_url":   f"{APP_URL}/api/paiement/retour?ref={cmd.ref}",
         # Pas de payment_method → Genius Pay affiche sa page de checkout
         # avec tous les opérateurs disponibles (Orange Money GN, MTN, etc.)
     }
@@ -398,16 +404,31 @@ async def webhook_cinetpay(request: Request, db: Session = Depends(get_db)):
 @router.get("/retour")
 async def retour_paiement(ref: str, db: Session = Depends(get_db)):
     from fastapi.responses import HTMLResponse
+    import asyncio
+
     cmd = db.query(Commande).filter(Commande.ref == ref).first()
     if not cmd:
         return HTMLResponse("<h2>Commande introuvable</h2>")
+
+    # ✅ FIX : le webhook (qui confirme réellement le paiement) peut arriver
+    # quelques instants après que le client soit redirigé ici. Sans ce court
+    # délai, on risquait d'afficher "paiement non abouti" à un client qui a
+    # pourtant bien payé, juste parce que le webhook n'avait pas encore eu
+    # le temps de mettre à jour la commande en base.
+    for _ in range(3):
+        if cmd.statut == "paye":
+            break
+        await asyncio.sleep(1)
+        db.refresh(cmd)
 
     ref_safe = _html.escape(ref)
 
     if cmd.statut == "paye":
         html = (
             f'<html><head><meta charset="UTF-8"/>'
-            f'<meta http-equiv="refresh" content="3;url=/?paye={ref_safe}"/></head>'
+            # ✅ FIX : redirection relative envoyait le client sur le domaine
+            # du backend (qui ne sert pas l'app) au lieu du vrai site.
+            f'<meta http-equiv="refresh" content="3;url={FRONTEND_URL}/?paye={ref_safe}"/></head>'
             f'<body style="font-family:sans-serif;text-align:center;padding:40px">'
             f'<div style="font-size:48px">✅</div>'
             f'<h2>Paiement confirmé !</h2>'
@@ -416,7 +437,7 @@ async def retour_paiement(ref: str, db: Session = Depends(get_db)):
     else:
         html = (
             f'<html><head><meta charset="UTF-8"/>'
-            f'<meta http-equiv="refresh" content="3;url=/?echec={ref_safe}"/></head>'
+            f'<meta http-equiv="refresh" content="3;url={FRONTEND_URL}/?echec={ref_safe}"/></head>'
             f'<body style="font-family:sans-serif;text-align:center;padding:40px">'
             f'<div style="font-size:48px">❌</div>'
             f'<h2>Paiement non abouti</h2>'
