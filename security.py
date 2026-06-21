@@ -12,6 +12,7 @@ import os
 
 _request_log: dict = defaultdict(list)
 _login_log:   dict = defaultdict(list)
+_reset_log:   dict = defaultdict(list)
 _blocked_ips: dict = {}
 
 # ── Configuration ─────────────────────────────────────────────
@@ -34,6 +35,12 @@ BOT_RATE_WINDOW = 60
 LOGIN_MAX_ATTEMPTS  = 5
 LOGIN_WINDOW        = 300
 LOGIN_BLOCK_SECONDS = 1800
+
+# ✅ Même protection que le login — /api/auth/reset permet de changer le mot de passe
+# admin avec un simple secret, donc un attaquant qui le devine prend tout le compte.
+RESET_MAX_ATTEMPTS  = 5
+RESET_WINDOW        = 300
+RESET_BLOCK_SECONDS = 1800
 
 WRITE_ROUTES = [
     "/api/commandes/annuler",
@@ -114,6 +121,18 @@ class SecurityMiddleware(BaseHTTPMiddleware):
                     headers={"Retry-After": str(LOGIN_BLOCK_SECONDS)},
                 )
 
+        # ── Brute force reset mot de passe (prise de contrôle admin si secret deviné) ──
+        elif path == "/api/auth/reset" and method == "POST":
+            _reset_log[ip] = clean_old(_reset_log[ip], RESET_WINDOW)
+            _reset_log[ip].append(time.time())
+            if len(_reset_log[ip]) > RESET_MAX_ATTEMPTS:
+                block_ip(ip, RESET_BLOCK_SECONDS)
+                return JSONResponse(
+                    status_code=429,
+                    content={"detail": "Trop de tentatives. Réessayez dans 30 min."},
+                    headers={"Retry-After": str(RESET_BLOCK_SECONDS)},
+                )
+
         # ── Création de commande ───────────────────────────────
         if path == "/api/commandes/" and method == "POST":
             if rate_check(f"cmd_create:{ip}", CREATE_COMMANDE_MAX, CREATE_COMMANDE_WINDOW):
@@ -191,4 +210,12 @@ async def cleanup_rate_limits():
             _request_log[key] = clean_old(_request_log[key], RATE_LIMIT_WINDOW)
             if not _request_log[key]:
                 del _request_log[key]
+        for ip in list(_login_log.keys()):
+            _login_log[ip] = clean_old(_login_log[ip], LOGIN_WINDOW)
+            if not _login_log[ip]:
+                del _login_log[ip]
+        for ip in list(_reset_log.keys()):
+            _reset_log[ip] = clean_old(_reset_log[ip], RESET_WINDOW)
+            if not _reset_log[ip]:
+                del _reset_log[ip]
         print(f"🧹 Rate limits nettoyés — {len(_blocked_ips)} IPs bloquées")
