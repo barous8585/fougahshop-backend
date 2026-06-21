@@ -4,7 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from sqlalchemy import text
-import os, asyncio
+import os, asyncio, secrets
 from security import SecurityMiddleware, cleanup_rate_limits
 from database import engine, Base, SessionLocal
 import models  # noqa — déclenche la création des tables
@@ -20,6 +20,7 @@ from routes.avis       import router as avis_router
 from routes.whatsapp   import router as whatsapp_router
 from routes.parrainage import router as parrainage_router
 from routes.annonce    import router as annonce_router
+from routes.paiement   import router as paiement_router      # ✅ FIX : routeur paiement jamais importé
 from routes.bot        import router as bot_router        # ✅ Bot IA Fouga
 
 # ── Imports fonctions startup ─────────────────────────────────
@@ -53,9 +54,11 @@ async def lifespan(app: FastAPI):
         init_port(db)
 
         if not cfg.admin_pwd:
-            cfg.admin_pwd = "admin123"
+            temp_pwd = secrets.token_urlsafe(12)
+            cfg.admin_pwd = temp_pwd
             db.commit()
-            print("✅ Mot de passe admin initialisé (valeur par défaut)")
+            print(f"⚠️  Aucun mot de passe admin en base — mot de passe temporaire généré : {temp_pwd}")
+            print("⚠️  Connecte-toi maintenant et change-le immédiatement dans l'admin — il ne sera plus jamais réaffiché dans les logs.")
         else:
             print("✅ Mot de passe admin configuré")
 
@@ -187,6 +190,7 @@ app.include_router(avis_router)
 app.include_router(whatsapp_router)
 app.include_router(parrainage_router)
 app.include_router(annonce_router)
+app.include_router(paiement_router)                       # ✅ FIX : routeur paiement jamais enregistré
 app.include_router(bot_router)                            # ✅ Bot IA Fouga
 
 # ── Frontend statique ─────────────────────────────────────────
