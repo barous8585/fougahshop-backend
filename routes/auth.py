@@ -355,7 +355,9 @@ def check(request: Request, db: Session = Depends(get_db)):
 
 
 @router.post("/reset")
-def reset_password(body: Dict[str, Any], db: Session = Depends(get_db)):
+def reset_password(body: Dict[str, Any], request: Request, db: Session = Depends(get_db)):
+    import time as _time
+
     secret       = str(body.get("secret", "")).strip()
     new_password = str(body.get("new_password", "")).strip()
 
@@ -366,6 +368,13 @@ def reset_password(body: Dict[str, Any], db: Session = Depends(get_db)):
 
     cfg = get_config(db)
     if not cfg.secret_reset or secret != cfg.secret_reset:
+        # ✅ FIX : même délai que /login en cas d'échec — ralentit les essais automatisés
+        # en complément de la limite de tentatives gérée dans security.py.
+        ip = (request.headers.get("CF-Connecting-IP")
+              or request.headers.get("X-Forwarded-For", "").split(",")[0]
+              or (request.client.host if request.client else "?"))
+        print(f"🚨 Tentative /auth/reset échouée — IP: {ip}")
+        _time.sleep(0.5)
         raise HTTPException(403, "Code secret incorrect")
 
     cfg.admin_pwd = hash_password(new_password)
@@ -374,6 +383,7 @@ def reset_password(body: Dict[str, Any], db: Session = Depends(get_db)):
     except Exception:
         pass
     db.commit()
+    print(f"✅ Mot de passe patron réinitialisé via /auth/reset")
     return {"ok": True, "message": "Mot de passe mis à jour"}
 
 
