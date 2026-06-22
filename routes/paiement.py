@@ -37,7 +37,7 @@ GENIUSPAY_API_SECRET = os.environ.get("GENIUSPAY_API_SECRET", "")
 # sur GENIUSPAY_API_SECRET par sécurité, mais ça ne fonctionnera que si Genius Pay
 # accepte effectivement la clé API secrète pour signer — à vérifier avec un vrai test.
 GENIUSPAY_WEBHOOK_SECRET = os.environ.get("GENIUSPAY_WEBHOOK_SECRET", "") or GENIUSPAY_API_SECRET
-GENIUSPAY_URL        = "https://pay.genius.ci/api/v1/merchant/payments"  # URL API officielle (docs)
+GENIUSPAY_URL        = "https://geniuspay.ci/api/v1/merchant/payments"  # URL v3 officielle
 
 if not GENIUSPAY_API_KEY or not GENIUSPAY_API_SECRET:
     print("⚠️  GENIUSPAY_API_KEY / GENIUSPAY_API_SECRET non définies dans l'environnement Render.")
@@ -151,13 +151,28 @@ async def _init_geniuspay(cmd: Commande, db: Session):
         "error_url":   f"{APP_URL}/api/paiement/retour?ref={cmd.ref}",
     }
 
-    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+    async with httpx.AsyncClient(timeout=30, follow_redirects=False) as client:
         r = await client.post(GENIUSPAY_URL, json=payload, headers=headers)
-        try:
-            data = r.json()
-        except Exception:
-            print(f"[geniuspay] Réponse non-JSON — HTTP {r.status_code} : {r.text[:500]}")
-            raise HTTPException(400, f"Erreur Genius Pay : réponse invalide (HTTP {r.status_code})")
+
+    print(f"[geniuspay] HTTP {r.status_code} — headers: {dict(r.headers)} — body: {r.text[:300]}")
+
+    # Certaines API de paiement retournent un 302 dont le header Location
+    # EST directement l'URL de checkout — on intercepte ce cas ici.
+    if r.status_code in (301, 302, 303, 307, 308):
+        location = r.headers.get("location") or r.headers.get("Location")
+        if location and ("checkout" in location or "pay" in location or "geniuspay" in location):
+            print(f"[geniuspay] Redirect 302 → checkout_url détectée : {location}")
+            cmd.paiement_ref = location
+            db.commit()
+            return {"payment_url": location, "ref": cmd.ref}
+        print(f"[geniuspay] Redirect {r.status_code} vers : {location} — non géré")
+        raise HTTPException(400, f"Erreur Genius Pay : redirection inattendue ({r.status_code}) → {location}")
+
+    try:
+        data = r.json()
+    except Exception:
+        print(f"[geniuspay] Réponse non-JSON — HTTP {r.status_code} : {r.text[:500]}")
+        raise HTTPException(400, f"Erreur Genius Pay : réponse invalide (HTTP {r.status_code})")
 
     # ✅ FIX diagnostic : on logge TOUJOURS la réponse complète côté serveur
     # (consultable dans les logs Render) pour pouvoir identifier la vraie cause
