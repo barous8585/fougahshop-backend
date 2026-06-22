@@ -210,3 +210,8 @@ def health():
 @app.get("/api")
 def api_info():
     return {"app": "FougahShop API", "version": "2.3.0"}
+
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon():
+    from fastapi.responses import Response
+    return Response(status_code=204)
