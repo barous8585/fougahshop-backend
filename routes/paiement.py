@@ -56,6 +56,26 @@ FRONTEND_URL = os.environ.get("FRONTEND_URL", "https://fougahshop.com")
 # Pays routés vers Genius Pay (Guinée → GNF)
 GENIUS_PAYS = {"Guinée"}
 
+# ✅ Mapping ISO devise par pays — crucial pour CinetPay qui distingue XOF et XAF.
+# Cameroun/Congo/Gabon utilisent le franc CFA CEMAC (XAF), pas le franc CFA UEMOA (XOF).
+# Les deux valent la même chose en pratique (1 EUR ≈ 656), mais CinetPay les distingue.
+PAYS_CURRENCY_ISO = {
+    "Guinée":          "GNF",  # routé vers Genius Pay, pas CinetPay
+    "Cameroun":        "XAF",  # CEMAC
+    "Congo":           "XAF",  # CEMAC
+    "Burkina Faso":    "XOF",  # UEMOA
+    "Bénin":           "XOF",  # UEMOA
+    "Togo":            "XOF",  # UEMOA
+    "Niger":           "XOF",  # UEMOA
+    "Sénégal":         "XOF",  # UEMOA
+    "Mali":            "XOF",  # UEMOA
+    "Côte d'Ivoire":   "XOF",  # UEMOA
+}
+
+# Gabon utilise XAF mais n'est couvert ni par CinetPay ni par Genius Pay.
+# Ces clients reçoivent un message clair leur demandant de passer par WhatsApp.
+PAYS_SANS_GATEWAY = {"Gabon"}
+
 # Correspondance pays → code ISO (pour CinetPay)
 PAYS_ISO = {
     "Guinée":        "GN",
@@ -81,8 +101,15 @@ async def init_paiement(body: Dict[str, Any], db: Session = Depends(get_db)):
     cmd = db.query(Commande).filter(Commande.ref == ref).first()
     if not cmd:
         raise HTTPException(404, "Commande introuvable")
-    if cmd.statut != "en_attente_paiement":
+    if cmd.statut not in ("en_attente_paiement", "paiement_refuse"):
         raise HTTPException(400, "Commande déjà payée ou annulée")
+
+    # ✅ Pays sans gateway disponible → message clair renvoyé au client
+    if cmd.client_pays in PAYS_SANS_GATEWAY:
+        raise HTTPException(400,
+            f"Le paiement en ligne n'est pas encore disponible pour {cmd.client_pays}. "
+            "Contactez-nous sur WhatsApp pour finaliser votre commande."
+        )
 
     # Routage selon le pays du client
     if cmd.client_pays in GENIUS_PAYS:
@@ -102,23 +129,26 @@ async def _init_geniuspay(cmd: Commande, db: Session):
     }
     payload = {
         "amount":      int(cmd.total_local),
+        # ✅ FIX : sans currency explicite, Genius Pay interprète le montant
+        # comme du XOF (sa devise de stockage interne) au lieu de GNF.
+        # Résultat : le client voyait "91 824 XOF" au lieu de "91 824 GNF",
+        # et Stripe (carte internationale) était proposé en premier.
+        "currency":    "GNF",
         "description": f"FougahShop — {cmd.nb_articles} article(s) — {cmd.ref}",
         "customer": {
-            "name":  cmd.client_nom or "Client",
-            "phone": cmd.client_tel or "",
+            "name":    cmd.client_nom or "Client",
+            "phone":   cmd.client_tel or "",
+            # ✅ FIX : le code pays aide Genius Pay à sélectionner automatiquement
+            # les opérateurs Mobile Money disponibles en Guinée (Orange GN, MTN GN)
+            # plutôt que de tomber par défaut sur Stripe/carte internationale.
+            "country": "GN",
         },
         "metadata": {
             "order_id": cmd.ref,
             "pays":     cmd.client_pays,
         },
-        # ✅ FIX : Genius Pay supporte bien un retour automatique, mais via
-        # success_url/error_url (confirmé par la doc officielle) — pas via
-        # un paramètre "return_url" comme CinetPay. On réutilise le même
-        # endpoint /retour qui gère déjà ce flux pour CinetPay.
         "success_url": f"{APP_URL}/api/paiement/retour?ref={cmd.ref}",
         "error_url":   f"{APP_URL}/api/paiement/retour?ref={cmd.ref}",
-        # Pas de payment_method → Genius Pay affiche sa page de checkout
-        # avec tous les opérateurs disponibles (Orange Money GN, MTN, etc.)
     }
 
     async with httpx.AsyncClient(timeout=30) as client:
@@ -174,12 +204,16 @@ async def _init_cinetpay(cmd: Commande, db: Session):
         }
 
     pays_iso = PAYS_ISO.get(cmd.client_pays or "", "CI")
+    # ✅ FIX : Cameroun et Congo utilisent XAF (pas XOF).
+    # cmd.monnaie = "FCFA" pour les deux zones UEMOA et CEMAC — indiscernable.
+    # On mappe depuis le pays pour envoyer le bon code ISO à CinetPay.
+    currency = PAYS_CURRENCY_ISO.get(cmd.client_pays, "XOF")
     payload = {
         "apikey":                CINETPAY_API_KEY,
         "site_id":               CINETPAY_SITE_ID,
         "transaction_id":        cmd.ref,
         "amount":                int(cmd.total_local),
-        "currency":              "XOF" if cmd.monnaie == "FCFA" else "GNF",
+        "currency":              currency,
         "description":           f"FougahShop — {cmd.nb_articles} article(s) — {cmd.ref}",
         "return_url":            f"{APP_URL}/api/paiement/retour?ref={cmd.ref}",
         "notify_url":            f"{APP_URL}/api/paiement/webhook",
