@@ -12,11 +12,6 @@ try:
 except Exception:
     def notifier_patron(*a, **kw): pass
 
-try:
-    from routes.notifs import notifier_patron
-except Exception:
-    def notifier_patron(*a, **kw): pass
-
 router = APIRouter(prefix="/api/paiement", tags=["paiement"])
 
 # ── CinetPay ──────────────────────────────────────────────────────────────────
