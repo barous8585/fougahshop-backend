@@ -37,7 +37,7 @@ GENIUSPAY_API_SECRET = os.environ.get("GENIUSPAY_API_SECRET", "")
 # sur GENIUSPAY_API_SECRET par sécurité, mais ça ne fonctionnera que si Genius Pay
 # accepte effectivement la clé API secrète pour signer — à vérifier avec un vrai test.
 GENIUSPAY_WEBHOOK_SECRET = os.environ.get("GENIUSPAY_WEBHOOK_SECRET", "") or GENIUSPAY_API_SECRET
-GENIUSPAY_URL        = "https://geniuspay.ci/api/v1/merchant/payments"  # URL v3 officielle
+GENIUSPAY_URL        = "https://pay.genius.ci/api/v1/merchant/payments"  # URL confirmée par doc officielle
 
 if not GENIUSPAY_API_KEY or not GENIUSPAY_API_SECRET:
     print("⚠️  GENIUSPAY_API_KEY / GENIUSPAY_API_SECRET non définies dans l'environnement Render.")
@@ -119,85 +119,68 @@ async def init_paiement(body: Dict[str, Any], db: Session = Depends(get_db)):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# GENIUS PAY — Guinée (GNF)
+# GENIUS PAY — Guinée (GNF → XOF)
+# Base URL confirmée par la doc officielle : pay.genius.ci/api/v1/merchant/payments
+# Genius Pay n'accepte que XOF, EUR, USD — pas GNF.
+# Il faut donc convertir le total_local (GNF) en XOF avant d'envoyer.
+# Taux : 1 EUR = 9 500 GNF = 656 XOF → 1 GNF ≈ 0.069 XOF
 # ══════════════════════════════════════════════════════════════════════════════
+GNF_EUR_TAUX = float(os.environ.get("GNF_EUR_TAUX", "9500"))  # GNF par euro
+
 async def _init_geniuspay(cmd: Commande, db: Session):
     headers = {
         "X-API-Key":    GENIUSPAY_API_KEY,
         "X-API-Secret": GENIUSPAY_API_SECRET,
         "Content-Type": "application/json",
     }
+
+    # ✅ Conversion GNF → XOF (Genius Pay n'accepte pas GNF comme devise)
+    # Les deux sont liés à l'euro : 1 EUR = 656 XOF = ~9500 GNF
+    amount_xof = max(200, round((cmd.total_local or 0) * 656 / GNF_EUR_TAUX))
+
     payload = {
-        "amount":      int(cmd.total_local),
-        # ✅ FIX : sans currency explicite, Genius Pay interprète le montant
-        # comme du XOF (sa devise de stockage interne) au lieu de GNF.
-        # Résultat : le client voyait "91 824 XOF" au lieu de "91 824 GNF",
-        # et Stripe (carte internationale) était proposé en premier.
-        "currency":    "GNF",
+        "amount":      amount_xof,
+        # Pas de champ "currency" → défaut XOF (seul format accepté pour Afrique de l'Ouest)
         "description": f"FougahShop — {cmd.nb_articles} article(s) — {cmd.ref}",
         "customer": {
             "name":    cmd.client_nom or "Client",
             "phone":   cmd.client_tel or "",
-            # ✅ FIX : le code pays aide Genius Pay à sélectionner automatiquement
-            # les opérateurs Mobile Money disponibles en Guinée (Orange GN, MTN GN)
-            # plutôt que de tomber par défaut sur Stripe/carte internationale.
-            "country": "GN",
+            "country": "GN",  # aide au routage vers opérateurs guinéens (Orange GN, MTN GN)
         },
         "metadata": {
             "order_id": cmd.ref,
             "pays":     cmd.client_pays,
+            "gnf":      int(cmd.total_local or 0),  # montant original conservé pour référence
         },
         "success_url": f"{APP_URL}/api/paiement/retour?ref={cmd.ref}",
         "error_url":   f"{APP_URL}/api/paiement/retour?ref={cmd.ref}",
     }
 
-    async with httpx.AsyncClient(timeout=30, follow_redirects=False) as client:
+    async with httpx.AsyncClient(timeout=30) as client:
         r = await client.post(GENIUSPAY_URL, json=payload, headers=headers)
 
-    print(f"[geniuspay] HTTP {r.status_code} — headers: {dict(r.headers)} — body: {r.text[:300]}")
-
-    # Certaines API de paiement retournent un 302 dont le header Location
-    # EST directement l'URL de checkout — on intercepte ce cas ici.
-    if r.status_code in (301, 302, 303, 307, 308):
-        location = r.headers.get("location") or r.headers.get("Location")
-        if location and ("checkout" in location or "pay" in location or "geniuspay" in location):
-            print(f"[geniuspay] Redirect 302 → checkout_url détectée : {location}")
-            cmd.paiement_ref = location
-            db.commit()
-            return {"payment_url": location, "ref": cmd.ref}
-        print(f"[geniuspay] Redirect {r.status_code} vers : {location} — non géré")
-        raise HTTPException(400, f"Erreur Genius Pay : redirection inattendue ({r.status_code}) → {location}")
+    # Log complet pour diagnostic dans Render
+    print(f"[geniuspay] HTTP {r.status_code} | amount_xof={amount_xof} | body={r.text[:400]}")
 
     try:
         data = r.json()
     except Exception:
-        print(f"[geniuspay] Réponse non-JSON — HTTP {r.status_code} : {r.text[:500]}")
         raise HTTPException(400, f"Erreur Genius Pay : réponse invalide (HTTP {r.status_code})")
 
-    # ✅ FIX diagnostic : on logge TOUJOURS la réponse complète côté serveur
-    # (consultable dans les logs Render) pour pouvoir identifier la vraie cause
-    # même quand le message d'erreur affiché au client reste générique.
-    print(f"[geniuspay] HTTP {r.status_code} — réponse : {data}")
-
     if not data.get("success"):
-        # Genius Pay peut utiliser différents noms de champ selon le type d'erreur
         msg = (
             data.get("message")
-            or data.get("error")
-            or data.get("detail")
-            or (data.get("errors")[0] if isinstance(data.get("errors"), list) and data.get("errors") else None)
-            or f"HTTP {r.status_code} — voir logs serveur pour le détail"
+            or (data.get("error", {}) or {}).get("message")
+            or str(data.get("error") or data.get("detail") or "")
+            or f"HTTP {r.status_code}"
         )
         raise HTTPException(400, f"Erreur Genius Pay : {msg}")
 
     paiement_data = data["data"]
-
-    # Stocker la référence Genius Pay dans la commande
     cmd.paiement_ref      = paiement_data.get("reference", "")
     cmd.paiement_provider = "geniuspay"
     db.commit()
 
-    # Genius Pay retourne checkout_url quand pas de payment_method spécifié
     checkout_url = paiement_data.get("checkout_url") or paiement_data.get("payment_url", "")
     return {
         "payment_url": checkout_url,
