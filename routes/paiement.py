@@ -110,7 +110,7 @@ async def init_paiement(body: Dict[str, Any], db: Session = Depends(get_db)):
     if cmd.client_pays in GENIUS_PAYS:
         return await _init_geniuspay(cmd, db)
     else:
-        return await _init_cinetpay(cmd, db)
+        return await _init_kkiapay(cmd, db)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -184,57 +184,30 @@ async def _init_geniuspay(cmd: Commande, db: Session):
     }
 
 
+KKIAPAY_PUBLIC_KEY = os.environ.get("KKIAPAY_PUBLIC_KEY", "")
+
+if not KKIAPAY_PUBLIC_KEY:
+    print("⚠️  KKIAPAY_PUBLIC_KEY non définie — paiements hors Guinée non disponibles.")
+
+
 # ══════════════════════════════════════════════════════════════════════════════
-# CINETPAY — reste de l'Afrique (XOF)
+# KKIAPAY — Afrique de l'Ouest hors Guinée (widget JS côté client)
+# Kkiapay n'a pas d'API de redirection serveur → on retourne la config
+# pour que le frontend ouvre le widget JS directement.
 # ══════════════════════════════════════════════════════════════════════════════
-async def _init_cinetpay(cmd: Commande, db: Session):
-    if not CINETPAY_SITE_ID or not CINETPAY_API_KEY:
-        return {
-            "mode":        "test",
-            "message":     "CinetPay non configuré",
-            "payment_url": f"{APP_URL}/paiement-test?ref={cmd.ref}",
-            "ref":         cmd.ref,
-        }
-
-    pays_iso = PAYS_ISO.get(cmd.client_pays or "", "CI")
-    # ✅ FIX : Cameroun et Congo utilisent XAF (pas XOF).
-    # cmd.monnaie = "FCFA" pour les deux zones UEMOA et CEMAC — indiscernable.
-    # On mappe depuis le pays pour envoyer le bon code ISO à CinetPay.
-    currency = PAYS_CURRENCY_ISO.get(cmd.client_pays, "XOF")
-    payload = {
-        "apikey":                CINETPAY_API_KEY,
-        "site_id":               CINETPAY_SITE_ID,
-        "transaction_id":        cmd.ref,
-        "amount":                int(cmd.total_local),
-        "currency":              currency,
-        "description":           f"FougahShop — {cmd.nb_articles} article(s) — {cmd.ref}",
-        "return_url":            f"{APP_URL}/api/paiement/retour?ref={cmd.ref}",
-        "notify_url":            f"{APP_URL}/api/paiement/webhook",
-        "customer_name":         cmd.client_nom.split()[0] if cmd.client_nom else "Client",
-        "customer_surname":      cmd.client_nom.split()[-1] if cmd.client_nom else "",
-        "customer_phone_number": cmd.client_tel,
-        "customer_address":      cmd.client_adresse or "",
-        "customer_city":         cmd.client_pays,
-        "customer_country":      pays_iso,
-        "channels":              "ALL",
-        "lang":                  "fr",
-    }
-
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.post(CINETPAY_URL, json=payload)
-        data = r.json()
-
-    if data.get("code") != "201":
-        raise HTTPException(400, f"Erreur CinetPay : {data.get('message', 'Inconnue')}")
-
-    cmd.paiement_ref      = data["data"]["payment_token"]
-    cmd.paiement_provider = "cinetpay"
-    db.commit()
-
+async def _init_kkiapay(cmd: Commande, db: Session):
+    if not KKIAPAY_PUBLIC_KEY:
+        raise HTTPException(400,
+            "Le paiement en ligne n'est pas encore disponible pour ce pays. "
+            "Contactez-nous sur WhatsApp pour finaliser votre commande."
+        )
     return {
-        "payment_url": data["data"]["payment_url"],
-        "ref":         cmd.ref,
-        "provider":    "cinetpay",
+        "mode":       "kkiapay",
+        "amount":     int(cmd.total_local or 0),
+        "public_key": KKIAPAY_PUBLIC_KEY,
+        "ref":        cmd.ref,
+        "tel":        cmd.client_tel or "",
+        "nom":        cmd.client_nom or "",
     }
 
 
