@@ -20,8 +20,9 @@ from routes.avis       import router as avis_router
 from routes.whatsapp   import router as whatsapp_router
 from routes.parrainage import router as parrainage_router
 from routes.annonce    import router as annonce_router
-from routes.paiement   import router as paiement_router      # ✅ FIX : routeur paiement jamais importé
-from routes.bot        import router as bot_router        # ✅ Bot IA Fouga
+from routes.paiement   import router as paiement_router
+from routes.bot        import router as bot_router
+from routes.boutique   import router as boutique_router
 
 # ── Imports fonctions startup ─────────────────────────────────
 from routes.promo      import ensure_tables as ensure_promo_tables
@@ -190,8 +191,9 @@ app.include_router(avis_router)
 app.include_router(whatsapp_router)
 app.include_router(parrainage_router)
 app.include_router(annonce_router)
-app.include_router(paiement_router)                       # ✅ FIX : routeur paiement jamais enregistré
-app.include_router(bot_router)                            # ✅ Bot IA Fouga
+app.include_router(paiement_router)
+app.include_router(bot_router)
+app.include_router(boutique_router)   # ✅ Boutique e-commerce
 
 # ── Frontend statique ─────────────────────────────────────────
 static_dir = os.path.join(os.path.dirname(__file__), "static")
