@@ -1,7 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.orm import Session
-from sqlalchemy import Column, Integer, String, Float, Boolean, Text, DateTime
-from sqlalchemy.ext.declarative import declarative_base
 from pydantic import BaseModel
 from typing import Optional, List
 from datetime import datetime
