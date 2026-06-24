@@ -13,10 +13,8 @@ class Config(Base):
     wa_number    = Column(String,  default="33651727112")
     admin_pwd    = Column(String,  default="admin123")
     secret_reset = Column(String,  default="fougah2026")
-    # ── 2FA TOTP (Point 2) ──────────────────────────────────────
-    # Ajouté via migration ALTER TABLE dans auth.py au startup
-    totp_secret  = Column(String,  nullable=True)   # secret base32 pyotp
-    totp_enabled = Column(Boolean, default=False)   # True = 2FA active pour le patron
+    totp_secret  = Column(String,  nullable=True)
+    totp_enabled = Column(Boolean, default=False)
 
 
 class PortKg(Base):
@@ -108,3 +106,23 @@ class Avis(Base):
     photo_url     = Column(String,  nullable=True)
     verifie       = Column(Boolean, default=False)
     utile_count   = Column(Integer, default=0)
+
+
+# ══════════════════════════════════════════════════════════════════════
+# BOUTIQUE — Catalogue produits à la demande
+# La table est créée automatiquement par Base.metadata.create_all()
+# ══════════════════════════════════════════════════════════════════════
+class Produit(Base):
+    __tablename__ = "produits"
+
+    id          = Column(Integer,  primary_key=True, autoincrement=True)
+    nom         = Column(String(200), nullable=False)
+    description = Column(Text,     default="")
+    categorie   = Column(String(80), default="")
+    image_url   = Column(String(500), default="")
+    images      = Column(Text,     default="[]")       # JSON list d'URLs
+    prix_eur    = Column(Float,    nullable=False)      # Prix de vente fixé par le patron
+    badge       = Column(String(50), default="")       # "Nouveau", "Populaire", "Promo"
+    actif       = Column(Boolean,  default=True)
+    ordre       = Column(Integer,  default=0)          # Ordre d'affichage dans la boutique
+    created_at  = Column(DateTime, server_default=func.now())
