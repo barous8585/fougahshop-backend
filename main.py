@@ -8,7 +8,6 @@ import os, asyncio, secrets
 from security import SecurityMiddleware, cleanup_rate_limits
 from database import engine, Base, SessionLocal
 import models  # noqa — déclenche la création des tables
-
 # ── Imports routers ───────────────────────────────────────────
 from routes.commandes  import router as commandes_router
 from routes.admin      import router as admin_router
@@ -22,8 +21,7 @@ from routes.parrainage import router as parrainage_router
 from routes.annonce    import router as annonce_router
 from routes.paiement   import router as paiement_router
 from routes.bot        import router as bot_router
-from routes.boutique   import router as boutique_router
-
+# from routes.boutique   import router as boutique_router  # ⏸️ temporairement désactivé
 # ── Imports fonctions startup ─────────────────────────────────
 from routes.promo      import ensure_tables as ensure_promo_tables
 from routes.annonce    import ensure_annonces_table
@@ -37,15 +35,11 @@ from routes.notifs     import ensure_tokens_table, purge_old_tokens
 from routes.parrainage import ensure_parrainage_tables
 from routes.avis       import ensure_avis_columns
 from routes.config     import init_port, get_config, ensure_tarifs_columns
-
 # ── Créer les tables SQLAlchemy ───────────────────────────────
 Base.metadata.create_all(bind=engine)
-
-
 # ══════════════════════════════════════════════════════════════
 # LIFESPAN
 # ══════════════════════════════════════════════════════════════
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db = SessionLocal()
@@ -53,7 +47,6 @@ async def lifespan(app: FastAPI):
         # ── Config de base ────────────────────────────────────
         cfg = get_config(db)
         init_port(db)
-
         if not cfg.admin_pwd:
             temp_pwd = secrets.token_urlsafe(12)
             cfg.admin_pwd = temp_pwd
@@ -62,7 +55,6 @@ async def lifespan(app: FastAPI):
             print("⚠️  Connecte-toi maintenant et change-le immédiatement dans l'admin — il ne sera plus jamais réaffiché dans les logs.")
         else:
             print("✅ Mot de passe admin configuré")
-
         secret_env = os.environ.get("SECRET_RESET", "")
         if secret_env and not cfg.secret_reset:
             cfg.secret_reset = secret_env
@@ -72,38 +64,27 @@ async def lifespan(app: FastAPI):
             print("✅ Secret reset configuré")
         else:
             print("⚠️  SECRET_RESET non défini — définissez la variable d'environnement sur Render")
-
         # ── Migrations tables ─────────────────────────────────
         ensure_parrainage_tables(db)
         print("✅ Tables parrainage et galerie vérifiées")
-
         ensure_promo_tables(db)
         print("✅ Table promo_codes vérifiée")
-
         ensure_annonces_table(db)
         print("✅ Table annonces vérifiée")
-
         ensure_archived_column(db)
         print("✅ Colonne archived vérifiée")
-
         ensure_sessions_table(db)
         print("✅ Table admin_sessions vérifiée")
-
         ensure_tokens_table(db)
         print("✅ Table FCM tokens vérifiée")
-
         ensure_tarifs_columns(db)
         print("✅ Colonnes config vérifiées")
-
         ensure_avis_columns(db)
         print("✅ Colonnes avis vérifiées (photos_urls, client_tel, commande_ref...)")
-
         ensure_totp_columns(db)
         print("✅ Colonnes 2FA vérifiées (totp_secret, totp_enabled)")
-
         migrate_pwd_to_bcrypt(db)
         print("✅ Mots de passe vérifiés / migrés vers bcrypt")
-
         # ── Table sessions WhatsApp ───────────────────────────
         db.execute(text("""
             CREATE TABLE IF NOT EXISTS whatsapp_sessions (
@@ -114,49 +95,37 @@ async def lifespan(app: FastAPI):
         """))
         db.commit()
         print("✅ Table sessions WhatsApp vérifiée")
-
         # ── Nettoyages ────────────────────────────────────────
         purge_expired_sessions(db)
         print("✅ Sessions expirées nettoyées")
-
         purge_old_tokens(db)
         print("✅ Tokens FCM obsolètes nettoyés")
-
         # ── Taux GNF : fixé manuellement par l'admin, plus aucun
         # appel automatique à une API externe au démarrage. ────
-
     except Exception as e:
         print(f"❌ Erreur startup: {e}")
     finally:
         db.close()
-
     # ── Tâches de fond ───────────────────────────────────────
     task_cleanup = asyncio.create_task(cleanup_rate_limits())
     print("✅ Tâche nettoyage rate limits démarrée")
-
     yield  # ← l'app tourne ici
-
     # ── Shutdown ──────────────────────────────────────────────
     task_cleanup.cancel()
     try:
         await task_cleanup
     except asyncio.CancelledError:
         pass
-
-
 # ══════════════════════════════════════════════════════════════
 # APP
 # ══════════════════════════════════════════════════════════════
-
 app = FastAPI(
     title    = "FougahShop API",
     version  = "2.3.0",
     lifespan = lifespan,
 )
-
 # ── CORS ──────────────────────────────────────────────────────
 _is_prod = os.environ.get("RENDER", "") == "true"
-
 ALLOWED_ORIGINS = [
     "https://fougahshop.com",
     "https://www.fougahshop.com",
@@ -168,10 +137,8 @@ ALLOWED_ORIGINS = [
     "http://localhost:8000",
     "http://127.0.0.1:8000",
 ])
-
 # ── Sécurité ─────────────────────────────────────────────────
 app.add_middleware(SecurityMiddleware)
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins     = ALLOWED_ORIGINS,
@@ -179,7 +146,6 @@ app.add_middleware(
     allow_headers     = ["Content-Type", "X-Admin-Token"],
     allow_credentials = True,
 )
-
 # ── Routes ────────────────────────────────────────────────────
 app.include_router(commandes_router)
 app.include_router(admin_router)
@@ -193,26 +159,21 @@ app.include_router(parrainage_router)
 app.include_router(annonce_router)
 app.include_router(paiement_router)
 app.include_router(bot_router)
-app.include_router(boutique_router)   # ✅ Boutique e-commerce
-
+# app.include_router(boutique_router)  # ⏸️ temporairement désactivé
 # ── Frontend statique ─────────────────────────────────────────
 static_dir = os.path.join(os.path.dirname(__file__), "static")
 if os.path.exists(static_dir):
     app.mount("/static", StaticFiles(directory=static_dir), name="static")
-
     @app.get("/", response_class=FileResponse)
     def root():
         return os.path.join(static_dir, "index.html")
-
 # ── Health check ──────────────────────────────────────────────
 @app.get("/health")
 def health():
     return {"status": "ok", "version": "2.3.0"}
-
 @app.get("/api")
 def api_info():
     return {"app": "FougahShop API", "version": "2.3.0"}
-
 @app.get("/favicon.ico", include_in_schema=False)
 def favicon():
     from fastapi.responses import Response
